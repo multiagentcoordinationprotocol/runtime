@@ -163,7 +163,12 @@ jobs:
         if: github.event_name == 'pull_request'
         run: |
           git fetch origin main
-          buf breaking proto --against '.git#branch=origin/main,subdir=proto'
+          # Skip if main branch doesn't have a buf module yet
+          if git show origin/main:proto/buf.yaml > /dev/null 2>&1; then
+            buf breaking proto --against '.git#branch=origin/main,subdir=proto'
+          else
+            echo "No buf module found on main branch, skipping breaking change check"
+          fi
 
   ci-pass:
     name: All Checks Passed
