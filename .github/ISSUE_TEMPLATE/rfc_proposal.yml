@@ -1,0 +1,31 @@
+
+name: RFC / Enhancement Proposal
+description: Propose a change or extension to the MACP runtime
+title: "[RFC] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: High-level overview of the proposal.
+    validations:
+      required: true
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation
+      description: Why is this needed?
+
+  - type: textarea
+    id: specification
+    attributes:
+      label: Proposed Changes
+      description: Detailed specification changes.
+
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Backward Compatibility
+      description: Does this introduce breaking changes?
