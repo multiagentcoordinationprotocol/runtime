@@ -1,0 +1,31 @@
+
+name: Bug Report
+description: Report a problem with the MACP runtime
+title: "[BUG] "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: Describe the issue clearly.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction Steps
+      description: Steps or example envelope/client code that demonstrates the issue.
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What should happen according to the protocol?
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Rust version, OS, protoc version, etc.
