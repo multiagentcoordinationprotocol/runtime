@@ -157,13 +157,13 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Lint protobuf with buf
-        run: buf lint
+        run: buf lint proto
 
       - name: Check for breaking changes
         if: github.event_name == 'pull_request'
         run: |
           git fetch origin main
-          buf breaking --against '.git#branch=origin/main'
+          buf breaking proto --against '.git#branch=origin/main,subdir=proto'
 
   ci-pass:
     name: All Checks Passed

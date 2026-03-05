@@ -147,10 +147,7 @@ mod tests {
             payload: b"hello".to_vec(),
         };
 
-        let resp = server
-            .send_message(Request::new(wrap(env)))
-            .await
-            .unwrap();
+        let resp = server.send_message(Request::new(wrap(env))).await.unwrap();
         let ack = resp.into_inner();
         assert!(!ack.accepted);
         assert_eq!(ack.error, "TtlExpired");
@@ -194,10 +191,7 @@ mod tests {
             payload: b"hello".to_vec(),
         };
 
-        let resp = server
-            .send_message(Request::new(wrap(env)))
-            .await
-            .unwrap();
+        let resp = server.send_message(Request::new(wrap(env))).await.unwrap();
         let ack = resp.into_inner();
         assert!(ack.accepted);
 
@@ -239,10 +233,7 @@ mod tests {
             payload: b"hello".to_vec(),
         };
 
-        let resp = server
-            .send_message(Request::new(wrap(env)))
-            .await
-            .unwrap();
+        let resp = server.send_message(Request::new(wrap(env))).await.unwrap();
         let ack = resp.into_inner();
         assert!(!ack.accepted);
         assert_eq!(ack.error, "SessionNotOpen");

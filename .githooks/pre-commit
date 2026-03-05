@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -e
+
+echo "Running cargo fmt check..."
+cargo fmt --all -- --check
+if [ $? -ne 0 ]; then
+    echo ""
+    echo "Commit rejected: code is not formatted."
+    echo "Run 'cargo fmt --all' to fix formatting, then try again."
+    exit 1
+fi

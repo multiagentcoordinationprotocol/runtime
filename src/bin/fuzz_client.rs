@@ -25,14 +25,8 @@ fn env(
     }
 }
 
-async fn send(
-    client: &mut MacpServiceClient<tonic::transport::Channel>,
-    label: &str,
-    e: Envelope,
-) {
-    let req = SendMessageRequest {
-        envelope: Some(e),
-    };
+async fn send(client: &mut MacpServiceClient<tonic::transport::Channel>, label: &str, e: Envelope) {
+    let req = SendMessageRequest { envelope: Some(e) };
     match client.send_message(req).await {
         Ok(resp) => {
             let ack = resp.into_inner();

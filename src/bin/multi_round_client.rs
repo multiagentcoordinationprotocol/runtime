@@ -1,14 +1,8 @@
 use macp_runtime::pb::macp_service_client::MacpServiceClient;
 use macp_runtime::pb::{Envelope, GetSessionRequest, SendMessageRequest};
 
-async fn send(
-    client: &mut MacpServiceClient<tonic::transport::Channel>,
-    label: &str,
-    e: Envelope,
-) {
-    let req = SendMessageRequest {
-        envelope: Some(e),
-    };
+async fn send(client: &mut MacpServiceClient<tonic::transport::Channel>, label: &str, e: Envelope) {
+    let req = SendMessageRequest { envelope: Some(e) };
     match client.send_message(req).await {
         Ok(resp) => {
             let ack = resp.into_inner();
