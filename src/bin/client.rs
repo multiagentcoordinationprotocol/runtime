@@ -1,5 +1,5 @@
 use macp_runtime::pb::macp_service_client::MacpServiceClient;
-use macp_runtime::pb::Envelope;
+use macp_runtime::pb::{Envelope, SendMessageRequest};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -18,7 +18,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         payload: vec![],
     };
 
-    let ack = client.send_message(start).await?.into_inner();
+    let ack = client
+        .send_message(SendMessageRequest {
+            envelope: Some(start),
+        })
+        .await?
+        .into_inner();
     println!(
         "SessionStart ack: accepted={} error='{}'",
         ack.accepted, ack.error
@@ -36,7 +41,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         payload: b"hello".to_vec(),
     };
 
-    let ack = client.send_message(msg).await?.into_inner();
+    let ack = client
+        .send_message(SendMessageRequest {
+            envelope: Some(msg),
+        })
+        .await?
+        .into_inner();
     println!(
         "Message ack: accepted={} error='{}'",
         ack.accepted, ack.error
@@ -54,7 +64,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         payload: b"resolve".to_vec(),
     };
 
-    let ack = client.send_message(resolve).await?.into_inner();
+    let ack = client
+        .send_message(SendMessageRequest {
+            envelope: Some(resolve),
+        })
+        .await?
+        .into_inner();
     println!(
         "Resolve ack: accepted={} error='{}'",
         ack.accepted, ack.error
@@ -72,7 +87,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         payload: b"should-fail".to_vec(),
     };
 
-    let ack = client.send_message(after).await?.into_inner();
+    let ack = client
+        .send_message(SendMessageRequest {
+            envelope: Some(after),
+        })
+        .await?
+        .into_inner();
     println!(
         "After-resolve ack: accepted={} error='{}'",
         ack.accepted, ack.error

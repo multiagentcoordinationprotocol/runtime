@@ -1,8 +1,15 @@
 use macp_runtime::pb::macp_service_client::MacpServiceClient;
-use macp_runtime::pb::{Envelope, SessionQuery};
+use macp_runtime::pb::{Envelope, GetSessionRequest, SendMessageRequest};
 
-async fn send(client: &mut MacpServiceClient<tonic::transport::Channel>, label: &str, e: Envelope) {
-    match client.send_message(e).await {
+async fn send(
+    client: &mut MacpServiceClient<tonic::transport::Channel>,
+    label: &str,
+    e: Envelope,
+) {
+    let req = SendMessageRequest {
+        envelope: Some(e),
+    };
+    match client.send_message(req).await {
         Ok(resp) => {
             let ack = resp.into_inner();
             println!("[{label}] accepted={} error='{}'", ack.accepted, ack.error);
@@ -77,7 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Query session state — should be Open
     match client
-        .get_session(SessionQuery {
+        .get_session(GetSessionRequest {
             session_id: "mr1".into(),
         })
         .await
@@ -111,7 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Query session state — should be Resolved
     match client
-        .get_session(SessionQuery {
+        .get_session(GetSessionRequest {
             session_id: "mr1".into(),
         })
         .await

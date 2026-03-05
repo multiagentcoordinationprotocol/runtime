@@ -1,6 +1,8 @@
 use macp_runtime::error::MacpError;
 use macp_runtime::pb::macp_service_server::MacpService;
-use macp_runtime::pb::{Ack, Envelope, SessionInfo, SessionQuery};
+use macp_runtime::pb::{
+    Envelope, GetSessionRequest, GetSessionResponse, SendMessageRequest, SendMessageResponse,
+};
 use macp_runtime::runtime::Runtime;
 use macp_runtime::session::SessionState;
 use std::sync::Arc;
@@ -28,8 +30,14 @@ impl MacpServer {
 
 #[tonic::async_trait]
 impl MacpService for MacpServer {
-    async fn send_message(&self, request: Request<Envelope>) -> Result<Response<Ack>, Status> {
-        let env = request.into_inner();
+    async fn send_message(
+        &self,
+        request: Request<SendMessageRequest>,
+    ) -> Result<Response<SendMessageResponse>, Status> {
+        let req = request.into_inner();
+        let env = req
+            .envelope
+            .ok_or_else(|| Status::invalid_argument("missing envelope"))?;
 
         let result = async {
             Self::validate(&env)?;
@@ -37,24 +45,24 @@ impl MacpService for MacpServer {
         }
         .await;
 
-        let ack = match result {
-            Ok(_) => Ack {
+        let resp = match result {
+            Ok(_) => SendMessageResponse {
                 accepted: true,
                 error: "".into(),
             },
-            Err(e) => Ack {
+            Err(e) => SendMessageResponse {
                 accepted: false,
                 error: e.to_string(),
             },
         };
 
-        Ok(Response::new(ack))
+        Ok(Response::new(resp))
     }
 
     async fn get_session(
         &self,
-        request: Request<SessionQuery>,
-    ) -> Result<Response<SessionInfo>, Status> {
+        request: Request<GetSessionRequest>,
+    ) -> Result<Response<GetSessionResponse>, Status> {
         let query = request.into_inner();
 
         match self.runtime.registry.get_session(&query.session_id).await {
@@ -65,7 +73,7 @@ impl MacpService for MacpServer {
                     SessionState::Expired => "Expired",
                 };
 
-                Ok(Response::new(SessionInfo {
+                Ok(Response::new(GetSessionResponse {
                     session_id: session.session_id.clone(),
                     mode: session.mode.clone(),
                     state: state_str.into(),
@@ -97,6 +105,12 @@ mod tests {
         let runtime = Arc::new(Runtime::new(registry, log_store));
         let server = MacpServer::new(runtime.clone());
         (server, runtime)
+    }
+
+    fn wrap(env: Envelope) -> SendMessageRequest {
+        SendMessageRequest {
+            envelope: Some(env),
+        }
     }
 
     #[tokio::test]
@@ -133,7 +147,10 @@ mod tests {
             payload: b"hello".to_vec(),
         };
 
-        let resp = server.send_message(Request::new(env)).await.unwrap();
+        let resp = server
+            .send_message(Request::new(wrap(env)))
+            .await
+            .unwrap();
         let ack = resp.into_inner();
         assert!(!ack.accepted);
         assert_eq!(ack.error, "TtlExpired");
@@ -177,7 +194,10 @@ mod tests {
             payload: b"hello".to_vec(),
         };
 
-        let resp = server.send_message(Request::new(env)).await.unwrap();
+        let resp = server
+            .send_message(Request::new(wrap(env)))
+            .await
+            .unwrap();
         let ack = resp.into_inner();
         assert!(ack.accepted);
 
@@ -219,7 +239,10 @@ mod tests {
             payload: b"hello".to_vec(),
         };
 
-        let resp = server.send_message(Request::new(env)).await.unwrap();
+        let resp = server
+            .send_message(Request::new(wrap(env)))
+            .await
+            .unwrap();
         let ack = resp.into_inner();
         assert!(!ack.accepted);
         assert_eq!(ack.error, "SessionNotOpen");

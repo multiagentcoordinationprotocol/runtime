@@ -13,16 +13,20 @@ message Envelope {
   bytes payload = 8;
 }
 
-message Ack {
+message SendMessageRequest {
+  Envelope envelope = 1;
+}
+
+message SendMessageResponse {
   bool accepted = 1;
   string error = 2;
 }
 
-message SessionQuery {
+message GetSessionRequest {
   string session_id = 1;
 }
 
-message SessionInfo {
+message GetSessionResponse {
   string session_id = 1;
   string mode = 2;
   string state = 3;
@@ -33,6 +37,6 @@ message SessionInfo {
 }
 
 service MACPService {
-  rpc SendMessage(Envelope) returns (Ack);
-  rpc GetSession(SessionQuery) returns (SessionInfo);
+  rpc SendMessage(SendMessageRequest) returns (SendMessageResponse);
+  rpc GetSession(GetSessionRequest) returns (GetSessionResponse);
 }
