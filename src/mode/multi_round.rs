@@ -5,27 +5,14 @@ use crate::session::Session;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Convergence strategy configuration.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ConvergenceConfig {
-    #[serde(rename = "type")]
-    pub convergence_type: String,
-}
-
-/// SessionStart payload for multi_round mode.
-#[derive(Debug, Clone, Deserialize)]
-pub struct MultiRoundConfig {
-    pub participants: Vec<String>,
-    pub convergence: ConvergenceConfig,
-    pub ttl_ms: Option<i64>,
-}
-
 /// Internal state tracked across rounds.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MultiRoundState {
     pub round: u64,
     pub participants: Vec<String>,
     pub contributions: BTreeMap<String, String>,
+    #[serde(default)]
+    pub convergence_type: String,
 }
 
 /// Payload for Contribute messages.
@@ -58,25 +45,21 @@ impl MultiRoundMode {
 impl Mode for MultiRoundMode {
     fn on_session_start(
         &self,
-        _session: &Session,
-        env: &Envelope,
+        session: &Session,
+        _env: &Envelope,
     ) -> Result<ModeResponse, MacpError> {
-        let text = std::str::from_utf8(&env.payload).map_err(|_| MacpError::InvalidPayload)?;
-        let config: MultiRoundConfig =
-            serde_json::from_str(text).map_err(|_| MacpError::InvalidPayload)?;
+        // Participants come from the runtime via SessionStartPayload
+        let participants = session.participants.clone();
 
-        if config.participants.is_empty() {
-            return Err(MacpError::InvalidPayload);
-        }
-
-        if config.convergence.convergence_type != "all_equal" {
+        if participants.is_empty() {
             return Err(MacpError::InvalidPayload);
         }
 
         let state = MultiRoundState {
             round: 0,
-            participants: config.participants,
+            participants,
             contributions: BTreeMap::new(),
+            convergence_type: "all_equal".into(),
         };
 
         Ok(ModeResponse::PersistState(Self::encode_state(&state)))
@@ -138,36 +121,43 @@ impl Mode for MultiRoundMode {
 mod tests {
     use super::*;
     use crate::session::SessionState;
+    use std::collections::HashSet;
 
     fn base_session() -> Session {
         Session {
             session_id: "s1".into(),
             state: SessionState::Open,
             ttl_expiry: i64::MAX,
+            started_at_unix_ms: 0,
             resolution: None,
             mode: "multi_round".into(),
             mode_state: vec![],
             participants: vec![],
+            seen_message_ids: HashSet::new(),
+            intent: String::new(),
+            mode_version: String::new(),
+            configuration_version: String::new(),
+            policy_version: String::new(),
         }
     }
 
-    fn session_start_env(payload: &str) -> Envelope {
+    fn session_start_env() -> Envelope {
         Envelope {
-            macp_version: "v1".into(),
+            macp_version: "1.0".into(),
             mode: "multi_round".into(),
             message_type: "SessionStart".into(),
             message_id: "m0".into(),
             session_id: "s1".into(),
             sender: "creator".into(),
             timestamp_unix_ms: 1_700_000_000_000,
-            payload: payload.as_bytes().to_vec(),
+            payload: vec![],
         }
     }
 
     fn contribute_env(sender: &str, value: &str) -> Envelope {
         let payload = serde_json::json!({"value": value}).to_string();
         Envelope {
-            macp_version: "v1".into(),
+            macp_version: "1.0".into(),
             mode: "multi_round".into(),
             message_type: "Contribute".into(),
             message_id: format!("m_{}", sender),
@@ -181,15 +171,16 @@ mod tests {
     fn session_with_state(state: &MultiRoundState) -> Session {
         let mut s = base_session();
         s.mode_state = MultiRoundMode::encode_state(state);
+        s.participants = state.participants.clone();
         s
     }
 
     #[test]
     fn session_start_parses_valid_config() {
         let mode = MultiRoundMode;
-        let session = base_session();
-        let payload = r#"{"participants":["alice","bob"],"convergence":{"type":"all_equal"}}"#;
-        let env = session_start_env(payload);
+        let mut session = base_session();
+        session.participants = vec!["alice".into(), "bob".into()];
+        let env = session_start_env();
 
         let result = mode.on_session_start(&session, &env).unwrap();
         match result {
@@ -204,44 +195,10 @@ mod tests {
     }
 
     #[test]
-    fn session_start_with_ttl() {
-        let mode = MultiRoundMode;
-        let session = base_session();
-        let payload =
-            r#"{"participants":["alice"],"convergence":{"type":"all_equal"},"ttl_ms":5000}"#;
-        let env = session_start_env(payload);
-
-        let result = mode.on_session_start(&session, &env).unwrap();
-        assert!(matches!(result, ModeResponse::PersistState(_)));
-    }
-
-    #[test]
     fn session_start_rejects_empty_participants() {
         let mode = MultiRoundMode;
-        let session = base_session();
-        let payload = r#"{"participants":[],"convergence":{"type":"all_equal"}}"#;
-        let env = session_start_env(payload);
-
-        let err = mode.on_session_start(&session, &env).unwrap_err();
-        assert_eq!(err.to_string(), "InvalidPayload");
-    }
-
-    #[test]
-    fn session_start_rejects_unknown_convergence() {
-        let mode = MultiRoundMode;
-        let session = base_session();
-        let payload = r#"{"participants":["alice"],"convergence":{"type":"majority"}}"#;
-        let env = session_start_env(payload);
-
-        let err = mode.on_session_start(&session, &env).unwrap_err();
-        assert_eq!(err.to_string(), "InvalidPayload");
-    }
-
-    #[test]
-    fn session_start_rejects_invalid_json() {
-        let mode = MultiRoundMode;
-        let session = base_session();
-        let env = session_start_env("not json");
+        let session = base_session(); // empty participants
+        let env = session_start_env();
 
         let err = mode.on_session_start(&session, &env).unwrap_err();
         assert_eq!(err.to_string(), "InvalidPayload");
@@ -254,6 +211,7 @@ mod tests {
             round: 0,
             participants: vec!["alice".into(), "bob".into()],
             contributions: BTreeMap::new(),
+            convergence_type: "all_equal".into(),
         };
         let session = session_with_state(&state);
         let env = contribute_env("alice", "option_a");
@@ -278,6 +236,7 @@ mod tests {
             round: 1,
             participants: vec!["alice".into(), "bob".into()],
             contributions,
+            convergence_type: "all_equal".into(),
         };
         let session = session_with_state(&state);
         let env = contribute_env("alice", "option_a");
@@ -301,6 +260,7 @@ mod tests {
             round: 1,
             participants: vec!["alice".into(), "bob".into()],
             contributions,
+            convergence_type: "all_equal".into(),
         };
         let session = session_with_state(&state);
         let env = contribute_env("alice", "option_b");
@@ -325,6 +285,7 @@ mod tests {
             round: 1,
             participants: vec!["alice".into(), "bob".into()],
             contributions,
+            convergence_type: "all_equal".into(),
         };
         let session = session_with_state(&state);
         let env = contribute_env("bob", "option_a");
@@ -357,6 +318,7 @@ mod tests {
             round: 1,
             participants: vec!["alice".into(), "bob".into()],
             contributions,
+            convergence_type: "all_equal".into(),
         };
         let session = session_with_state(&state);
         let env = contribute_env("bob", "option_b");
@@ -372,6 +334,7 @@ mod tests {
             round: 0,
             participants: vec!["alice".into(), "bob".into(), "carol".into()],
             contributions: BTreeMap::new(),
+            convergence_type: "all_equal".into(),
         };
         let session = session_with_state(&state);
         let env = contribute_env("alice", "option_a");
@@ -387,10 +350,11 @@ mod tests {
             round: 0,
             participants: vec!["alice".into()],
             contributions: BTreeMap::new(),
+            convergence_type: "all_equal".into(),
         };
         let session = session_with_state(&state);
         let env = Envelope {
-            macp_version: "v1".into(),
+            macp_version: "1.0".into(),
             mode: "multi_round".into(),
             message_type: "Message".into(),
             message_id: "m1".into(),
@@ -411,10 +375,11 @@ mod tests {
             round: 0,
             participants: vec!["alice".into()],
             contributions: BTreeMap::new(),
+            convergence_type: "all_equal".into(),
         };
         let session = session_with_state(&state);
         let env = Envelope {
-            macp_version: "v1".into(),
+            macp_version: "1.0".into(),
             mode: "multi_round".into(),
             message_type: "Contribute".into(),
             message_id: "m1".into(),
@@ -436,6 +401,7 @@ mod tests {
             round: 5,
             participants: vec!["alice".into(), "bob".into()],
             contributions,
+            convergence_type: "all_equal".into(),
         };
 
         let encoded = MultiRoundMode::encode_state(&original);
@@ -456,7 +422,6 @@ mod tests {
     fn three_participant_convergence() {
         let mode = MultiRoundMode;
 
-        // Alice and Bob already contributed "option_a"
         let mut contributions = BTreeMap::new();
         contributions.insert("alice".to_string(), "option_a".to_string());
         contributions.insert("bob".to_string(), "option_a".to_string());
@@ -464,6 +429,7 @@ mod tests {
             round: 2,
             participants: vec!["alice".into(), "bob".into(), "carol".into()],
             contributions,
+            convergence_type: "all_equal".into(),
         };
         let session = session_with_state(&state);
         let env = contribute_env("carol", "option_a");

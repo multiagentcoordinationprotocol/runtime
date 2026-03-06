@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package macp.modes.decision.v1;
+
+message ProposalPayload {
+  string proposal_id = 1;
+  string option = 2;
+  string rationale = 3;
+  bytes supporting_data = 4;
+}
+
+message EvaluationPayload {
+  string proposal_id = 1;
+  string recommendation = 2; // APPROVE | REVIEW | BLOCK | REJECT
+  double confidence = 3;
+  string reason = 4;
+}
+
+message ObjectionPayload {
+  string proposal_id = 1;
+  string reason = 2;
+  string severity = 3; // low | medium | high | critical
+}
+
+message VotePayload {
+  string proposal_id = 1;
+  string vote = 2; // approve | reject | abstain
+  string reason = 3;
+}
+
+// Decision Mode typically reuses macp.v1.CommitmentPayload for terminal results.
