@@ -1,14 +1,41 @@
-use macp_runtime::pb::macp_service_client::MacpServiceClient;
-use macp_runtime::pb::{Envelope, SendMessageRequest};
+use macp_runtime::pb::macp_runtime_service_client::MacpRuntimeServiceClient;
+use macp_runtime::pb::{
+    Envelope, GetSessionRequest, InitializeRequest, ListModesRequest, SendRequest,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Server address from main.rs
-    let mut client = MacpServiceClient::connect("http://127.0.0.1:50051").await?;
+    let mut client = MacpRuntimeServiceClient::connect("http://127.0.0.1:50051").await?;
 
-    // 1) SessionStart
+    // 1) Initialize — negotiate protocol version
+    let init_resp = client
+        .initialize(InitializeRequest {
+            supported_protocol_versions: vec!["1.0".into()],
+            client_info: None,
+            capabilities: None,
+        })
+        .await?
+        .into_inner();
+    println!(
+        "Initialize: version={} runtime={}",
+        init_resp.selected_protocol_version,
+        init_resp
+            .runtime_info
+            .as_ref()
+            .map(|r| r.name.as_str())
+            .unwrap_or("?")
+    );
+
+    // 2) ListModes — discover available modes
+    let modes_resp = client.list_modes(ListModesRequest {}).await?.into_inner();
+    println!(
+        "ListModes: {:?}",
+        modes_resp.modes.iter().map(|m| &m.mode).collect::<Vec<_>>()
+    );
+
+    // 3) SessionStart
     let start = Envelope {
-        macp_version: "v1".into(),
+        macp_version: "1.0".into(),
         mode: "decision".into(),
         message_type: "SessionStart".into(),
         message_id: "m1".into(),
@@ -19,19 +46,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let ack = client
-        .send_message(SendMessageRequest {
+        .send(SendRequest {
             envelope: Some(start),
         })
         .await?
-        .into_inner();
+        .into_inner()
+        .ack
+        .unwrap();
     println!(
-        "SessionStart ack: accepted={} error='{}'",
-        ack.accepted, ack.error
+        "SessionStart ack: ok={} error={:?}",
+        ack.ok,
+        ack.error.as_ref().map(|e| &e.code)
     );
 
-    // 2) Normal message
+    // 4) Normal message
     let msg = Envelope {
-        macp_version: "v1".into(),
+        macp_version: "1.0".into(),
         mode: "decision".into(),
         message_type: "Message".into(),
         message_id: "m2".into(),
@@ -42,19 +72,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let ack = client
-        .send_message(SendMessageRequest {
+        .send(SendRequest {
             envelope: Some(msg),
         })
         .await?
-        .into_inner();
+        .into_inner()
+        .ack
+        .unwrap();
     println!(
-        "Message ack: accepted={} error='{}'",
-        ack.accepted, ack.error
+        "Message ack: ok={} error={:?}",
+        ack.ok,
+        ack.error.as_ref().map(|e| &e.code)
     );
 
-    // 3) Resolve message (DecisionMode resolves when payload == "resolve")
+    // 5) Resolve message (DecisionMode resolves when payload == "resolve")
     let resolve = Envelope {
-        macp_version: "v1".into(),
+        macp_version: "1.0".into(),
         mode: "decision".into(),
         message_type: "Message".into(),
         message_id: "m3".into(),
@@ -65,19 +98,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let ack = client
-        .send_message(SendMessageRequest {
+        .send(SendRequest {
             envelope: Some(resolve),
         })
         .await?
-        .into_inner();
+        .into_inner()
+        .ack
+        .unwrap();
     println!(
-        "Resolve ack: accepted={} error='{}'",
-        ack.accepted, ack.error
+        "Resolve ack: ok={} error={:?}",
+        ack.ok,
+        ack.error.as_ref().map(|e| &e.code)
     );
 
-    // 4) Message after resolve (should be rejected: SessionNotOpen)
+    // 6) Message after resolve (should be rejected: SessionNotOpen)
     let after = Envelope {
-        macp_version: "v1".into(),
+        macp_version: "1.0".into(),
         mode: "decision".into(),
         message_type: "Message".into(),
         message_id: "m4".into(),
@@ -88,15 +124,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let ack = client
-        .send_message(SendMessageRequest {
+        .send(SendRequest {
             envelope: Some(after),
         })
         .await?
-        .into_inner();
+        .into_inner()
+        .ack
+        .unwrap();
     println!(
-        "After-resolve ack: accepted={} error='{}'",
-        ack.accepted, ack.error
+        "After-resolve ack: ok={} error={:?}",
+        ack.ok,
+        ack.error.as_ref().map(|e| &e.code)
     );
+
+    // 7) GetSession — verify resolved state
+    let resp = client
+        .get_session(GetSessionRequest {
+            session_id: "s1".into(),
+        })
+        .await?
+        .into_inner();
+    let meta = resp.metadata.unwrap();
+    println!("GetSession: state={} mode={}", meta.state, meta.mode);
 
     Ok(())
 }
