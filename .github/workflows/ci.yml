@@ -170,10 +170,40 @@ jobs:
             echo "No buf module found on main branch, skipping breaking change check"
           fi
 
+  proto-sync:
+    name: Proto Sync Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bufbuild/buf-setup-action@v1
+      - name: Verify protos match pinned BSR version
+        run: |
+          TMPDIR=$(mktemp -d)
+          buf export buf.build/multiagentcoordinationprotocol/macp -o "$TMPDIR"
+
+          DRIFT=0
+          for proto in \
+            macp/v1/envelope.proto \
+            macp/v1/core.proto \
+            macp/modes/decision/v1/decision.proto; do
+            if ! diff -q "$TMPDIR/$proto" "proto/$proto" > /dev/null 2>&1; then
+              echo "DRIFT: $proto"
+              diff -u "$TMPDIR/$proto" "proto/$proto" || true
+              DRIFT=1
+            fi
+          done
+          rm -rf "$TMPDIR"
+
+          if [ "$DRIFT" -ne 0 ]; then
+            echo "Proto files don't match BSR. Run 'make sync-protos'."
+            exit 1
+          fi
+          echo "All proto files match BSR."
+
   ci-pass:
     name: All Checks Passed
     runs-on: ubuntu-latest
-    needs: [check, fmt, clippy, test, build, lint-protobuf]
+    needs: [check, fmt, clippy, test, build, lint-protobuf, proto-sync]
 
     steps:
       - name: Summary
@@ -185,3 +215,4 @@ jobs:
           echo "  - cargo test"
           echo "  - cargo build --release"
           echo "  - protobuf lint"
+          echo "  - proto sync check"
