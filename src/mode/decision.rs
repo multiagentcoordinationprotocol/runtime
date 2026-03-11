@@ -1,9 +1,11 @@
+use crate::decision_pb::{EvaluationPayload, ObjectionPayload, ProposalPayload, VotePayload};
 use crate::error::MacpError;
 use crate::mode::{Mode, ModeResponse};
 use crate::pb::Envelope;
 use crate::session::Session;
+use prost::Message;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 /// Phase of the decision lifecycle.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -17,10 +19,10 @@ pub enum DecisionPhase {
 /// Internal state tracked across the decision lifecycle.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecisionState {
-    pub proposals: HashMap<String, Proposal>,
+    pub proposals: BTreeMap<String, Proposal>,
     pub evaluations: Vec<Evaluation>,
     pub objections: Vec<Objection>,
-    pub votes: HashMap<String, Vote>,
+    pub votes: BTreeMap<String, Vote>,
     pub phase: DecisionPhase,
 }
 
@@ -58,6 +60,7 @@ pub struct Vote {
 }
 
 /// DecisionMode implements the RFC-compliant Proposal -> Evaluation -> Vote -> Commitment lifecycle.
+/// Payloads are protobuf-encoded using types from `decision.proto`.
 /// Also supports the legacy `payload == b"resolve"` behavior for backward compatibility.
 pub struct DecisionMode;
 
@@ -74,14 +77,18 @@ impl DecisionMode {
 impl Mode for DecisionMode {
     fn on_session_start(
         &self,
-        _session: &Session,
+        session: &Session,
         _env: &Envelope,
     ) -> Result<ModeResponse, MacpError> {
+        // Enforce declared participant model for canonical mode name
+        if session.mode == "macp.mode.decision.v1" && session.participants.is_empty() {
+            return Err(MacpError::InvalidPayload);
+        }
         let state = DecisionState {
-            proposals: HashMap::new(),
+            proposals: BTreeMap::new(),
             evaluations: Vec::new(),
             objections: Vec::new(),
-            votes: HashMap::new(),
+            votes: BTreeMap::new(),
             phase: DecisionPhase::Proposal,
         };
         Ok(ModeResponse::PersistState(Self::encode_state(&state)))
@@ -101,10 +108,10 @@ impl Mode for DecisionMode {
 
         let mut state = if session.mode_state.is_empty() {
             DecisionState {
-                proposals: HashMap::new(),
+                proposals: BTreeMap::new(),
                 evaluations: Vec::new(),
                 objections: Vec::new(),
-                votes: HashMap::new(),
+                votes: BTreeMap::new(),
                 phase: DecisionPhase::Proposal,
             }
         } else {
@@ -117,8 +124,8 @@ impl Mode for DecisionMode {
 
         match env.message_type.as_str() {
             "Proposal" => {
-                let payload: ProposalInput =
-                    serde_json::from_slice(&env.payload).map_err(|_| MacpError::InvalidPayload)?;
+                let payload = ProposalPayload::decode(&*env.payload)
+                    .map_err(|_| MacpError::InvalidPayload)?;
                 if payload.proposal_id.is_empty() {
                     return Err(MacpError::InvalidPayload);
                 }
@@ -127,7 +134,7 @@ impl Mode for DecisionMode {
                     Proposal {
                         proposal_id: payload.proposal_id,
                         option: payload.option,
-                        rationale: payload.rationale.unwrap_or_default(),
+                        rationale: payload.rationale,
                         sender: env.sender.clone(),
                     },
                 );
@@ -135,30 +142,34 @@ impl Mode for DecisionMode {
                 Ok(ModeResponse::PersistState(Self::encode_state(&state)))
             }
             "Evaluation" => {
-                let payload: EvaluationInput =
-                    serde_json::from_slice(&env.payload).map_err(|_| MacpError::InvalidPayload)?;
+                let payload = EvaluationPayload::decode(&*env.payload)
+                    .map_err(|_| MacpError::InvalidPayload)?;
                 if !state.proposals.contains_key(&payload.proposal_id) {
                     return Err(MacpError::InvalidPayload);
                 }
                 state.evaluations.push(Evaluation {
                     proposal_id: payload.proposal_id,
                     recommendation: payload.recommendation,
-                    confidence: payload.confidence.unwrap_or(0.0),
-                    reason: payload.reason.unwrap_or_default(),
+                    confidence: payload.confidence,
+                    reason: payload.reason,
                     sender: env.sender.clone(),
                 });
                 Ok(ModeResponse::PersistState(Self::encode_state(&state)))
             }
             "Objection" => {
-                let payload: ObjectionInput =
-                    serde_json::from_slice(&env.payload).map_err(|_| MacpError::InvalidPayload)?;
+                let payload = ObjectionPayload::decode(&*env.payload)
+                    .map_err(|_| MacpError::InvalidPayload)?;
                 if !state.proposals.contains_key(&payload.proposal_id) {
                     return Err(MacpError::InvalidPayload);
                 }
                 state.objections.push(Objection {
                     proposal_id: payload.proposal_id,
                     reason: payload.reason,
-                    severity: payload.severity.unwrap_or_else(|| "medium".into()),
+                    severity: if payload.severity.is_empty() {
+                        "medium".into()
+                    } else {
+                        payload.severity
+                    },
                     sender: env.sender.clone(),
                 });
                 Ok(ModeResponse::PersistState(Self::encode_state(&state)))
@@ -167,8 +178,8 @@ impl Mode for DecisionMode {
                 if state.proposals.is_empty() {
                     return Err(MacpError::InvalidPayload);
                 }
-                let payload: VoteInput =
-                    serde_json::from_slice(&env.payload).map_err(|_| MacpError::InvalidPayload)?;
+                let payload =
+                    VotePayload::decode(&*env.payload).map_err(|_| MacpError::InvalidPayload)?;
                 if !state.proposals.contains_key(&payload.proposal_id) {
                     return Err(MacpError::InvalidPayload);
                 }
@@ -177,7 +188,7 @@ impl Mode for DecisionMode {
                     Vote {
                         proposal_id: payload.proposal_id,
                         vote: payload.vote,
-                        reason: payload.reason.unwrap_or_default(),
+                        reason: payload.reason,
                         sender: env.sender.clone(),
                     },
                 );
@@ -197,36 +208,6 @@ impl Mode for DecisionMode {
             _ => Ok(ModeResponse::NoOp),
         }
     }
-}
-
-// Input types for JSON deserialization from payload
-#[derive(Deserialize)]
-struct ProposalInput {
-    proposal_id: String,
-    option: String,
-    rationale: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct EvaluationInput {
-    proposal_id: String,
-    recommendation: String,
-    confidence: Option<f64>,
-    reason: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ObjectionInput {
-    proposal_id: String,
-    reason: String,
-    severity: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct VoteInput {
-    proposal_id: String,
-    vote: String,
-    reason: Option<String>,
 }
 
 #[cfg(test)]
@@ -274,10 +255,10 @@ mod tests {
 
     fn empty_state() -> DecisionState {
         DecisionState {
-            proposals: HashMap::new(),
+            proposals: BTreeMap::new(),
             evaluations: Vec::new(),
             objections: Vec::new(),
-            votes: HashMap::new(),
+            votes: BTreeMap::new(),
             phase: DecisionPhase::Proposal,
         }
     }
@@ -310,6 +291,50 @@ mod tests {
         );
         state.phase = DecisionPhase::Voting;
         state
+    }
+
+    // Helper to encode protobuf payloads
+    fn encode_proposal(proposal_id: &str, option: &str, rationale: &str) -> Vec<u8> {
+        ProposalPayload {
+            proposal_id: proposal_id.into(),
+            option: option.into(),
+            rationale: rationale.into(),
+            supporting_data: vec![],
+        }
+        .encode_to_vec()
+    }
+
+    fn encode_evaluation(
+        proposal_id: &str,
+        recommendation: &str,
+        confidence: f64,
+        reason: &str,
+    ) -> Vec<u8> {
+        EvaluationPayload {
+            proposal_id: proposal_id.into(),
+            recommendation: recommendation.into(),
+            confidence,
+            reason: reason.into(),
+        }
+        .encode_to_vec()
+    }
+
+    fn encode_objection(proposal_id: &str, reason: &str, severity: &str) -> Vec<u8> {
+        ObjectionPayload {
+            proposal_id: proposal_id.into(),
+            reason: reason.into(),
+            severity: severity.into(),
+        }
+        .encode_to_vec()
+    }
+
+    fn encode_vote(proposal_id: &str, vote: &str, reason: &str) -> Vec<u8> {
+        VotePayload {
+            proposal_id: proposal_id.into(),
+            vote: vote.into(),
+            reason: reason.into(),
+        }
+        .encode_to_vec()
     }
 
     #[test]
@@ -357,12 +382,8 @@ mod tests {
     fn proposal_creates_entry_and_advances_phase() {
         let mode = DecisionMode;
         let session = session_with_state(&empty_state());
-        let payload = serde_json::json!({
-            "proposal_id": "p1",
-            "option": "option_a",
-            "rationale": "it's the best"
-        });
-        let env = test_envelope("Proposal", payload.to_string().as_bytes());
+        let payload = encode_proposal("p1", "option_a", "it's the best");
+        let env = test_envelope("Proposal", &payload);
 
         let result = mode.on_message(&session, &env).unwrap();
         match result {
@@ -382,20 +403,17 @@ mod tests {
     fn proposal_with_empty_id_rejected() {
         let mode = DecisionMode;
         let session = session_with_state(&empty_state());
-        let payload = serde_json::json!({
-            "proposal_id": "",
-            "option": "opt"
-        });
-        let env = test_envelope("Proposal", payload.to_string().as_bytes());
+        let payload = encode_proposal("", "opt", "");
+        let env = test_envelope("Proposal", &payload);
         let err = mode.on_message(&session, &env).unwrap_err();
         assert_eq!(err.to_string(), "InvalidPayload");
     }
 
     #[test]
-    fn proposal_with_bad_json_rejected() {
+    fn proposal_with_bad_payload_rejected() {
         let mode = DecisionMode;
         let session = session_with_state(&empty_state());
-        let env = test_envelope("Proposal", b"not json");
+        let env = test_envelope("Proposal", b"not protobuf");
         let err = mode.on_message(&session, &env).unwrap_err();
         assert_eq!(err.to_string(), "InvalidPayload");
     }
@@ -406,13 +424,8 @@ mod tests {
     fn evaluation_for_existing_proposal() {
         let mode = DecisionMode;
         let session = session_with_state(&state_with_proposal());
-        let payload = serde_json::json!({
-            "proposal_id": "p1",
-            "recommendation": "APPROVE",
-            "confidence": 0.9,
-            "reason": "looks good"
-        });
-        let env = test_envelope("Evaluation", payload.to_string().as_bytes());
+        let payload = encode_evaluation("p1", "APPROVE", 0.9, "looks good");
+        let env = test_envelope("Evaluation", &payload);
 
         let result = mode.on_message(&session, &env).unwrap();
         match result {
@@ -429,11 +442,8 @@ mod tests {
     fn evaluation_for_nonexistent_proposal_rejected() {
         let mode = DecisionMode;
         let session = session_with_state(&state_with_proposal());
-        let payload = serde_json::json!({
-            "proposal_id": "nonexistent",
-            "recommendation": "APPROVE"
-        });
-        let env = test_envelope("Evaluation", payload.to_string().as_bytes());
+        let payload = encode_evaluation("nonexistent", "APPROVE", 0.9, "");
+        let env = test_envelope("Evaluation", &payload);
         let err = mode.on_message(&session, &env).unwrap_err();
         assert_eq!(err.to_string(), "InvalidPayload");
     }
@@ -444,12 +454,8 @@ mod tests {
     fn objection_for_existing_proposal() {
         let mode = DecisionMode;
         let session = session_with_state(&state_with_proposal());
-        let payload = serde_json::json!({
-            "proposal_id": "p1",
-            "reason": "too risky",
-            "severity": "high"
-        });
-        let env = test_envelope("Objection", payload.to_string().as_bytes());
+        let payload = encode_objection("p1", "too risky", "high");
+        let env = test_envelope("Objection", &payload);
 
         let result = mode.on_message(&session, &env).unwrap();
         match result {
@@ -466,11 +472,8 @@ mod tests {
     fn objection_for_nonexistent_proposal_rejected() {
         let mode = DecisionMode;
         let session = session_with_state(&state_with_proposal());
-        let payload = serde_json::json!({
-            "proposal_id": "nope",
-            "reason": "bad"
-        });
-        let env = test_envelope("Objection", payload.to_string().as_bytes());
+        let payload = encode_objection("nope", "bad", "medium");
+        let env = test_envelope("Objection", &payload);
         let err = mode.on_message(&session, &env).unwrap_err();
         assert_eq!(err.to_string(), "InvalidPayload");
     }
@@ -481,12 +484,8 @@ mod tests {
     fn vote_for_existing_proposal() {
         let mode = DecisionMode;
         let session = session_with_state(&state_with_proposal());
-        let payload = serde_json::json!({
-            "proposal_id": "p1",
-            "vote": "approve",
-            "reason": "I agree"
-        });
-        let env = test_envelope("Vote", payload.to_string().as_bytes());
+        let payload = encode_vote("p1", "approve", "I agree");
+        let env = test_envelope("Vote", &payload);
 
         let result = mode.on_message(&session, &env).unwrap();
         match result {
@@ -504,11 +503,8 @@ mod tests {
     fn vote_before_proposal_rejected() {
         let mode = DecisionMode;
         let session = session_with_state(&empty_state());
-        let payload = serde_json::json!({
-            "proposal_id": "p1",
-            "vote": "approve"
-        });
-        let env = test_envelope("Vote", payload.to_string().as_bytes());
+        let payload = encode_vote("p1", "approve", "");
+        let env = test_envelope("Vote", &payload);
         let err = mode.on_message(&session, &env).unwrap_err();
         assert_eq!(err.to_string(), "InvalidPayload");
     }
@@ -517,11 +513,8 @@ mod tests {
     fn vote_for_nonexistent_proposal_rejected() {
         let mode = DecisionMode;
         let session = session_with_state(&state_with_proposal());
-        let payload = serde_json::json!({
-            "proposal_id": "nope",
-            "vote": "approve"
-        });
-        let env = test_envelope("Vote", payload.to_string().as_bytes());
+        let payload = encode_vote("nope", "approve", "");
+        let env = test_envelope("Vote", &payload);
         let err = mode.on_message(&session, &env).unwrap_err();
         assert_eq!(err.to_string(), "InvalidPayload");
     }
@@ -530,11 +523,8 @@ mod tests {
     fn vote_overwrites_previous_vote_by_sender() {
         let mode = DecisionMode;
         let session = session_with_state(&state_with_proposal());
-        let payload = serde_json::json!({
-            "proposal_id": "p1",
-            "vote": "approve"
-        });
-        let env = test_envelope("Vote", payload.to_string().as_bytes());
+        let payload = encode_vote("p1", "approve", "");
+        let env = test_envelope("Vote", &payload);
         let result = mode.on_message(&session, &env).unwrap();
         let data = match result {
             ModeResponse::PersistState(d) => d,
@@ -544,11 +534,8 @@ mod tests {
         // Second vote by same sender
         let mut session2 = test_session();
         session2.mode_state = data;
-        let payload2 = serde_json::json!({
-            "proposal_id": "p1",
-            "vote": "reject"
-        });
-        let env2 = test_envelope("Vote", payload2.to_string().as_bytes());
+        let payload2 = encode_vote("p1", "reject", "");
+        let env2 = test_envelope("Vote", &payload2);
         let result2 = mode.on_message(&session2, &env2).unwrap();
         match result2 {
             ModeResponse::PersistState(data) => {
@@ -566,12 +553,8 @@ mod tests {
     fn commitment_resolves_session() {
         let mode = DecisionMode;
         let session = session_with_state(&state_with_vote());
-        let payload = serde_json::json!({
-            "commitment_id": "c1",
-            "action": "deploy option_a",
-            "authority_scope": "team-alpha"
-        });
-        let env = test_envelope("Commitment", payload.to_string().as_bytes());
+        let payload = b"commitment-data";
+        let env = test_envelope("Commitment", payload);
 
         let result = mode.on_message(&session, &env).unwrap();
         match result {
@@ -588,11 +571,7 @@ mod tests {
     fn commitment_without_votes_rejected() {
         let mode = DecisionMode;
         let session = session_with_state(&state_with_proposal());
-        let payload = serde_json::json!({
-            "commitment_id": "c1",
-            "action": "deploy"
-        });
-        let env = test_envelope("Commitment", payload.to_string().as_bytes());
+        let env = test_envelope("Commitment", b"commit-data");
         let err = mode.on_message(&session, &env).unwrap_err();
         assert_eq!(err.to_string(), "InvalidPayload");
     }
@@ -612,49 +591,31 @@ mod tests {
         }
 
         // Proposal
-        let payload = serde_json::json!({
-            "proposal_id": "p1",
-            "option": "option_a",
-            "rationale": "best choice"
-        });
-        let env = test_envelope("Proposal", payload.to_string().as_bytes());
+        let payload = encode_proposal("p1", "option_a", "best choice");
+        let env = test_envelope("Proposal", &payload);
         let result = mode.on_message(&session, &env).unwrap();
         if let ModeResponse::PersistState(data) = result {
             session.mode_state = data;
         }
 
         // Evaluation
-        let payload = serde_json::json!({
-            "proposal_id": "p1",
-            "recommendation": "APPROVE",
-            "confidence": 0.95
-        });
-        let env = test_envelope("Evaluation", payload.to_string().as_bytes());
+        let payload = encode_evaluation("p1", "APPROVE", 0.95, "");
+        let env = test_envelope("Evaluation", &payload);
         let result = mode.on_message(&session, &env).unwrap();
         if let ModeResponse::PersistState(data) = result {
             session.mode_state = data;
         }
 
         // Vote
-        let payload = serde_json::json!({
-            "proposal_id": "p1",
-            "vote": "approve",
-            "reason": "agreed"
-        });
-        let env = test_envelope("Vote", payload.to_string().as_bytes());
+        let payload = encode_vote("p1", "approve", "agreed");
+        let env = test_envelope("Vote", &payload);
         let result = mode.on_message(&session, &env).unwrap();
         if let ModeResponse::PersistState(data) = result {
             session.mode_state = data;
         }
 
         // Commitment
-        let payload = serde_json::json!({
-            "commitment_id": "c1",
-            "action": "deploy option_a",
-            "authority_scope": "team",
-            "reason": "consensus reached"
-        });
-        let env = test_envelope("Commitment", payload.to_string().as_bytes());
+        let env = test_envelope("Commitment", b"final-commitment");
         let result = mode.on_message(&session, &env).unwrap();
         assert!(matches!(result, ModeResponse::PersistAndResolve { .. }));
     }
@@ -666,12 +627,113 @@ mod tests {
         state.phase = DecisionPhase::Committed;
         let session = session_with_state(&state);
 
-        let payload = serde_json::json!({
-            "proposal_id": "p1",
-            "option": "option_b"
-        });
-        let env = test_envelope("Proposal", payload.to_string().as_bytes());
+        let payload = encode_proposal("p1", "option_b", "");
+        let env = test_envelope("Proposal", &payload);
         let err = mode.on_message(&session, &env).unwrap_err();
         assert_eq!(err.to_string(), "SessionNotOpen");
+    }
+
+    #[test]
+    fn objection_default_severity() {
+        let mode = DecisionMode;
+        let session = session_with_state(&state_with_proposal());
+        // Encode with empty severity -- should default to "medium"
+        let payload = encode_objection("p1", "bad idea", "");
+        let env = test_envelope("Objection", &payload);
+
+        let result = mode.on_message(&session, &env).unwrap();
+        match result {
+            ModeResponse::PersistState(data) => {
+                let state: DecisionState = serde_json::from_slice(&data).unwrap();
+                assert_eq!(state.objections[0].severity, "medium");
+            }
+            _ => panic!("Expected PersistState"),
+        }
+    }
+
+    #[test]
+    fn btreemap_deterministic_serialization() {
+        // Verify BTreeMap produces deterministic output
+        let mut state1 = empty_state();
+        state1.proposals.insert(
+            "z".into(),
+            Proposal {
+                proposal_id: "z".into(),
+                option: "z".into(),
+                rationale: "".into(),
+                sender: "".into(),
+            },
+        );
+        state1.proposals.insert(
+            "a".into(),
+            Proposal {
+                proposal_id: "a".into(),
+                option: "a".into(),
+                rationale: "".into(),
+                sender: "".into(),
+            },
+        );
+
+        let mut state2 = empty_state();
+        state2.proposals.insert(
+            "a".into(),
+            Proposal {
+                proposal_id: "a".into(),
+                option: "a".into(),
+                rationale: "".into(),
+                sender: "".into(),
+            },
+        );
+        state2.proposals.insert(
+            "z".into(),
+            Proposal {
+                proposal_id: "z".into(),
+                option: "z".into(),
+                rationale: "".into(),
+                sender: "".into(),
+            },
+        );
+
+        let enc1 = DecisionMode::encode_state(&state1);
+        let enc2 = DecisionMode::encode_state(&state2);
+        assert_eq!(enc1, enc2);
+    }
+
+    // --- Participant enforcement tests ---
+
+    #[test]
+    fn canonical_mode_requires_participants() {
+        let mode = DecisionMode;
+        let mut session = test_session();
+        session.mode = "macp.mode.decision.v1".into();
+        session.participants = vec![]; // empty
+        let env = test_envelope("SessionStart", b"");
+
+        let err = mode.on_session_start(&session, &env).unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
+    }
+
+    #[test]
+    fn canonical_mode_with_participants_succeeds() {
+        let mode = DecisionMode;
+        let mut session = test_session();
+        session.mode = "macp.mode.decision.v1".into();
+        session.participants = vec!["alice".into(), "bob".into()];
+        let env = test_envelope("SessionStart", b"");
+
+        let result = mode.on_session_start(&session, &env).unwrap();
+        assert!(matches!(result, ModeResponse::PersistState(_)));
+    }
+
+    #[test]
+    fn legacy_alias_allows_empty_participants() {
+        let mode = DecisionMode;
+        let mut session = test_session();
+        session.mode = "decision".into();
+        session.participants = vec![]; // empty -- should be allowed for legacy alias
+        let env = test_envelope("SessionStart", b"");
+
+        let result = mode.on_session_start(&session, &env).unwrap();
+        assert!(matches!(result, ModeResponse::PersistState(_)));
     }
 }

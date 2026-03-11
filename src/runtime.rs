@@ -130,17 +130,8 @@ impl Runtime {
         let now = Utc::now().timestamp_millis();
         let ttl_expiry = now + ttl_ms;
 
-        // Create session log and append incoming entry
-        self.log_store.create_session_log(&env.session_id).await;
-        self.log_store
-            .append(&env.session_id, Self::make_incoming_entry(env))
-            .await;
-
         // Extract participants from SessionStartPayload
         let participants = start_payload.participants.clone();
-
-        let mut seen_message_ids = HashSet::new();
-        seen_message_ids.insert(env.message_id.clone());
 
         // Create session with initial state and RFC version fields
         let session = Session {
@@ -152,18 +143,24 @@ impl Runtime {
             mode: mode_name.to_string(),
             mode_state: vec![],
             participants,
-            seen_message_ids,
+            seen_message_ids: HashSet::new(),
             intent: start_payload.intent.clone(),
             mode_version: start_payload.mode_version.clone(),
             configuration_version: start_payload.configuration_version.clone(),
             policy_version: start_payload.policy_version.clone(),
         };
 
-        // Call mode's on_session_start
+        // Call mode's on_session_start BEFORE recording side effects
         let response = mode.on_session_start(&session, env)?;
 
-        // Insert session and apply response
+        // Only on success: create log and record message_id
+        self.log_store.create_session_log(&env.session_id).await;
+        self.log_store
+            .append(&env.session_id, Self::make_incoming_entry(env))
+            .await;
+
         let mut session = session;
+        session.seen_message_ids.insert(env.message_id.clone());
         Self::apply_mode_response(&mut session, response);
 
         // For multi_round mode, extract participants from mode_state if not already set
@@ -221,18 +218,18 @@ impl Runtime {
             return Err(MacpError::Forbidden);
         }
 
-        // Record message_id
-        session.seen_message_ids.insert(env.message_id.clone());
+        let mode_name = session.mode.clone();
+        let mode = self.modes.get(&mode_name).ok_or(MacpError::UnknownMode)?;
 
-        // Log incoming message before mode dispatch
+        // Dispatch to mode BEFORE recording side effects
+        let response = mode.on_message(session, env)?;
+
+        // Only on success: record message_id and log
+        session.seen_message_ids.insert(env.message_id.clone());
         self.log_store
             .append(&env.session_id, Self::make_incoming_entry(env))
             .await;
 
-        let mode_name = session.mode.clone();
-        let mode = self.modes.get(&mode_name).ok_or(MacpError::UnknownMode)?;
-
-        let response = mode.on_message(session, env)?;
         Self::apply_mode_response(session, response);
 
         Ok(ProcessResult {
@@ -249,6 +246,23 @@ impl Runtime {
         })
     }
 
+    /// Get a session with TTL check. Transitions expired sessions to Expired state.
+    pub async fn get_session_checked(&self, session_id: &str) -> Option<Session> {
+        let mut guard = self.registry.sessions.write().await;
+        if let Some(session) = guard.get_mut(session_id) {
+            let now = Utc::now().timestamp_millis();
+            if session.state == SessionState::Open && now > session.ttl_expiry {
+                self.log_store
+                    .append(session_id, Self::make_internal_entry("TtlExpired", b""))
+                    .await;
+                session.state = SessionState::Expired;
+            }
+            Some(session.clone())
+        } else {
+            None
+        }
+    }
+
     /// Cancel a session by ID. Idempotent for already-resolved/expired sessions.
     pub async fn cancel_session(
         &self,
@@ -258,6 +272,15 @@ impl Runtime {
         let mut guard = self.registry.sessions.write().await;
 
         let session = guard.get_mut(session_id).ok_or(MacpError::UnknownSession)?;
+
+        // TTL check: transition expired sessions
+        let now = Utc::now().timestamp_millis();
+        if session.state == SessionState::Open && now > session.ttl_expiry {
+            self.log_store
+                .append(session_id, Self::make_internal_entry("TtlExpired", b""))
+                .await;
+            session.state = SessionState::Expired;
+        }
 
         // Idempotent: already resolved or expired
         if session.state == SessionState::Resolved || session.state == SessionState::Expired {
@@ -287,6 +310,7 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decision_pb::ProposalPayload;
     use crate::pb::SessionStartPayload;
     use prost::Message;
 
@@ -356,7 +380,9 @@ mod tests {
     async fn empty_mode_defaults_to_decision() {
         let rt = make_runtime();
 
-        let e = env("", "SessionStart", "m1", "s1", "alice", b"");
+        // Empty mode defaults to macp.mode.decision.v1 which requires participants
+        let payload = encode_session_start(0, vec!["alice".into()]);
+        let e = env("", "SessionStart", "m1", "s1", "alice", &payload);
         rt.process(&e).await.unwrap();
 
         let guard = rt.registry.sessions.read().await;
@@ -703,13 +729,14 @@ mod tests {
     async fn rfc_mode_name_works() {
         let rt = make_runtime();
 
+        let payload = encode_session_start(0, vec!["alice".into()]);
         let e = env(
             "macp.mode.decision.v1",
             "SessionStart",
             "m1",
             "s1",
             "alice",
-            b"",
+            &payload,
         );
         rt.process(&e).await.unwrap();
 
@@ -1096,5 +1123,165 @@ mod tests {
         assert_eq!(s.mode_version, "1.0");
         assert_eq!(s.configuration_version, "cfg-v2");
         assert_eq!(s.policy_version, "pol-v1");
+    }
+
+    // --- PR #1a: Admission pipeline bug tests ---
+
+    #[tokio::test]
+    async fn rejected_message_does_not_burn_message_id() {
+        let rt = make_runtime();
+
+        // Create a decision session with a proposal so we can test invalid payloads
+        let e = env("decision", "SessionStart", "m1", "s1", "alice", b"");
+        rt.process(&e).await.unwrap();
+
+        // Send a Proposal with invalid payload — should be rejected
+        let e = env("decision", "Proposal", "m2", "s1", "alice", b"not protobuf");
+        let err = rt.process(&e).await.unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
+
+        // Retry the same message_id with valid payload — should succeed (not duplicate)
+        let valid_payload = ProposalPayload {
+            proposal_id: "p1".into(),
+            option: "option_a".into(),
+            rationale: "test".into(),
+            supporting_data: vec![],
+        }
+        .encode_to_vec();
+        let e = env("decision", "Proposal", "m2", "s1", "alice", &valid_payload);
+        let result = rt.process(&e).await.unwrap();
+        assert!(!result.duplicate);
+    }
+
+    #[tokio::test]
+    async fn rejected_message_not_in_log() {
+        let rt = make_runtime();
+
+        let e = env("decision", "SessionStart", "m1", "s1", "alice", b"");
+        rt.process(&e).await.unwrap();
+
+        let log_before = rt.log_store.get_log("s1").await.unwrap().len();
+
+        // Send a Proposal with invalid payload — should be rejected
+        let e = env("decision", "Proposal", "m2", "s1", "alice", b"not protobuf");
+        let _ = rt.process(&e).await;
+
+        let log_after = rt.log_store.get_log("s1").await.unwrap().len();
+        assert_eq!(log_before, log_after); // No new log entry for rejected message
+    }
+
+    #[tokio::test]
+    async fn accepted_messages_still_dedup_correctly() {
+        let rt = make_runtime();
+
+        let e = env("decision", "SessionStart", "m1", "s1", "alice", b"");
+        rt.process(&e).await.unwrap();
+
+        let e = env("decision", "Message", "m2", "s1", "alice", b"hello");
+        let result = rt.process(&e).await.unwrap();
+        assert!(!result.duplicate);
+
+        // Same message_id again — should be duplicate
+        let e = env("decision", "Message", "m2", "s1", "alice", b"hello");
+        let result = rt.process(&e).await.unwrap();
+        assert!(result.duplicate);
+    }
+
+    #[tokio::test]
+    async fn session_start_mode_rejection_no_side_effects() {
+        let rt = make_runtime();
+
+        // MultiRound requires participants — empty participants should fail
+        let e = env("multi_round", "SessionStart", "m1", "s1", "creator", b"");
+        let err = rt.process(&e).await.unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
+
+        // Session should not exist
+        assert!(rt.registry.get_session("s1").await.is_none());
+        // Log should not exist
+        assert!(rt.log_store.get_log("s1").await.is_none());
+    }
+
+    // --- PR #1b: TTL on GetSession/CancelSession tests ---
+
+    #[tokio::test]
+    async fn get_session_checked_transitions_expired() {
+        let rt = make_runtime();
+
+        let payload = encode_session_start(1, vec![]);
+        let e = env("decision", "SessionStart", "m1", "s1", "alice", &payload);
+        rt.process(&e).await.unwrap();
+
+        // Wait for TTL to expire
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let session = rt.get_session_checked("s1").await.unwrap();
+        assert_eq!(session.state, SessionState::Expired);
+    }
+
+    #[tokio::test]
+    async fn cancel_expired_session_returns_expired_idempotent() {
+        let rt = make_runtime();
+
+        let payload = encode_session_start(1, vec![]);
+        let e = env("decision", "SessionStart", "m1", "s1", "alice", &payload);
+        rt.process(&e).await.unwrap();
+
+        // Wait for TTL to expire
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Cancel should detect TTL expiry and return Expired idempotently
+        let result = rt.cancel_session("s1", "cancel attempt").await.unwrap();
+        assert_eq!(result.session_state, SessionState::Expired);
+    }
+
+    // --- PR #5: Participant enforcement tests ---
+
+    #[tokio::test]
+    async fn canonical_decision_mode_requires_participants() {
+        let rt = make_runtime();
+
+        // macp.mode.decision.v1 with no participants should fail
+        let e = env(
+            "macp.mode.decision.v1",
+            "SessionStart",
+            "m1",
+            "s1",
+            "alice",
+            b"",
+        );
+        let err = rt.process(&e).await.unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
+    }
+
+    #[tokio::test]
+    async fn canonical_decision_mode_with_participants_succeeds() {
+        let rt = make_runtime();
+
+        let payload = encode_session_start(0, vec!["alice".into(), "bob".into()]);
+        let e = env(
+            "macp.mode.decision.v1",
+            "SessionStart",
+            "m1",
+            "s1",
+            "alice",
+            &payload,
+        );
+        rt.process(&e).await.unwrap();
+
+        let s = rt.registry.get_session("s1").await.unwrap();
+        assert_eq!(s.mode, "macp.mode.decision.v1");
+        assert_eq!(s.participants, vec!["alice", "bob"]);
+    }
+
+    #[tokio::test]
+    async fn legacy_decision_alias_allows_empty_participants() {
+        let rt = make_runtime();
+
+        let e = env("decision", "SessionStart", "m1", "s1", "alice", b"");
+        rt.process(&e).await.unwrap();
+
+        let s = rt.registry.get_session("s1").await.unwrap();
+        assert_eq!(s.mode, "decision");
     }
 }
