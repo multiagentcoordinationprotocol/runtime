@@ -89,7 +89,7 @@ impl MacpRuntimeService for MacpServer {
             runtime_info: Some(RuntimeInfo {
                 name: "macp-runtime".into(),
                 title: "MACP Reference Runtime".into(),
-                version: "0.2".into(),
+                version: "0.3".into(),
                 description: "Reference implementation of the Multi-Agent Coordination Protocol"
                     .into(),
                 website_url: String::new(),
@@ -150,7 +150,7 @@ impl MacpRuntimeService for MacpServer {
     ) -> Result<Response<GetSessionResponse>, Status> {
         let req = request.into_inner();
 
-        match self.runtime.registry.get_session(&req.session_id).await {
+        match self.runtime.get_session_checked(&req.session_id).await {
             Some(session) => {
                 let state = Self::session_state_to_pb(&session.state);
 
@@ -247,8 +247,9 @@ impl MacpRuntimeService for MacpServer {
                 title: "Decision Mode".into(),
                 description: "Proposal-based decision making with voting".into(),
                 determinism_class: "semantic-deterministic".into(),
-                participant_model: "open".into(),
+                participant_model: "declared".into(),
                 message_types: vec![
+                    "SessionStart".into(),
                     "Proposal".into(),
                     "Evaluation".into(),
                     "Objection".into(),
@@ -262,10 +263,11 @@ impl MacpRuntimeService for MacpServer {
                 mode: "macp.mode.multi_round.v1".into(),
                 mode_version: "1.0".into(),
                 title: "Multi-Round Convergence Mode".into(),
-                description: "Participant-based convergence with all_equal strategy".into(),
+                description: "Participant-based convergence with all_equal strategy (experimental)"
+                    .into(),
                 determinism_class: "semantic-deterministic".into(),
-                participant_model: "closed".into(),
-                message_types: vec!["Contribute".into()],
+                participant_model: "declared".into(),
+                message_types: vec!["SessionStart".into(), "Contribute".into()],
                 terminal_message_types: vec![],
                 schema_uris: HashMap::new(),
             },
@@ -308,9 +310,24 @@ impl MacpRuntimeService for MacpServer {
                 .await;
 
                 match result {
-                    Ok(_) => {
+                    Ok(result) => {
+                        let ack_env = Envelope {
+                            macp_version: "1.0".into(),
+                            mode: env.mode.clone(),
+                            message_type: "Ack".into(),
+                            message_id: format!("ack-{}", env.message_id),
+                            session_id: env.session_id.clone(),
+                            sender: "_runtime".into(),
+                            timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
+                            payload: serde_json::to_vec(&serde_json::json!({
+                                "ok": true,
+                                "duplicate": result.duplicate,
+                                "session_state": format!("{:?}", result.session_state),
+                            }))
+                            .unwrap_or_default(),
+                        };
                         yield StreamSessionResponse {
-                            envelope: Some(env),
+                            envelope: Some(ack_env),
                         };
                     }
                     Err(e) => {
@@ -1216,7 +1233,7 @@ mod tests {
         assert!(init.runtime_info.is_some());
         let info = init.runtime_info.unwrap();
         assert_eq!(info.name, "macp-runtime");
-        assert_eq!(info.version, "0.2");
+        assert_eq!(info.version, "0.3");
         assert!(init.capabilities.is_some());
         assert!(!init.supported_modes.is_empty());
     }
