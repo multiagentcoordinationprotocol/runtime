@@ -30,4 +30,13 @@ pub trait Mode: Send + Sync {
     ) -> Result<ModeResponse, MacpError>;
 
     fn on_message(&self, session: &Session, env: &Envelope) -> Result<ModeResponse, MacpError>;
+
+    /// Authorize the sender for this message. Modes can override to customize
+    /// authorization (e.g., allowing orchestrator bypass for Commitment messages).
+    fn authorize_sender(&self, session: &Session, env: &Envelope) -> Result<(), MacpError> {
+        if !session.participants.is_empty() && !session.participants.contains(&env.sender) {
+            return Err(MacpError::Forbidden);
+        }
+        Ok(())
+    }
 }

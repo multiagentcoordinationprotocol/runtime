@@ -75,6 +75,20 @@ impl DecisionMode {
 }
 
 impl Mode for DecisionMode {
+    fn authorize_sender(&self, session: &Session, env: &Envelope) -> Result<(), MacpError> {
+        if session.participants.is_empty() {
+            return Ok(());
+        }
+        // Commitment allowed from session initiator (designated orchestrator)
+        if env.message_type == "Commitment" && env.sender == session.initiator_sender {
+            return Ok(());
+        }
+        if !session.participants.contains(&env.sender) {
+            return Err(MacpError::Forbidden);
+        }
+        Ok(())
+    }
+
     fn on_session_start(
         &self,
         session: &Session,
@@ -95,15 +109,22 @@ impl Mode for DecisionMode {
     }
 
     fn on_message(&self, session: &Session, env: &Envelope) -> Result<ModeResponse, MacpError> {
-        // Legacy backward compatibility: payload == "resolve" resolves immediately
-        if env.message_type == "Message" && env.payload == b"resolve" {
+        // Legacy backward compatibility: payload == "resolve" ONLY on alias "decision"
+        if session.mode == "decision" && env.message_type == "Message" && env.payload == b"resolve"
+        {
             return Ok(ModeResponse::Resolve(env.payload.clone()));
         }
 
-        // For non-typed messages, just pass through
         match env.message_type.as_str() {
             "Proposal" | "Evaluation" | "Objection" | "Vote" | "Commitment" => {}
-            _ => return Ok(ModeResponse::NoOp),
+            _ => {
+                // Canonical mode rejects unknown message types
+                if session.mode == "macp.mode.decision.v1" {
+                    return Err(MacpError::InvalidPayload);
+                }
+                // Legacy alias allows unknown message types as NoOp
+                return Ok(ModeResponse::NoOp);
+            }
         }
 
         let mut state = if session.mode_state.is_empty() {
@@ -196,7 +217,7 @@ impl Mode for DecisionMode {
                 Ok(ModeResponse::PersistState(Self::encode_state(&state)))
             }
             "Commitment" => {
-                if state.votes.is_empty() {
+                if state.proposals.is_empty() {
                     return Err(MacpError::InvalidPayload);
                 }
                 state.phase = DecisionPhase::Committed;
@@ -231,6 +252,9 @@ mod tests {
             mode_version: String::new(),
             configuration_version: String::new(),
             policy_version: String::new(),
+            context: vec![],
+            roots: vec![],
+            initiator_sender: String::new(),
         }
     }
 
@@ -568,12 +592,21 @@ mod tests {
     }
 
     #[test]
-    fn commitment_without_votes_rejected() {
+    fn commitment_without_proposals_rejected() {
         let mode = DecisionMode;
-        let session = session_with_state(&state_with_proposal());
+        let session = session_with_state(&empty_state());
         let env = test_envelope("Commitment", b"commit-data");
         let err = mode.on_message(&session, &env).unwrap_err();
         assert_eq!(err.to_string(), "InvalidPayload");
+    }
+
+    #[test]
+    fn commitment_with_proposal_no_votes_succeeds() {
+        let mode = DecisionMode;
+        let session = session_with_state(&state_with_proposal());
+        let env = test_envelope("Commitment", b"commit-data");
+        let result = mode.on_message(&session, &env).unwrap();
+        assert!(matches!(result, ModeResponse::PersistAndResolve { .. }));
     }
 
     // --- Full lifecycle ---
@@ -735,5 +768,49 @@ mod tests {
 
         let result = mode.on_session_start(&session, &env).unwrap();
         assert!(matches!(result, ModeResponse::PersistState(_)));
+    }
+
+    // --- Phase 4: Legacy scoping + canonical strictness ---
+
+    #[test]
+    fn canonical_mode_rejects_legacy_resolve() {
+        let mode = DecisionMode;
+        let mut session = test_session();
+        session.mode = "macp.mode.decision.v1".into();
+        let env = test_envelope("Message", b"resolve");
+
+        let err = mode.on_message(&session, &env).unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
+    }
+
+    #[test]
+    fn canonical_mode_rejects_unknown_message_type() {
+        let mode = DecisionMode;
+        let mut session = test_session();
+        session.mode = "macp.mode.decision.v1".into();
+        let env = test_envelope("CustomType", b"data");
+
+        let err = mode.on_message(&session, &env).unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
+    }
+
+    #[test]
+    fn legacy_alias_allows_legacy_resolve() {
+        let mode = DecisionMode;
+        let session = test_session(); // mode = "decision"
+        let env = test_envelope("Message", b"resolve");
+
+        let result = mode.on_message(&session, &env).unwrap();
+        assert!(matches!(result, ModeResponse::Resolve(_)));
+    }
+
+    #[test]
+    fn legacy_alias_allows_unknown_message_noop() {
+        let mode = DecisionMode;
+        let session = test_session(); // mode = "decision"
+        let env = test_envelope("CustomType", b"data");
+
+        let result = mode.on_message(&session, &env).unwrap();
+        assert!(matches!(result, ModeResponse::NoOp));
     }
 }

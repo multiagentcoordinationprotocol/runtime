@@ -17,7 +17,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = Arc::new(Runtime::new(registry, log_store));
     let svc = MacpServer::new(runtime);
 
-    println!("macp-runtime v0.3 (RFC-0001) listening on {}", addr);
+    println!("macp-runtime v0.3.0 (RFC-0001) listening on {}", addr);
 
     Server::builder()
         .add_service(pb::macp_runtime_service_server::MacpRuntimeServiceServer::new(svc))

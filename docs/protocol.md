@@ -1,6 +1,6 @@
 # MACP Protocol Specification (v1.0 — RFC-0001)
 
-This document is the authoritative specification of the Multi-Agent Coordination Protocol (MACP) as implemented by `macp-runtime` v0.2. It describes every message type, every field, every validation rule, every error code, and every behavioral guarantee in narrative detail. Whether you are building a client, implementing a new mode, or auditing the protocol for correctness, this document is your reference.
+This document is the authoritative specification of the Multi-Agent Coordination Protocol (MACP) as implemented by `macp-runtime` v0.3. It describes every message type, every field, every validation rule, every error code, and every behavioral guarantee in narrative detail. Whether you are building a client, implementing a new mode, or auditing the protocol for correctness, this document is your reference.
 
 ---
 

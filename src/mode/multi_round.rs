@@ -138,6 +138,9 @@ mod tests {
             mode_version: String::new(),
             configuration_version: String::new(),
             policy_version: String::new(),
+            context: vec![],
+            roots: vec![],
+            initiator_sender: String::new(),
         }
     }
 
