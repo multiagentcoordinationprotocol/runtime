@@ -144,6 +144,13 @@ message GetManifestRequest {
   string agent_id = 1;
 }
 
+message TransportEndpoint {
+  string transport = 1;
+  string uri = 2;
+  repeated string content_types = 3;
+  map<string, string> metadata = 4;
+}
+
 message AgentManifest {
   string agent_id = 1;
   string title = 2;
@@ -152,6 +159,7 @@ message AgentManifest {
   repeated string input_content_types = 5;
   repeated string output_content_types = 6;
   map<string, string> metadata = 7;
+  repeated TransportEndpoint transport_endpoints = 8;
 }
 
 message ModeDescriptor {

@@ -1,6 +1,6 @@
 # Architecture
 
-This document explains how the MACP Runtime v0.2 is built internally. It walks through every component, every data structure, every flow, and every design decision in narrative detail. You do not need to know Rust to follow along — the documentation explains concepts in plain language, with code excerpts for precision where it matters.
+This document explains how the MACP Runtime v0.3 is built internally. It walks through every component, every data structure, every flow, and every design decision in narrative detail. You do not need to know Rust to follow along — the documentation explains concepts in plain language, with code excerpts for precision where it matters.
 
 ---
 

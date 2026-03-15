@@ -1,4 +1,4 @@
-# macp-runtime v0.2
+# macp-runtime v0.3
 
 **Minimal Coordination Runtime (MCR)** — an RFC-0001-compliant gRPC server implementing the Multi-Agent Coordination Protocol (MACP).
 
@@ -9,13 +9,13 @@ The MACP Runtime provides session-based message coordination between autonomous 
 - **RFC-0001 Compliant Protocol** — Structured protobuf schema with versioned envelope, typed errors, and capability negotiation
 - **Initialize Handshake** — Protocol version negotiation and capability discovery before any session work begins
 - **Pluggable Mode System** — Coordination logic is decoupled from runtime physics; ship new modes without touching the kernel
-- **Decision Mode (RFC Lifecycle)** — Full Proposal → Evaluation → Objection → Vote → Commitment workflow with phase tracking
-- **Multi-Round Convergence Mode** — Participant-based `all_equal` convergence strategy with automatic resolution
+- **Decision Mode (RFC Lifecycle)** — Full Proposal → Evaluation → Objection → Vote → Commitment workflow with phase tracking and mode-aware authorization
+- **Multi-Round Convergence Mode (Experimental)** — Participant-based `all_equal` convergence strategy with automatic resolution (not advertised via discovery RPCs)
 - **Session Cancellation** — Explicit `CancelSession` RPC to terminate sessions with a recorded reason
 - **Message Deduplication** — Idempotent message handling via `seen_message_ids` tracking
+- **Mode-Aware Authorization** — Sender authorization delegated to modes; Decision Mode allows orchestrator Commitment bypass per RFC
 - **Participant Validation** — Sender membership enforcement when a participant list is configured
 - **Signal Messages** — Ambient, session-less messages for out-of-band coordination signals
-- **Bidirectional Streaming** — `StreamSession` RPC for real-time session event streaming
 - **Mode & Manifest Discovery** — `ListModes` and `GetManifest` RPCs for runtime introspection
 - **Structured Errors** — `MACPError` with RFC error codes, session/message correlation, and detail payloads
 - **Append-Only Audit Log** — Log-before-mutate ordering for every session event
@@ -107,7 +107,7 @@ The runtime exposes `MACPRuntimeService` on `127.0.0.1:50051` with the following
 |-----|-------------|
 | `Initialize` | Protocol version negotiation and capability exchange |
 | `Send` | Send an Envelope, receive an Ack |
-| `StreamSession` | Bidirectional streaming for session events |
+| `StreamSession` | Bidirectional streaming for session events (not yet fully implemented) |
 | `GetSession` | Query session metadata by ID |
 | `CancelSession` | Cancel an active session with a reason |
 | `GetManifest` | Retrieve agent manifest and supported modes |

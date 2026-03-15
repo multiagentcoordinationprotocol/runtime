@@ -41,11 +41,11 @@ impl Runtime {
         }
     }
 
-    /// Returns the list of RFC-compliant mode names registered.
+    /// Returns the list of RFC-registered mode names (excludes experimental modes).
     pub fn registered_mode_names(&self) -> Vec<String> {
         self.modes
             .keys()
-            .filter(|k| k.starts_with("macp.mode."))
+            .filter(|k| k.starts_with("macp.mode.") && !k.contains("multi_round"))
             .cloned()
             .collect()
     }
@@ -148,6 +148,9 @@ impl Runtime {
             mode_version: start_payload.mode_version.clone(),
             configuration_version: start_payload.configuration_version.clone(),
             policy_version: start_payload.policy_version.clone(),
+            context: start_payload.context.clone(),
+            roots: start_payload.roots.clone(),
+            initiator_sender: env.sender.clone(),
         };
 
         // Call mode's on_session_start BEFORE recording side effects
@@ -213,13 +216,11 @@ impl Runtime {
             return Err(MacpError::SessionNotOpen);
         }
 
-        // Participant validation
-        if !session.participants.is_empty() && !session.participants.contains(&env.sender) {
-            return Err(MacpError::Forbidden);
-        }
-
         let mode_name = session.mode.clone();
         let mode = self.modes.get(&mode_name).ok_or(MacpError::UnknownMode)?;
+
+        // Mode-aware authorization (replaces hardcoded participant check)
+        mode.authorize_sender(session, env)?;
 
         // Dispatch to mode BEFORE recording side effects
         let response = mode.on_message(session, env)?;
@@ -479,6 +480,9 @@ mod tests {
             mode_version: String::new(),
             configuration_version: String::new(),
             policy_version: String::new(),
+            context: vec![],
+            roots: vec![],
+            initiator_sender: String::new(),
         };
         Runtime::apply_mode_response(&mut session, ModeResponse::NoOp);
         assert_eq!(session.state, SessionState::Open);
@@ -501,6 +505,9 @@ mod tests {
             mode_version: String::new(),
             configuration_version: String::new(),
             policy_version: String::new(),
+            context: vec![],
+            roots: vec![],
+            initiator_sender: String::new(),
         };
         Runtime::apply_mode_response(
             &mut session,
@@ -973,6 +980,9 @@ mod tests {
             mode_version: String::new(),
             configuration_version: String::new(),
             policy_version: String::new(),
+            context: vec![],
+            roots: vec![],
+            initiator_sender: String::new(),
         };
         Runtime::apply_mode_response(
             &mut session,
@@ -999,6 +1009,9 @@ mod tests {
             mode_version: String::new(),
             configuration_version: String::new(),
             policy_version: String::new(),
+            context: vec![],
+            roots: vec![],
+            initiator_sender: String::new(),
         };
         Runtime::apply_mode_response(&mut session, ModeResponse::Resolve(b"resolved".to_vec()));
         assert_eq!(session.state, SessionState::Resolved);
@@ -1283,5 +1296,183 @@ mod tests {
 
         let s = rt.registry.get_session("s1").await.unwrap();
         assert_eq!(s.mode, "decision");
+    }
+
+    // --- Phase 2: Session data model tests ---
+
+    #[tokio::test]
+    async fn session_stores_context_and_roots() {
+        let rt = make_runtime();
+
+        let payload = SessionStartPayload {
+            intent: String::new(),
+            participants: vec!["alice".into()],
+            mode_version: String::new(),
+            configuration_version: String::new(),
+            policy_version: String::new(),
+            ttl_ms: 0,
+            context: b"some context".to_vec(),
+            roots: vec![crate::pb::Root {
+                uri: "file:///tmp".into(),
+                name: "test-root".into(),
+            }],
+        };
+        let e = env(
+            "macp.mode.decision.v1",
+            "SessionStart",
+            "m1",
+            "s1",
+            "alice",
+            &payload.encode_to_vec(),
+        );
+        rt.process(&e).await.unwrap();
+
+        let s = rt.registry.get_session("s1").await.unwrap();
+        assert_eq!(s.context, b"some context");
+        assert_eq!(s.roots.len(), 1);
+        assert_eq!(s.roots[0].uri, "file:///tmp");
+        assert_eq!(s.roots[0].name, "test-root");
+    }
+
+    #[tokio::test]
+    async fn session_stores_initiator_sender() {
+        let rt = make_runtime();
+
+        let payload = encode_session_start(0, vec!["alice".into()]);
+        let e = env(
+            "macp.mode.decision.v1",
+            "SessionStart",
+            "m1",
+            "s1",
+            "alice",
+            &payload,
+        );
+        rt.process(&e).await.unwrap();
+
+        let s = rt.registry.get_session("s1").await.unwrap();
+        assert_eq!(s.initiator_sender, "alice");
+    }
+
+    // --- Phase 3: Mode-aware authorization tests ---
+
+    #[tokio::test]
+    async fn commitment_from_initiator_allowed_outside_participants() {
+        let rt = make_runtime();
+
+        // Create session with participants alice+bob, initiator is "coordinator"
+        let payload = encode_session_start(0, vec!["alice".into(), "bob".into()]);
+        let e = env(
+            "macp.mode.decision.v1",
+            "SessionStart",
+            "m0",
+            "s1",
+            "coordinator",
+            &payload,
+        );
+        rt.process(&e).await.unwrap();
+
+        // Alice submits a proposal
+        let proposal = crate::decision_pb::ProposalPayload {
+            proposal_id: "p1".into(),
+            option: "opt".into(),
+            rationale: "r".into(),
+            supporting_data: vec![],
+        }
+        .encode_to_vec();
+        let e = env(
+            "macp.mode.decision.v1",
+            "Proposal",
+            "m1",
+            "s1",
+            "alice",
+            &proposal,
+        );
+        rt.process(&e).await.unwrap();
+
+        // Coordinator (not in participants) sends Commitment — should succeed (no votes required per RFC)
+        let e = env(
+            "macp.mode.decision.v1",
+            "Commitment",
+            "m2",
+            "s1",
+            "coordinator",
+            b"commit",
+        );
+        let result = rt.process(&e).await.unwrap();
+        assert_eq!(result.session_state, SessionState::Resolved);
+    }
+
+    #[tokio::test]
+    async fn proposal_from_non_participant_still_forbidden() {
+        let rt = make_runtime();
+
+        let payload = encode_session_start(0, vec!["alice".into(), "bob".into()]);
+        let e = env(
+            "macp.mode.decision.v1",
+            "SessionStart",
+            "m0",
+            "s1",
+            "coordinator",
+            &payload,
+        );
+        rt.process(&e).await.unwrap();
+
+        // "charlie" not a participant and not sending Commitment
+        let proposal = crate::decision_pb::ProposalPayload {
+            proposal_id: "p1".into(),
+            option: "opt".into(),
+            rationale: "r".into(),
+            supporting_data: vec![],
+        }
+        .encode_to_vec();
+        let e = env(
+            "macp.mode.decision.v1",
+            "Proposal",
+            "m1",
+            "s1",
+            "charlie",
+            &proposal,
+        );
+        let err = rt.process(&e).await.unwrap_err();
+        assert_eq!(err.to_string(), "Forbidden");
+    }
+
+    #[tokio::test]
+    async fn multi_round_authorization_unchanged() {
+        let rt = make_runtime();
+
+        let payload = encode_session_start(0, vec!["alice".into(), "bob".into()]);
+        let e = env(
+            "multi_round",
+            "SessionStart",
+            "m0",
+            "s1",
+            "creator",
+            &payload,
+        );
+        rt.process(&e).await.unwrap();
+
+        // "charlie" still forbidden (default authorize_sender)
+        let e = env(
+            "multi_round",
+            "Contribute",
+            "m1",
+            "s1",
+            "charlie",
+            br#"{"value":"x"}"#,
+        );
+        let err = rt.process(&e).await.unwrap_err();
+        assert_eq!(err.to_string(), "Forbidden");
+
+        // alice succeeds
+        let e = env(
+            "multi_round",
+            "Contribute",
+            "m2",
+            "s1",
+            "alice",
+            br#"{"value":"x"}"#,
+        );
+        rt.process(&e).await.unwrap();
     }
 }

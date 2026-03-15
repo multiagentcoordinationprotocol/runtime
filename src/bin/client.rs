@@ -1,7 +1,10 @@
+use macp_runtime::decision_pb::ProposalPayload;
 use macp_runtime::pb::macp_runtime_service_client::MacpRuntimeServiceClient;
 use macp_runtime::pb::{
     Envelope, GetSessionRequest, InitializeRequest, ListModesRequest, SendRequest,
+    SessionStartPayload,
 };
+use prost::Message;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -33,16 +36,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         modes_resp.modes.iter().map(|m| &m.mode).collect::<Vec<_>>()
     );
 
-    // 3) SessionStart
+    // 3) SessionStart with participants (canonical mode)
+    let start_payload = SessionStartPayload {
+        intent: "demo canonical lifecycle".into(),
+        participants: vec!["alice".into(), "bob".into()],
+        mode_version: String::new(),
+        configuration_version: String::new(),
+        policy_version: String::new(),
+        ttl_ms: 60_000,
+        context: vec![],
+        roots: vec![],
+    };
+
     let start = Envelope {
         macp_version: "1.0".into(),
-        mode: "decision".into(),
+        mode: "macp.mode.decision.v1".into(),
         message_type: "SessionStart".into(),
         message_id: "m1".into(),
         session_id: "s1".into(),
-        sender: "ajit".into(),
-        timestamp_unix_ms: 1_700_000_000_000,
-        payload: vec![],
+        sender: "coordinator".into(),
+        timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
+        payload: start_payload.encode_to_vec(),
     };
 
     let ack = client
@@ -59,81 +73,94 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ack.error.as_ref().map(|e| &e.code)
     );
 
-    // 4) Normal message
-    let msg = Envelope {
+    // 4) Proposal (protobuf-encoded)
+    let proposal = ProposalPayload {
+        proposal_id: "p1".into(),
+        option: "Deploy v2.1 to production".into(),
+        rationale: "All integration tests pass".into(),
+        supporting_data: vec![],
+    };
+    let proposal_env = Envelope {
         macp_version: "1.0".into(),
-        mode: "decision".into(),
-        message_type: "Message".into(),
+        mode: "macp.mode.decision.v1".into(),
+        message_type: "Proposal".into(),
         message_id: "m2".into(),
         session_id: "s1".into(),
-        sender: "ajit".into(),
-        timestamp_unix_ms: 1_700_000_000_001,
-        payload: b"hello".to_vec(),
+        sender: "alice".into(),
+        timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
+        payload: proposal.encode_to_vec(),
     };
 
     let ack = client
         .send(SendRequest {
-            envelope: Some(msg),
+            envelope: Some(proposal_env),
         })
         .await?
         .into_inner()
         .ack
         .unwrap();
     println!(
-        "Message ack: ok={} error={:?}",
+        "Proposal ack: ok={} error={:?}",
         ack.ok,
         ack.error.as_ref().map(|e| &e.code)
     );
 
-    // 5) Resolve message (DecisionMode resolves when payload == "resolve")
-    let resolve = Envelope {
+    // 5) Evaluation (protobuf-encoded)
+    let eval = macp_runtime::decision_pb::EvaluationPayload {
+        proposal_id: "p1".into(),
+        recommendation: "APPROVE".into(),
+        confidence: 0.95,
+        reason: "Looks good".into(),
+    };
+    let eval_env = Envelope {
         macp_version: "1.0".into(),
-        mode: "decision".into(),
-        message_type: "Message".into(),
+        mode: "macp.mode.decision.v1".into(),
+        message_type: "Evaluation".into(),
         message_id: "m3".into(),
         session_id: "s1".into(),
-        sender: "ajit".into(),
-        timestamp_unix_ms: 1_700_000_000_002,
-        payload: b"resolve".to_vec(),
+        sender: "bob".into(),
+        timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
+        payload: eval.encode_to_vec(),
     };
 
     let ack = client
         .send(SendRequest {
-            envelope: Some(resolve),
+            envelope: Some(eval_env),
         })
         .await?
         .into_inner()
         .ack
         .unwrap();
     println!(
-        "Resolve ack: ok={} error={:?}",
+        "Evaluation ack: ok={} error={:?}",
         ack.ok,
         ack.error.as_ref().map(|e| &e.code)
     );
 
-    // 6) Message after resolve (should be rejected: SessionNotOpen)
-    let after = Envelope {
+    // 6) Commitment (votes not required per RFC — orchestrator bypass)
+    let commitment = Envelope {
         macp_version: "1.0".into(),
-        mode: "decision".into(),
-        message_type: "Message".into(),
+        mode: "macp.mode.decision.v1".into(),
+        message_type: "Commitment".into(),
         message_id: "m4".into(),
         session_id: "s1".into(),
-        sender: "ajit".into(),
-        timestamp_unix_ms: 1_700_000_000_003,
-        payload: b"should-fail".to_vec(),
+        sender: "coordinator".into(),
+        timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
+        payload: b"deploy-approved".to_vec(),
     };
 
     let ack = client
         .send(SendRequest {
-            envelope: Some(after),
+            envelope: Some(commitment),
         })
         .await?
         .into_inner()
         .ack
         .unwrap();
     println!(
-        "After-resolve ack: ok={} error={:?}",
+        "Commitment ack: ok={} state={} error={:?}",
         ack.ok,
+        ack.session_state,
         ack.error.as_ref().map(|e| &e.code)
     );
 

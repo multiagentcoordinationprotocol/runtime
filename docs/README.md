@@ -8,7 +8,7 @@ Welcome to the Multi-Agent Coordination Protocol (MACP) Runtime documentation. T
 
 The MACP Runtime — also called the **Minimal Coordination Runtime (MCR)** — is a **gRPC server** that helps multiple AI agents or programs coordinate with each other. Think of it as a traffic controller for structured conversations between autonomous agents: it manages who can speak, tracks the state of each conversation, enforces time limits, and determines when a conversation has reached its conclusion.
 
-Version **0.2** of the runtime implements **RFC-0001**, introducing a formal protocol handshake, structured error reporting, a rich Decision Mode lifecycle, session cancellation, message deduplication, participant validation, and a host of new RPCs for runtime introspection.
+Version **0.3** of the runtime implements **RFC-0001**, introducing a formal protocol handshake, structured error reporting, a rich Decision Mode lifecycle, session cancellation, message deduplication, participant validation, mode-aware authorization, and a host of new RPCs for runtime introspection.
 
 ### Real-World Analogy
 
@@ -107,7 +107,7 @@ Two modes are built in:
 | Mode Name | Aliases | Description |
 |-----------|---------|-------------|
 | `macp.mode.decision.v1` | `decision` | RFC-compliant decision lifecycle: Proposal → Evaluation → Objection → Vote → Commitment |
-| `macp.mode.multi_round.v1` | `multi_round` | Participant-based convergence using `all_equal` strategy |
+| `macp.mode.multi_round.v1` | `multi_round` | Participant-based convergence using `all_equal` strategy (experimental, not on discovery surfaces) |
 
 An empty `mode` field defaults to `macp.mode.decision.v1` for backward compatibility.
 
@@ -188,7 +188,7 @@ cargo run
 
 You should see:
 ```
-macp-runtime v0.2 (RFC-0001) listening on 127.0.0.1:50051
+macp-runtime v0.3.0 (RFC-0001) listening on 127.0.0.1:50051
 ```
 
 **Terminal 2** — Run a test client:

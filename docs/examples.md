@@ -1,6 +1,6 @@
 # Examples and Usage
 
-This document provides step-by-step examples of using the MACP Runtime v0.2. It covers the full lifecycle — from protocol handshake to session creation, decision-making, convergence, cancellation, and error handling — with detailed explanations of what happens at each step.
+This document provides step-by-step examples of using the MACP Runtime v0.3. It covers the full lifecycle — from protocol handshake to session creation, decision-making, convergence, cancellation, and error handling — with detailed explanations of what happens at each step.
 
 ---
 
@@ -35,7 +35,7 @@ cargo run
 
 You should see:
 ```
-macp-runtime v0.2 (RFC-0001) listening on 127.0.0.1:50051
+macp-runtime v0.3.0 (RFC-0001) listening on 127.0.0.1:50051
 ```
 
 The server is now ready to accept connections on port 50051.
@@ -108,7 +108,7 @@ println!(
 
 **Expected output:**
 ```
-ListModes: ["macp.mode.decision.v1", "macp.mode.multi_round.v1"]
+ListModes: ["macp.mode.decision.v1"]
 ```
 
 ### Step 4: Create a Session (SessionStart)
@@ -228,7 +228,7 @@ GetSession: state=2 mode=decision
 
 ## Example 2: Full Decision Mode Lifecycle
 
-The Decision Mode in v0.2 supports a rich lifecycle: Proposal, Evaluation, Objection, Vote, and Commitment. Here is how a complete decision process flows:
+The Decision Mode in v0.3 supports a rich lifecycle: Proposal, Evaluation, Objection, Vote, and Commitment. Here is how a complete decision process flows:
 
 ### Step 1: Create a Session
 
@@ -526,8 +526,8 @@ The fuzz client (`src/bin/fuzz_client.rs`) is a comprehensive test that exercise
 [authorized_sender] ok=true duplicate=false error=''
 [signal] ok=true duplicate=false error=''
 [get_session] state=2 mode=decision
-[list_modes] count=2 modes=["macp.mode.decision.v1", "macp.mode.multi_round.v1"]
-[get_manifest] agent_id=macp-runtime modes=["macp.mode.decision.v1", "macp.mode.multi_round.v1"]
+[list_modes] count=1 modes=["macp.mode.decision.v1"]
+[get_manifest] agent_id=macp-runtime modes=["macp.mode.decision.v1"]
 [list_roots] count=0
 ```
 
@@ -1073,7 +1073,7 @@ let contribute = create_envelope("multi_round", "Contribute", "mr1", "alice",
 
 ### Q: What protocol version should I use?
 
-**A:** Use `macp_version: "1.0"`. This is the only supported version in v0.2. Always call `Initialize` first to confirm.
+**A:** Use `macp_version: "1.0"`. This is the only supported version in v0.3. Always call `Initialize` first to confirm.
 
 ### Q: How do I encode the SessionStart payload?
 

@@ -36,6 +36,12 @@ impl MacpServer {
         if env.message_id.is_empty() {
             return Err(MacpError::InvalidEnvelope);
         }
+        if env.sender.is_empty() {
+            return Err(MacpError::InvalidEnvelope);
+        }
+        if env.message_type.is_empty() {
+            return Err(MacpError::InvalidEnvelope);
+        }
         Ok(())
     }
 
@@ -89,13 +95,13 @@ impl MacpRuntimeService for MacpServer {
             runtime_info: Some(RuntimeInfo {
                 name: "macp-runtime".into(),
                 title: "MACP Reference Runtime".into(),
-                version: "0.3".into(),
+                version: "0.3.0".into(),
                 description: "Reference implementation of the Multi-Agent Coordination Protocol"
                     .into(),
                 website_url: String::new(),
             }),
             capabilities: Some(Capabilities {
-                sessions: Some(SessionsCapability { stream: true }),
+                sessions: Some(SessionsCapability { stream: false }),
                 cancellation: Some(CancellationCapability {
                     cancel_session: true,
                 }),
@@ -219,8 +225,18 @@ impl MacpRuntimeService for MacpServer {
 
     async fn get_manifest(
         &self,
-        _request: Request<GetManifestRequest>,
+        request: Request<GetManifestRequest>,
     ) -> Result<Response<GetManifestResponse>, Status> {
+        let req = request.into_inner();
+
+        // Empty agent_id or "macp-runtime" returns self manifest; anything else is not found
+        if !req.agent_id.is_empty() && req.agent_id != "macp-runtime" {
+            return Err(Status::not_found(format!(
+                "Agent '{}' not found",
+                req.agent_id
+            )));
+        }
+
         let mode_names = self.runtime.registered_mode_names();
 
         Ok(Response::new(GetManifestResponse {
@@ -229,9 +245,10 @@ impl MacpRuntimeService for MacpServer {
                 title: "MACP Reference Runtime".into(),
                 description: "Reference implementation of MACP".into(),
                 supported_modes: mode_names,
-                input_content_types: vec!["application/protobuf".into()],
-                output_content_types: vec!["application/protobuf".into()],
+                input_content_types: vec!["application/macp-envelope+proto".into()],
+                output_content_types: vec!["application/macp-envelope+proto".into()],
                 metadata: HashMap::new(),
+                transport_endpoints: vec![],
             }),
         }))
     }
@@ -240,38 +257,27 @@ impl MacpRuntimeService for MacpServer {
         &self,
         _request: Request<ListModesRequest>,
     ) -> Result<Response<ListModesResponse>, Status> {
-        let modes = vec![
-            ModeDescriptor {
-                mode: "macp.mode.decision.v1".into(),
-                mode_version: "1.0".into(),
-                title: "Decision Mode".into(),
-                description: "Proposal-based decision making with voting".into(),
-                determinism_class: "semantic-deterministic".into(),
-                participant_model: "declared".into(),
-                message_types: vec![
-                    "SessionStart".into(),
-                    "Proposal".into(),
-                    "Evaluation".into(),
-                    "Objection".into(),
-                    "Vote".into(),
-                    "Commitment".into(),
-                ],
-                terminal_message_types: vec!["Commitment".into()],
-                schema_uris: HashMap::new(),
-            },
-            ModeDescriptor {
-                mode: "macp.mode.multi_round.v1".into(),
-                mode_version: "1.0".into(),
-                title: "Multi-Round Convergence Mode".into(),
-                description: "Participant-based convergence with all_equal strategy (experimental)"
-                    .into(),
-                determinism_class: "semantic-deterministic".into(),
-                participant_model: "declared".into(),
-                message_types: vec!["SessionStart".into(), "Contribute".into()],
-                terminal_message_types: vec![],
-                schema_uris: HashMap::new(),
-            },
-        ];
+        let modes = vec![ModeDescriptor {
+            mode: "macp.mode.decision.v1".into(),
+            mode_version: "1.0.0".into(),
+            title: "Decision Mode".into(),
+            description: "Proposal-based decision making with voting".into(),
+            determinism_class: "semantic-deterministic".into(),
+            participant_model: "declared".into(),
+            message_types: vec![
+                "SessionStart".into(),
+                "Proposal".into(),
+                "Evaluation".into(),
+                "Objection".into(),
+                "Vote".into(),
+                "Commitment".into(),
+            ],
+            terminal_message_types: vec!["Commitment".into()],
+            schema_uris: HashMap::from([(
+                "protobuf".into(),
+                "buf.build/multiagentcoordinationprotocol/macp".into(),
+            )]),
+        }];
 
         Ok(Response::new(ListModesResponse { modes }))
     }
@@ -438,6 +444,9 @@ mod tests {
                     mode_version: String::new(),
                     configuration_version: String::new(),
                     policy_version: String::new(),
+                    context: vec![],
+                    roots: vec![],
+                    initiator_sender: String::new(),
                 },
             )
             .await;
@@ -485,6 +494,9 @@ mod tests {
                     mode_version: String::new(),
                     configuration_version: String::new(),
                     policy_version: String::new(),
+                    context: vec![],
+                    roots: vec![],
+                    initiator_sender: String::new(),
                 },
             )
             .await;
@@ -531,6 +543,9 @@ mod tests {
                     mode_version: String::new(),
                     configuration_version: String::new(),
                     policy_version: String::new(),
+                    context: vec![],
+                    roots: vec![],
+                    initiator_sender: String::new(),
                 },
             )
             .await;
@@ -1233,7 +1248,7 @@ mod tests {
         assert!(init.runtime_info.is_some());
         let info = init.runtime_info.unwrap();
         assert_eq!(info.name, "macp-runtime");
-        assert_eq!(info.version, "0.3");
+        assert_eq!(info.version, "0.3.0");
         assert!(init.capabilities.is_some());
         assert!(!init.supported_modes.is_empty());
     }
@@ -1278,9 +1293,8 @@ mod tests {
             .await
             .unwrap();
         let modes = resp.into_inner().modes;
-        assert_eq!(modes.len(), 2);
+        assert_eq!(modes.len(), 1);
         assert_eq!(modes[0].mode, "macp.mode.decision.v1");
-        assert_eq!(modes[1].mode, "macp.mode.multi_round.v1");
     }
 
     // --- GetManifest ---
@@ -1311,5 +1325,191 @@ mod tests {
             .await
             .unwrap();
         assert!(resp.into_inner().roots.is_empty());
+    }
+
+    // --- Phase 1: Discovery surface fixes ---
+
+    #[tokio::test]
+    async fn get_manifest_empty_agent_id_returns_self() {
+        let (server, _) = make_server();
+
+        let resp = server
+            .get_manifest(Request::new(GetManifestRequest {
+                agent_id: String::new(),
+            }))
+            .await
+            .unwrap();
+        let manifest = resp.into_inner().manifest.unwrap();
+        assert_eq!(manifest.agent_id, "macp-runtime");
+    }
+
+    #[tokio::test]
+    async fn get_manifest_self_agent_id_returns_self() {
+        let (server, _) = make_server();
+
+        let resp = server
+            .get_manifest(Request::new(GetManifestRequest {
+                agent_id: "macp-runtime".into(),
+            }))
+            .await
+            .unwrap();
+        let manifest = resp.into_inner().manifest.unwrap();
+        assert_eq!(manifest.agent_id, "macp-runtime");
+    }
+
+    #[tokio::test]
+    async fn get_manifest_unknown_agent_id_returns_not_found() {
+        let (server, _) = make_server();
+
+        let result = server
+            .get_manifest(Request::new(GetManifestRequest {
+                agent_id: "unknown-agent".into(),
+            }))
+            .await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn get_manifest_content_types_are_macp_media_types() {
+        let (server, _) = make_server();
+
+        let resp = server
+            .get_manifest(Request::new(GetManifestRequest {
+                agent_id: String::new(),
+            }))
+            .await
+            .unwrap();
+        let manifest = resp.into_inner().manifest.unwrap();
+        assert_eq!(
+            manifest.input_content_types,
+            vec!["application/macp-envelope+proto"]
+        );
+        assert_eq!(
+            manifest.output_content_types,
+            vec!["application/macp-envelope+proto"]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_modes_decision_version_is_semver() {
+        let (server, _) = make_server();
+
+        let resp = server
+            .list_modes(Request::new(ListModesRequest {}))
+            .await
+            .unwrap();
+        let modes = resp.into_inner().modes;
+        assert_eq!(modes[0].mode_version, "1.0.0");
+    }
+
+    #[tokio::test]
+    async fn list_modes_decision_has_schema_uris() {
+        let (server, _) = make_server();
+
+        let resp = server
+            .list_modes(Request::new(ListModesRequest {}))
+            .await
+            .unwrap();
+        let modes = resp.into_inner().modes;
+        assert_eq!(
+            modes[0].schema_uris.get("protobuf").unwrap(),
+            "buf.build/multiagentcoordinationprotocol/macp"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_modes_does_not_include_experimental() {
+        let (server, _) = make_server();
+
+        let resp = server
+            .list_modes(Request::new(ListModesRequest {}))
+            .await
+            .unwrap();
+        let modes = resp.into_inner().modes;
+        assert!(!modes.iter().any(|m| m.mode.contains("multi_round")));
+    }
+
+    #[tokio::test]
+    async fn multi_round_still_works_by_direct_name() {
+        let (server, _) = make_server();
+
+        let start_payload = SessionStartPayload {
+            intent: String::new(),
+            ttl_ms: 60_000,
+            participants: vec!["alice".into(), "bob".into()],
+            mode_version: String::new(),
+            configuration_version: String::new(),
+            policy_version: String::new(),
+            context: vec![],
+            roots: vec![],
+        };
+
+        let env = Envelope {
+            macp_version: "1.0".into(),
+            mode: "macp.mode.multi_round.v1".into(),
+            message_type: "SessionStart".into(),
+            message_id: "m0".into(),
+            session_id: "s_mr_direct".into(),
+            sender: "coordinator".into(),
+            timestamp_unix_ms: Utc::now().timestamp_millis(),
+            payload: start_payload.encode_to_vec(),
+        };
+        let ack = do_send(&server, env).await;
+        assert!(ack.ok);
+    }
+
+    #[tokio::test]
+    async fn initialize_stream_capability_is_false() {
+        let (server, _) = make_server();
+
+        let resp = server
+            .initialize(Request::new(InitializeRequest {
+                supported_protocol_versions: vec!["1.0".into()],
+                client_info: None,
+                capabilities: None,
+            }))
+            .await
+            .unwrap();
+        let caps = resp.into_inner().capabilities.unwrap();
+        assert!(!caps.sessions.unwrap().stream);
+    }
+
+    // --- Phase 2: Envelope validation ---
+
+    #[tokio::test]
+    async fn empty_sender_rejected() {
+        let (server, _) = make_server();
+        let env = Envelope {
+            macp_version: "1.0".into(),
+            mode: "decision".into(),
+            message_type: "SessionStart".into(),
+            message_id: "m1".into(),
+            session_id: "s1".into(),
+            sender: String::new(),
+            timestamp_unix_ms: Utc::now().timestamp_millis(),
+            payload: vec![],
+        };
+        let ack = do_send(&server, env).await;
+        assert!(!ack.ok);
+        assert_eq!(ack.error.as_ref().unwrap().code, "INVALID_ENVELOPE");
+    }
+
+    #[tokio::test]
+    async fn empty_message_type_rejected() {
+        let (server, _) = make_server();
+        let env = Envelope {
+            macp_version: "1.0".into(),
+            mode: "decision".into(),
+            message_type: String::new(),
+            message_id: "m1".into(),
+            session_id: "s1".into(),
+            sender: "test".into(),
+            timestamp_unix_ms: Utc::now().timestamp_millis(),
+            payload: vec![],
+        };
+        let ack = do_send(&server, env).await;
+        assert!(!ack.ok);
+        assert_eq!(ack.error.as_ref().unwrap().code, "INVALID_ENVELOPE");
     }
 }

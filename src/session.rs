@@ -29,6 +29,10 @@ pub struct Session {
     pub mode_version: String,
     pub configuration_version: String,
     pub policy_version: String,
+    // RFC session data fields
+    pub context: Vec<u8>,
+    pub roots: Vec<crate::pb::Root>,
+    pub initiator_sender: String,
 }
 
 /// Parse a protobuf-encoded SessionStartPayload from raw bytes.
