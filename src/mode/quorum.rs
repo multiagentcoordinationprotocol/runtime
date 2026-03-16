@@ -1,0 +1,879 @@
+use crate::error::MacpError;
+use crate::mode::util::{decode_commitment_payload, is_declared_participant};
+use crate::mode::{Mode, ModeResponse};
+use crate::pb::Envelope;
+use crate::quorum_pb::{AbstainPayload, ApprovalRequestPayload, ApprovePayload, RejectPayload};
+use crate::session::Session;
+use prost::Message;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum BallotChoice {
+    Approve,
+    Reject,
+    Abstain,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalRequestRecord {
+    pub request_id: String,
+    pub action: String,
+    pub summary: String,
+    pub details: Vec<u8>,
+    pub required_approvals: u32,
+    pub requested_by: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BallotRecord {
+    pub request_id: String,
+    pub choice: BallotChoice,
+    pub sender: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct QuorumState {
+    pub request: Option<ApprovalRequestRecord>,
+    pub ballots: BTreeMap<String, BallotRecord>,
+}
+
+pub struct QuorumMode;
+
+impl QuorumMode {
+    fn encode_state(state: &QuorumState) -> Vec<u8> {
+        serde_json::to_vec(state).expect("QuorumState is always serializable")
+    }
+
+    fn decode_state(data: &[u8]) -> Result<QuorumState, MacpError> {
+        serde_json::from_slice(data).map_err(|_| MacpError::InvalidModeState)
+    }
+
+    fn commitment_ready(session: &Session, state: &QuorumState) -> bool {
+        let request = match &state.request {
+            Some(request) => request,
+            None => return false,
+        };
+        let approvals = state
+            .ballots
+            .values()
+            .filter(|ballot| ballot.choice == BallotChoice::Approve)
+            .count() as u32;
+        let total_eligible = session.participants.len() as u32;
+        let counted = state.ballots.len() as u32;
+        let remaining = total_eligible.saturating_sub(counted);
+        // Commitment is ready if threshold reached OR threshold is mathematically unreachable
+        approvals >= request.required_approvals
+            || approvals + remaining < request.required_approvals
+    }
+}
+
+impl Mode for QuorumMode {
+    fn authorize_sender(&self, session: &Session, env: &Envelope) -> Result<(), MacpError> {
+        match env.message_type.as_str() {
+            "ApprovalRequest" | "Commitment" if env.sender == session.initiator_sender => Ok(()),
+            "ApprovalRequest" | "Commitment" => Err(MacpError::Forbidden),
+            _ if is_declared_participant(&session.participants, &env.sender) => Ok(()),
+            _ => Err(MacpError::Forbidden),
+        }
+    }
+
+    fn on_session_start(
+        &self,
+        session: &Session,
+        _env: &Envelope,
+    ) -> Result<ModeResponse, MacpError> {
+        if session.participants.is_empty() {
+            return Err(MacpError::InvalidPayload);
+        }
+        Ok(ModeResponse::PersistState(Self::encode_state(
+            &QuorumState::default(),
+        )))
+    }
+
+    fn on_message(&self, session: &Session, env: &Envelope) -> Result<ModeResponse, MacpError> {
+        let mut state = if session.mode_state.is_empty() {
+            QuorumState::default()
+        } else {
+            Self::decode_state(&session.mode_state)?
+        };
+
+        match env.message_type.as_str() {
+            "ApprovalRequest" => {
+                if env.sender != session.initiator_sender {
+                    return Err(MacpError::Forbidden);
+                }
+                let payload = ApprovalRequestPayload::decode(&*env.payload)
+                    .map_err(|_| MacpError::InvalidPayload)?;
+                if state.request.is_some()
+                    || payload.request_id.is_empty()
+                    || payload.required_approvals == 0
+                    || payload.required_approvals > session.participants.len() as u32
+                {
+                    return Err(MacpError::InvalidPayload);
+                }
+                state.request = Some(ApprovalRequestRecord {
+                    request_id: payload.request_id,
+                    action: payload.action,
+                    summary: payload.summary,
+                    details: payload.details,
+                    required_approvals: payload.required_approvals,
+                    requested_by: env.sender.clone(),
+                });
+                Ok(ModeResponse::PersistState(Self::encode_state(&state)))
+            }
+            "Approve" => {
+                let payload =
+                    ApprovePayload::decode(&*env.payload).map_err(|_| MacpError::InvalidPayload)?;
+                let request = state.request.as_ref().ok_or(MacpError::InvalidPayload)?;
+                if payload.request_id != request.request_id
+                    || state.ballots.contains_key(&env.sender)
+                {
+                    return Err(MacpError::InvalidPayload);
+                }
+                state.ballots.insert(
+                    env.sender.clone(),
+                    BallotRecord {
+                        request_id: payload.request_id,
+                        choice: BallotChoice::Approve,
+                        sender: env.sender.clone(),
+                        reason: payload.reason,
+                    },
+                );
+                Ok(ModeResponse::PersistState(Self::encode_state(&state)))
+            }
+            "Reject" => {
+                let payload =
+                    RejectPayload::decode(&*env.payload).map_err(|_| MacpError::InvalidPayload)?;
+                let request = state.request.as_ref().ok_or(MacpError::InvalidPayload)?;
+                if payload.request_id != request.request_id
+                    || state.ballots.contains_key(&env.sender)
+                {
+                    return Err(MacpError::InvalidPayload);
+                }
+                state.ballots.insert(
+                    env.sender.clone(),
+                    BallotRecord {
+                        request_id: payload.request_id,
+                        choice: BallotChoice::Reject,
+                        sender: env.sender.clone(),
+                        reason: payload.reason,
+                    },
+                );
+                Ok(ModeResponse::PersistState(Self::encode_state(&state)))
+            }
+            "Abstain" => {
+                let payload =
+                    AbstainPayload::decode(&*env.payload).map_err(|_| MacpError::InvalidPayload)?;
+                let request = state.request.as_ref().ok_or(MacpError::InvalidPayload)?;
+                if payload.request_id != request.request_id
+                    || state.ballots.contains_key(&env.sender)
+                {
+                    return Err(MacpError::InvalidPayload);
+                }
+                state.ballots.insert(
+                    env.sender.clone(),
+                    BallotRecord {
+                        request_id: payload.request_id,
+                        choice: BallotChoice::Abstain,
+                        sender: env.sender.clone(),
+                        reason: payload.reason,
+                    },
+                );
+                Ok(ModeResponse::PersistState(Self::encode_state(&state)))
+            }
+            "Commitment" => {
+                if env.sender != session.initiator_sender {
+                    return Err(MacpError::Forbidden);
+                }
+                let _payload = decode_commitment_payload(&env.payload)?;
+                if !Self::commitment_ready(session, &state) {
+                    return Err(MacpError::InvalidPayload);
+                }
+                Ok(ModeResponse::PersistAndResolve {
+                    state: Self::encode_state(&state),
+                    resolution: env.payload.clone(),
+                })
+            }
+            _ => Err(MacpError::InvalidPayload),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pb::CommitmentPayload;
+    use crate::session::{Session, SessionState};
+    use std::collections::HashSet;
+
+    fn base_session() -> Session {
+        Session {
+            session_id: "s1".into(),
+            state: SessionState::Open,
+            ttl_expiry: i64::MAX,
+            started_at_unix_ms: 0,
+            resolution: None,
+            mode: "macp.mode.quorum.v1".into(),
+            mode_state: vec![],
+            participants: vec!["alice".into(), "bob".into(), "carol".into()],
+            seen_message_ids: HashSet::new(),
+            intent: String::new(),
+            mode_version: String::new(),
+            configuration_version: String::new(),
+            policy_version: String::new(),
+            context: vec![],
+            roots: vec![],
+            initiator_sender: "coordinator".into(),
+        }
+    }
+
+    fn env(sender: &str, message_type: &str, payload: Vec<u8>) -> Envelope {
+        Envelope {
+            macp_version: "1.0".into(),
+            mode: "macp.mode.quorum.v1".into(),
+            message_type: message_type.into(),
+            message_id: format!("{}-{}", sender, message_type),
+            session_id: "s1".into(),
+            sender: sender.into(),
+            timestamp_unix_ms: 0,
+            payload,
+        }
+    }
+
+    fn commitment_payload() -> Vec<u8> {
+        CommitmentPayload {
+            commitment_id: "c1".into(),
+            action: "quorum.approved".into(),
+            authority_scope: "deploy".into(),
+            reason: "threshold met".into(),
+            mode_version: "1.0.0".into(),
+            policy_version: "policy".into(),
+            configuration_version: "config".into(),
+        }
+        .encode_to_vec()
+    }
+
+    fn apply(session: &mut Session, result: ModeResponse) {
+        match result {
+            ModeResponse::PersistState(data) => session.mode_state = data,
+            ModeResponse::PersistAndResolve { state, .. } => session.mode_state = state,
+            _ => {}
+        }
+    }
+
+    fn make_approval_request(request_id: &str, required: u32) -> Vec<u8> {
+        ApprovalRequestPayload {
+            request_id: request_id.into(),
+            action: "deploy.production".into(),
+            summary: "Deploy v2".into(),
+            details: vec![],
+            required_approvals: required,
+        }
+        .encode_to_vec()
+    }
+
+    fn make_approve(request_id: &str, reason: &str) -> Vec<u8> {
+        ApprovePayload {
+            request_id: request_id.into(),
+            reason: reason.into(),
+        }
+        .encode_to_vec()
+    }
+
+    fn make_reject(request_id: &str, reason: &str) -> Vec<u8> {
+        RejectPayload {
+            request_id: request_id.into(),
+            reason: reason.into(),
+        }
+        .encode_to_vec()
+    }
+
+    fn make_abstain(request_id: &str, reason: &str) -> Vec<u8> {
+        AbstainPayload {
+            request_id: request_id.into(),
+            reason: reason.into(),
+        }
+        .encode_to_vec()
+    }
+
+    // --- Session Start ---
+
+    #[test]
+    fn session_start_initializes_state() {
+        let mode = QuorumMode;
+        let session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("coordinator", "SessionStart", vec![]))
+            .unwrap();
+        match result {
+            ModeResponse::PersistState(data) => {
+                let state: QuorumState = serde_json::from_slice(&data).unwrap();
+                assert!(state.request.is_none());
+                assert!(state.ballots.is_empty());
+            }
+            _ => panic!("Expected PersistState"),
+        }
+    }
+
+    #[test]
+    fn session_start_requires_participants() {
+        let mode = QuorumMode;
+        let mut session = base_session();
+        session.participants.clear();
+        let err = mode
+            .on_session_start(&session, &env("coordinator", "SessionStart", vec![]))
+            .unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
+    }
+
+    // --- ApprovalRequest ---
+
+    #[test]
+    fn approval_request_from_coordinator() {
+        let mode = QuorumMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("coordinator", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env(
+                    "coordinator",
+                    "ApprovalRequest",
+                    make_approval_request("r1", 2),
+                ),
+            )
+            .unwrap();
+        match result {
+            ModeResponse::PersistState(data) => {
+                let state: QuorumState = serde_json::from_slice(&data).unwrap();
+                assert!(state.request.is_some());
+                assert_eq!(state.request.unwrap().required_approvals, 2);
+            }
+            _ => panic!("Expected PersistState"),
+        }
+    }
+
+    #[test]
+    fn duplicate_approval_request_rejected() {
+        let mode = QuorumMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("coordinator", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env(
+                    "coordinator",
+                    "ApprovalRequest",
+                    make_approval_request("r1", 2),
+                ),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let err = mode
+            .on_message(
+                &session,
+                &env(
+                    "coordinator",
+                    "ApprovalRequest",
+                    make_approval_request("r2", 1),
+                ),
+            )
+            .unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
+    }
+
+    #[test]
+    fn required_approvals_exceeds_participants_rejected() {
+        let mode = QuorumMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("coordinator", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let err = mode
+            .on_message(
+                &session,
+                &env(
+                    "coordinator",
+                    "ApprovalRequest",
+                    make_approval_request("r1", 4),
+                ),
+            )
+            .unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
+    }
+
+    #[test]
+    fn required_approvals_zero_rejected() {
+        let mode = QuorumMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("coordinator", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let err = mode
+            .on_message(
+                &session,
+                &env(
+                    "coordinator",
+                    "ApprovalRequest",
+                    make_approval_request("r1", 0),
+                ),
+            )
+            .unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
+    }
+
+    #[test]
+    fn non_coordinator_approval_request_rejected() {
+        let mode = QuorumMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("coordinator", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let err = mode
+            .on_message(
+                &session,
+                &env("alice", "ApprovalRequest", make_approval_request("r1", 2)),
+            )
+            .unwrap_err();
+        assert_eq!(err.to_string(), "Forbidden");
+    }
+
+    // --- Ballots ---
+
+    #[test]
+    fn participant_can_approve() {
+        let mode = QuorumMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("coordinator", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env(
+                    "coordinator",
+                    "ApprovalRequest",
+                    make_approval_request("r1", 2),
+                ),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("alice", "Approve", make_approve("r1", "looks good")),
+            )
+            .unwrap();
+        match result {
+            ModeResponse::PersistState(data) => {
+                let state: QuorumState = serde_json::from_slice(&data).unwrap();
+                assert!(state.ballots.contains_key("alice"));
+                assert_eq!(state.ballots["alice"].choice, BallotChoice::Approve);
+            }
+            _ => panic!("Expected PersistState"),
+        }
+    }
+
+    #[test]
+    fn participant_can_reject() {
+        let mode = QuorumMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("coordinator", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env(
+                    "coordinator",
+                    "ApprovalRequest",
+                    make_approval_request("r1", 2),
+                ),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("alice", "Reject", make_reject("r1", "not ready")),
+            )
+            .unwrap();
+        match result {
+            ModeResponse::PersistState(data) => {
+                let state: QuorumState = serde_json::from_slice(&data).unwrap();
+                assert_eq!(state.ballots["alice"].choice, BallotChoice::Reject);
+            }
+            _ => panic!("Expected PersistState"),
+        }
+    }
+
+    #[test]
+    fn participant_can_abstain() {
+        let mode = QuorumMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("coordinator", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env(
+                    "coordinator",
+                    "ApprovalRequest",
+                    make_approval_request("r1", 2),
+                ),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("alice", "Abstain", make_abstain("r1", "no opinion")),
+            )
+            .unwrap();
+        match result {
+            ModeResponse::PersistState(data) => {
+                let state: QuorumState = serde_json::from_slice(&data).unwrap();
+                assert_eq!(state.ballots["alice"].choice, BallotChoice::Abstain);
+            }
+            _ => panic!("Expected PersistState"),
+        }
+    }
+
+    #[test]
+    fn duplicate_ballot_rejected() {
+        let mode = QuorumMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("coordinator", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env(
+                    "coordinator",
+                    "ApprovalRequest",
+                    make_approval_request("r1", 2),
+                ),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("alice", "Approve", make_approve("r1", "yes")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let err = mode
+            .on_message(
+                &session,
+                &env("alice", "Approve", make_approve("r1", "again")),
+            )
+            .unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
+    }
+
+    #[test]
+    fn ballot_before_request_rejected() {
+        let mode = QuorumMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("coordinator", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let err = mode
+            .on_message(
+                &session,
+                &env("alice", "Approve", make_approve("r1", "premature")),
+            )
+            .unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
+    }
+
+    #[test]
+    fn wrong_request_id_rejected() {
+        let mode = QuorumMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("coordinator", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env(
+                    "coordinator",
+                    "ApprovalRequest",
+                    make_approval_request("r1", 2),
+                ),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let err = mode
+            .on_message(
+                &session,
+                &env("alice", "Approve", make_approve("r2", "wrong id")),
+            )
+            .unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
+    }
+
+    // --- Commitment ---
+
+    #[test]
+    fn commitment_when_threshold_reached() {
+        let mode = QuorumMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("coordinator", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env(
+                    "coordinator",
+                    "ApprovalRequest",
+                    make_approval_request("r1", 2),
+                ),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("alice", "Approve", make_approve("r1", "yes")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(&session, &env("bob", "Approve", make_approve("r1", "yes")))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("coordinator", "Commitment", commitment_payload()),
+            )
+            .unwrap();
+        assert!(matches!(result, ModeResponse::PersistAndResolve { .. }));
+    }
+
+    #[test]
+    fn commitment_when_threshold_unreachable() {
+        let mode = QuorumMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("coordinator", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env(
+                    "coordinator",
+                    "ApprovalRequest",
+                    make_approval_request("r1", 3),
+                ),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        // All 3 must approve for threshold=3, but alice rejects
+        let result = mode
+            .on_message(&session, &env("alice", "Reject", make_reject("r1", "no")))
+            .unwrap();
+        apply(&mut session, result);
+        // Threshold is now unreachable (need 3, max possible = 2)
+        let result = mode
+            .on_message(
+                &session,
+                &env("coordinator", "Commitment", commitment_payload()),
+            )
+            .unwrap();
+        assert!(matches!(result, ModeResponse::PersistAndResolve { .. }));
+    }
+
+    #[test]
+    fn commitment_before_threshold_rejected() {
+        let mode = QuorumMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("coordinator", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env(
+                    "coordinator",
+                    "ApprovalRequest",
+                    make_approval_request("r1", 2),
+                ),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("alice", "Approve", make_approve("r1", "yes")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        // Only 1 approval, threshold is 2, and 2 participants left can still vote
+        let err = mode
+            .on_message(
+                &session,
+                &env("coordinator", "Commitment", commitment_payload()),
+            )
+            .unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
+    }
+
+    #[test]
+    fn non_coordinator_commitment_rejected() {
+        let mode = QuorumMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("coordinator", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env(
+                    "coordinator",
+                    "ApprovalRequest",
+                    make_approval_request("r1", 2),
+                ),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("alice", "Approve", make_approve("r1", "yes")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(&session, &env("bob", "Approve", make_approve("r1", "yes")))
+            .unwrap();
+        apply(&mut session, result);
+        let err = mode
+            .on_message(&session, &env("alice", "Commitment", commitment_payload()))
+            .unwrap_err();
+        assert_eq!(err.to_string(), "Forbidden");
+    }
+
+    // --- Full lifecycle ---
+
+    #[test]
+    fn full_quorum_approve_lifecycle() {
+        let mode = QuorumMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("coordinator", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env(
+                    "coordinator",
+                    "ApprovalRequest",
+                    make_approval_request("r1", 2),
+                ),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("alice", "Approve", make_approve("r1", "green")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("bob", "Approve", make_approve("r1", "ready")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("coordinator", "Commitment", commitment_payload()),
+            )
+            .unwrap();
+        assert!(matches!(result, ModeResponse::PersistAndResolve { .. }));
+    }
+
+    #[test]
+    fn full_quorum_reject_lifecycle() {
+        let mode = QuorumMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("coordinator", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env(
+                    "coordinator",
+                    "ApprovalRequest",
+                    make_approval_request("r1", 3),
+                ),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("alice", "Reject", make_reject("r1", "not ready")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        // Threshold unreachable: need 3, 1 rejected, only 2 left, max possible = 2
+        let result = mode
+            .on_message(
+                &session,
+                &env("coordinator", "Commitment", commitment_payload()),
+            )
+            .unwrap();
+        assert!(matches!(result, ModeResponse::PersistAndResolve { .. }));
+    }
+
+    // --- Unknown message type ---
+
+    #[test]
+    fn unknown_message_type_rejected() {
+        let mode = QuorumMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("coordinator", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let err = mode
+            .on_message(&session, &env("alice", "CustomType", vec![]))
+            .unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
+    }
+}

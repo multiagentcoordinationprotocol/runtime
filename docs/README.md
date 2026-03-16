@@ -102,12 +102,16 @@ Sessions follow a strict state machine with three states:
 
 **Modes** are pluggable coordination strategies. The runtime provides the "physics" — session invariants, logging, TTL enforcement, routing — while modes provide the "coordination logic" — when to resolve, what state to track, and what convergence criteria to apply.
 
-Two modes are built in:
+Five standard modes are built in, plus one experimental mode:
 
-| Mode Name | Aliases | Description |
-|-----------|---------|-------------|
-| `macp.mode.decision.v1` | `decision` | RFC-compliant decision lifecycle: Proposal → Evaluation → Objection → Vote → Commitment |
-| `macp.mode.multi_round.v1` | `multi_round` | Participant-based convergence using `all_equal` strategy (experimental, not on discovery surfaces) |
+| Mode Name | Aliases | Participant Model | Determinism | Description |
+|-----------|---------|-------------------|-------------|-------------|
+| `macp.mode.decision.v1` | `decision` | Declared | Semantic-deterministic | RFC-compliant decision lifecycle: Proposal → Evaluation → Objection → Vote → Commitment |
+| `macp.mode.proposal.v1` | — | Peer | Semantic-deterministic | Lightweight propose/accept/reject lifecycle for peer-to-peer coordination |
+| `macp.mode.task.v1` | — | Orchestrated | Structural-only | Task assignment and completion tracking with orchestrator-driven workflow |
+| `macp.mode.handoff.v1` | — | Delegated | Context-frozen | Context transfer between agents with frozen context semantics |
+| `macp.mode.quorum.v1` | — | Quorum | Semantic-deterministic | Threshold-based voting where resolution requires a configurable quorum |
+| `macp.mode.multi_round.v1` | `multi_round` | Participant-based | Convergence | Participant-based convergence using `all_equal` strategy (experimental, not on discovery surfaces) |
 
 An empty `mode` field defaults to `macp.mode.decision.v1` for backward compatibility.
 
@@ -166,6 +170,10 @@ This runtime consists of:
 2. **Basic Client** (`client`) — a demo client exercising the happy path: Initialize, ListModes, SessionStart, Message, Resolve, GetSession.
 3. **Fuzz Client** (`fuzz_client`) — a comprehensive test client exercising every error path, every new RPC, participant validation, signal messages, cancellation, and multi-round convergence.
 4. **Multi-Round Client** (`multi_round_client`) — a focused demo of multi-round convergence with two participants reaching agreement.
+5. **Proposal Client** (`proposal_client`) — a demo of the Proposal mode's peer-based propose/accept/reject workflow.
+6. **Task Client** (`task_client`) — a demo of the Task mode's orchestrated assignment and completion tracking.
+7. **Handoff Client** (`handoff_client`) — a demo of the Handoff mode's delegated context transfer between agents.
+8. **Quorum Client** (`quorum_client`) — a demo of the Quorum mode's threshold-based voting and resolution.
 
 ---
 

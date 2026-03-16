@@ -5,8 +5,12 @@ use std::sync::Arc;
 use crate::error::MacpError;
 use crate::log_store::{EntryKind, LogEntry, LogStore};
 use crate::mode::decision::DecisionMode;
+use crate::mode::handoff::HandoffMode;
 use crate::mode::multi_round::MultiRoundMode;
-use crate::mode::{Mode, ModeResponse};
+use crate::mode::proposal::ProposalMode;
+use crate::mode::quorum::QuorumMode;
+use crate::mode::task::TaskMode;
+use crate::mode::{standard_mode_names, Mode, ModeResponse};
 use crate::pb::Envelope;
 use crate::registry::SessionRegistry;
 use crate::session::{extract_ttl_ms, parse_session_start_payload, Session, SessionState};
@@ -27,10 +31,18 @@ pub struct Runtime {
 impl Runtime {
     pub fn new(registry: Arc<SessionRegistry>, log_store: Arc<LogStore>) -> Self {
         let mut modes: HashMap<String, Box<dyn Mode>> = HashMap::new();
-        // RFC-compliant names
+
+        // Standards-track canonical mode names
         modes.insert("macp.mode.decision.v1".into(), Box::new(DecisionMode));
+        modes.insert("macp.mode.proposal.v1".into(), Box::new(ProposalMode));
+        modes.insert("macp.mode.task.v1".into(), Box::new(TaskMode));
+        modes.insert("macp.mode.handoff.v1".into(), Box::new(HandoffMode));
+        modes.insert("macp.mode.quorum.v1".into(), Box::new(QuorumMode));
+
+        // Experimental mode (not advertised via ListModes but functional)
         modes.insert("macp.mode.multi_round.v1".into(), Box::new(MultiRoundMode));
-        // Short aliases for backward compatibility
+
+        // Short aliases for backward compatibility (legacy only for decision/multi_round)
         modes.insert("decision".into(), Box::new(DecisionMode));
         modes.insert("multi_round".into(), Box::new(MultiRoundMode));
 
@@ -41,12 +53,12 @@ impl Runtime {
         }
     }
 
-    /// Returns the list of RFC-registered mode names (excludes experimental modes).
+    /// Returns the standards-track mode names in canonical registry order.
     pub fn registered_mode_names(&self) -> Vec<String> {
-        self.modes
-            .keys()
-            .filter(|k| k.starts_with("macp.mode.") && !k.contains("multi_round"))
-            .cloned()
+        standard_mode_names()
+            .iter()
+            .filter(|mode_name| self.modes.contains_key(**mode_name))
+            .map(|mode_name| (*mode_name).to_string())
             .collect()
     }
 
@@ -312,7 +324,12 @@ impl Runtime {
 mod tests {
     use super::*;
     use crate::decision_pb::ProposalPayload;
+    use crate::handoff_pb as hpb;
+    use crate::pb::CommitmentPayload;
     use crate::pb::SessionStartPayload;
+    use crate::proposal_pb as ppb;
+    use crate::quorum_pb as qpb;
+    use crate::task_pb as tpb;
     use prost::Message;
 
     fn make_runtime() -> Runtime {
@@ -1474,5 +1491,392 @@ mod tests {
             br#"{"value":"x"}"#,
         );
         rt.process(&e).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn proposal_mode_full_flow() {
+        let rt = make_runtime();
+
+        // SessionStart
+        let start_payload = encode_session_start(0, vec!["buyer".into(), "seller".into()]);
+        let e = env(
+            "macp.mode.proposal.v1",
+            "SessionStart",
+            "m0",
+            "s_prop",
+            "buyer",
+            &start_payload,
+        );
+        rt.process(&e).await.unwrap();
+
+        // Proposal from seller
+        let proposal = ppb::ProposalPayload {
+            proposal_id: "p1".into(),
+            title: "Offer".into(),
+            summary: "$1200".into(),
+            details: vec![],
+            tags: vec![],
+        };
+        let e = env(
+            "macp.mode.proposal.v1",
+            "Proposal",
+            "m1",
+            "s_prop",
+            "seller",
+            &proposal.encode_to_vec(),
+        );
+        rt.process(&e).await.unwrap();
+
+        // Accept from buyer
+        let accept = ppb::AcceptPayload {
+            proposal_id: "p1".into(),
+            reason: "agreed".into(),
+        };
+        let e = env(
+            "macp.mode.proposal.v1",
+            "Accept",
+            "m2",
+            "s_prop",
+            "buyer",
+            &accept.encode_to_vec(),
+        );
+        rt.process(&e).await.unwrap();
+
+        // Commitment from buyer (initiator)
+        let commitment = CommitmentPayload {
+            commitment_id: "c1".into(),
+            action: "proposal.accepted".into(),
+            authority_scope: "commercial".into(),
+            reason: "bound".into(),
+            mode_version: "1.0.0".into(),
+            policy_version: "policy".into(),
+            configuration_version: "config".into(),
+        };
+        let e = env(
+            "macp.mode.proposal.v1",
+            "Commitment",
+            "m3",
+            "s_prop",
+            "buyer",
+            &commitment.encode_to_vec(),
+        );
+        rt.process(&e).await.unwrap();
+
+        // Assert Resolved state
+        {
+            let guard = rt.registry.sessions.read().await;
+            assert_eq!(guard["s_prop"].state, SessionState::Resolved);
+        }
+
+        // Post-resolution message should fail
+        let e = env(
+            "macp.mode.proposal.v1",
+            "Proposal",
+            "m4",
+            "s_prop",
+            "seller",
+            b"nope",
+        );
+        let err = rt.process(&e).await.unwrap_err();
+        assert_eq!(err.to_string(), "SessionNotOpen");
+    }
+
+    #[tokio::test]
+    async fn task_mode_full_flow() {
+        let rt = make_runtime();
+
+        // SessionStart
+        let start_payload = encode_session_start(0, vec!["planner".into(), "worker".into()]);
+        let e = env(
+            "macp.mode.task.v1",
+            "SessionStart",
+            "m0",
+            "s_task",
+            "planner",
+            &start_payload,
+        );
+        rt.process(&e).await.unwrap();
+
+        // TaskRequest from planner
+        let task_req = tpb::TaskRequestPayload {
+            task_id: "t1".into(),
+            title: "Build widget".into(),
+            instructions: "Do it".into(),
+            requested_assignee: "worker".into(),
+            input: vec![],
+            deadline_unix_ms: 0,
+        };
+        let e = env(
+            "macp.mode.task.v1",
+            "TaskRequest",
+            "m1",
+            "s_task",
+            "planner",
+            &task_req.encode_to_vec(),
+        );
+        rt.process(&e).await.unwrap();
+
+        // TaskAccept from worker
+        let task_accept = tpb::TaskAcceptPayload {
+            task_id: "t1".into(),
+            assignee: "worker".into(),
+            reason: "ready".into(),
+        };
+        let e = env(
+            "macp.mode.task.v1",
+            "TaskAccept",
+            "m2",
+            "s_task",
+            "worker",
+            &task_accept.encode_to_vec(),
+        );
+        rt.process(&e).await.unwrap();
+
+        // TaskComplete from worker
+        let task_complete = tpb::TaskCompletePayload {
+            task_id: "t1".into(),
+            assignee: "worker".into(),
+            output: b"result".to_vec(),
+            summary: "done".into(),
+        };
+        let e = env(
+            "macp.mode.task.v1",
+            "TaskComplete",
+            "m3",
+            "s_task",
+            "worker",
+            &task_complete.encode_to_vec(),
+        );
+        rt.process(&e).await.unwrap();
+
+        // Commitment from planner (initiator)
+        let commitment = CommitmentPayload {
+            commitment_id: "c1".into(),
+            action: "task.completed".into(),
+            authority_scope: "commercial".into(),
+            reason: "bound".into(),
+            mode_version: "1.0.0".into(),
+            policy_version: "policy".into(),
+            configuration_version: "config".into(),
+        };
+        let e = env(
+            "macp.mode.task.v1",
+            "Commitment",
+            "m4",
+            "s_task",
+            "planner",
+            &commitment.encode_to_vec(),
+        );
+        rt.process(&e).await.unwrap();
+
+        // Assert Resolved state
+        {
+            let guard = rt.registry.sessions.read().await;
+            assert_eq!(guard["s_task"].state, SessionState::Resolved);
+        }
+
+        // Post-resolution message should fail
+        let e = env(
+            "macp.mode.task.v1",
+            "TaskRequest",
+            "m5",
+            "s_task",
+            "planner",
+            b"nope",
+        );
+        let err = rt.process(&e).await.unwrap_err();
+        assert_eq!(err.to_string(), "SessionNotOpen");
+    }
+
+    #[tokio::test]
+    async fn handoff_mode_full_flow() {
+        let rt = make_runtime();
+
+        // SessionStart
+        let start_payload = encode_session_start(0, vec!["owner".into(), "target".into()]);
+        let e = env(
+            "macp.mode.handoff.v1",
+            "SessionStart",
+            "m0",
+            "s_hand",
+            "owner",
+            &start_payload,
+        );
+        rt.process(&e).await.unwrap();
+
+        // HandoffOffer from owner
+        let offer = hpb::HandoffOfferPayload {
+            handoff_id: "h1".into(),
+            target_participant: "target".into(),
+            scope: "support".into(),
+            reason: "escalate".into(),
+        };
+        let e = env(
+            "macp.mode.handoff.v1",
+            "HandoffOffer",
+            "m1",
+            "s_hand",
+            "owner",
+            &offer.encode_to_vec(),
+        );
+        rt.process(&e).await.unwrap();
+
+        // HandoffAccept from target
+        let accept = hpb::HandoffAcceptPayload {
+            handoff_id: "h1".into(),
+            accepted_by: "target".into(),
+            reason: "ready".into(),
+        };
+        let e = env(
+            "macp.mode.handoff.v1",
+            "HandoffAccept",
+            "m2",
+            "s_hand",
+            "target",
+            &accept.encode_to_vec(),
+        );
+        rt.process(&e).await.unwrap();
+
+        // Commitment from owner (initiator)
+        let commitment = CommitmentPayload {
+            commitment_id: "c1".into(),
+            action: "handoff.accepted".into(),
+            authority_scope: "commercial".into(),
+            reason: "bound".into(),
+            mode_version: "1.0.0".into(),
+            policy_version: "policy".into(),
+            configuration_version: "config".into(),
+        };
+        let e = env(
+            "macp.mode.handoff.v1",
+            "Commitment",
+            "m3",
+            "s_hand",
+            "owner",
+            &commitment.encode_to_vec(),
+        );
+        rt.process(&e).await.unwrap();
+
+        // Assert Resolved state
+        {
+            let guard = rt.registry.sessions.read().await;
+            assert_eq!(guard["s_hand"].state, SessionState::Resolved);
+        }
+
+        // Post-resolution message should fail
+        let e = env(
+            "macp.mode.handoff.v1",
+            "HandoffOffer",
+            "m4",
+            "s_hand",
+            "owner",
+            b"nope",
+        );
+        let err = rt.process(&e).await.unwrap_err();
+        assert_eq!(err.to_string(), "SessionNotOpen");
+    }
+
+    #[tokio::test]
+    async fn quorum_mode_full_flow() {
+        let rt = make_runtime();
+
+        // SessionStart
+        let start_payload =
+            encode_session_start(0, vec!["alice".into(), "bob".into(), "carol".into()]);
+        let e = env(
+            "macp.mode.quorum.v1",
+            "SessionStart",
+            "m0",
+            "s_quorum",
+            "coordinator",
+            &start_payload,
+        );
+        rt.process(&e).await.unwrap();
+
+        // ApprovalRequest from coordinator
+        let approval_req = qpb::ApprovalRequestPayload {
+            request_id: "r1".into(),
+            action: "deploy".into(),
+            summary: "Deploy v2".into(),
+            details: vec![],
+            required_approvals: 2,
+        };
+        let e = env(
+            "macp.mode.quorum.v1",
+            "ApprovalRequest",
+            "m1",
+            "s_quorum",
+            "coordinator",
+            &approval_req.encode_to_vec(),
+        );
+        rt.process(&e).await.unwrap();
+
+        // Approve from alice
+        let approve_alice = qpb::ApprovePayload {
+            request_id: "r1".into(),
+            reason: "looks good".into(),
+        };
+        let e = env(
+            "macp.mode.quorum.v1",
+            "Approve",
+            "m2",
+            "s_quorum",
+            "alice",
+            &approve_alice.encode_to_vec(),
+        );
+        rt.process(&e).await.unwrap();
+
+        // Approve from bob
+        let approve_bob = qpb::ApprovePayload {
+            request_id: "r1".into(),
+            reason: "ready".into(),
+        };
+        let e = env(
+            "macp.mode.quorum.v1",
+            "Approve",
+            "m3",
+            "s_quorum",
+            "bob",
+            &approve_bob.encode_to_vec(),
+        );
+        rt.process(&e).await.unwrap();
+
+        // Commitment from coordinator (initiator)
+        let commitment = CommitmentPayload {
+            commitment_id: "c1".into(),
+            action: "quorum.approved".into(),
+            authority_scope: "commercial".into(),
+            reason: "bound".into(),
+            mode_version: "1.0.0".into(),
+            policy_version: "policy".into(),
+            configuration_version: "config".into(),
+        };
+        let e = env(
+            "macp.mode.quorum.v1",
+            "Commitment",
+            "m4",
+            "s_quorum",
+            "coordinator",
+            &commitment.encode_to_vec(),
+        );
+        rt.process(&e).await.unwrap();
+
+        // Assert Resolved state
+        {
+            let guard = rt.registry.sessions.read().await;
+            assert_eq!(guard["s_quorum"].state, SessionState::Resolved);
+        }
+
+        // Post-resolution message should fail
+        let e = env(
+            "macp.mode.quorum.v1",
+            "ApprovalRequest",
+            "m5",
+            "s_quorum",
+            "coordinator",
+            b"nope",
+        );
+        let err = rt.process(&e).await.unwrap_err();
+        assert_eq!(err.to_string(), "SessionNotOpen");
     }
 }
