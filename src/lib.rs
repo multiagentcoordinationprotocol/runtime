@@ -28,3 +28,5 @@ pub mod mode;
 pub mod registry;
 pub mod runtime;
 pub mod session;
+
+pub mod security;

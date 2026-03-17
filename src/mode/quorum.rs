@@ -1,5 +1,5 @@
 use crate::error::MacpError;
-use crate::mode::util::{decode_commitment_payload, is_declared_participant};
+use crate::mode::util::{is_declared_participant, validate_commitment_payload_for_session};
 use crate::mode::{Mode, ModeResponse};
 use crate::pb::Envelope;
 use crate::quorum_pb::{AbstainPayload, ApprovalRequestPayload, ApprovePayload, RejectPayload};
@@ -187,7 +187,7 @@ impl Mode for QuorumMode {
                 if env.sender != session.initiator_sender {
                     return Err(MacpError::Forbidden);
                 }
-                let _payload = decode_commitment_payload(&env.payload)?;
+                validate_commitment_payload_for_session(session, &env.payload)?;
                 if !Self::commitment_ready(session, &state) {
                     return Err(MacpError::InvalidPayload);
                 }
@@ -220,9 +220,9 @@ mod tests {
             participants: vec!["alice".into(), "bob".into(), "carol".into()],
             seen_message_ids: HashSet::new(),
             intent: String::new(),
-            mode_version: String::new(),
-            configuration_version: String::new(),
-            policy_version: String::new(),
+            mode_version: "1.0.0".into(),
+            configuration_version: "config".into(),
+            policy_version: "policy".into(),
             context: vec![],
             roots: vec![],
             initiator_sender: "coordinator".into(),

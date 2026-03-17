@@ -1,194 +1,145 @@
-use macp_runtime::pb::macp_runtime_service_client::MacpRuntimeServiceClient;
-use macp_runtime::pb::{Envelope, GetSessionRequest, SendRequest, SessionStartPayload};
+#[path = "support/common.rs"]
+mod common;
+
+use common::{
+    canonical_commitment_payload, canonical_start_payload, envelope, get_session_as, print_ack,
+    send_as,
+};
 use macp_runtime::task_pb::{
     TaskAcceptPayload, TaskCompletePayload, TaskRequestPayload, TaskUpdatePayload,
 };
 use prost::Message;
 
-async fn send(
-    client: &mut MacpRuntimeServiceClient<tonic::transport::Channel>,
-    label: &str,
-    e: Envelope,
-) {
-    match client.send(SendRequest { envelope: Some(e) }).await {
-        Ok(resp) => {
-            let ack = resp.into_inner().ack.unwrap();
-            let err_code = ack.error.as_ref().map(|e| e.code.as_str()).unwrap_or("");
-            println!("[{label}] ok={} error='{}'", ack.ok, err_code);
-        }
-        Err(status) => {
-            println!("[{label}] grpc error: {status}");
-        }
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = MacpRuntimeServiceClient::connect("http://127.0.0.1:50051").await?;
+    let mut client = common::connect_client().await?;
 
     println!("=== Task Mode Demo ===\n");
 
-    // 1) SessionStart
-    let start_payload = SessionStartPayload {
-        intent: "summarize document".into(),
-        ttl_ms: 60000,
-        participants: vec!["planner".into(), "worker".into()],
-        mode_version: String::new(),
-        configuration_version: String::new(),
-        policy_version: String::new(),
-        context: vec![],
-        roots: vec![],
-    };
-    send(
+    let ack = send_as(
         &mut client,
-        "session_start",
-        Envelope {
-            macp_version: "1.0".into(),
-            mode: "macp.mode.task.v1".into(),
-            message_type: "SessionStart".into(),
-            message_id: "m0".into(),
-            session_id: "task-1".into(),
-            sender: "planner".into(),
-            timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
-            payload: start_payload.encode_to_vec(),
-        },
+        "planner",
+        envelope(
+            "macp.mode.task.v1",
+            "SessionStart",
+            "m0",
+            "task-demo-1",
+            "planner",
+            canonical_start_payload("summarize quarterly report", &["planner", "worker"], 60_000),
+        ),
     )
-    .await;
+    .await?;
+    print_ack("session_start", &ack);
 
-    // 2) TaskRequest
-    let task_req = TaskRequestPayload {
+    let task_request = TaskRequestPayload {
         task_id: "t1".into(),
         title: "Summarize Q4 report".into(),
-        instructions: "Summarize the key findings".into(),
+        instructions: "Produce a concise executive summary".into(),
         requested_assignee: "worker".into(),
         input: vec![],
         deadline_unix_ms: 0,
     };
-    send(
+    let ack = send_as(
         &mut client,
-        "task_request",
-        Envelope {
-            macp_version: "1.0".into(),
-            mode: "macp.mode.task.v1".into(),
-            message_type: "TaskRequest".into(),
-            message_id: "m1".into(),
-            session_id: "task-1".into(),
-            sender: "planner".into(),
-            timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
-            payload: task_req.encode_to_vec(),
-        },
+        "planner",
+        envelope(
+            "macp.mode.task.v1",
+            "TaskRequest",
+            "m1",
+            "task-demo-1",
+            "planner",
+            task_request.encode_to_vec(),
+        ),
     )
-    .await;
+    .await?;
+    print_ack("task_request", &ack);
 
-    // 3) TaskAccept
     let accept = TaskAcceptPayload {
         task_id: "t1".into(),
         assignee: "worker".into(),
         reason: "ready".into(),
     };
-    send(
+    let ack = send_as(
         &mut client,
-        "task_accept",
-        Envelope {
-            macp_version: "1.0".into(),
-            mode: "macp.mode.task.v1".into(),
-            message_type: "TaskAccept".into(),
-            message_id: "m2".into(),
-            session_id: "task-1".into(),
-            sender: "worker".into(),
-            timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
-            payload: accept.encode_to_vec(),
-        },
+        "worker",
+        envelope(
+            "macp.mode.task.v1",
+            "TaskAccept",
+            "m2",
+            "task-demo-1",
+            "worker",
+            accept.encode_to_vec(),
+        ),
     )
-    .await;
+    .await?;
+    print_ack("task_accept", &ack);
 
-    // 4) TaskUpdate
     let update = TaskUpdatePayload {
         task_id: "t1".into(),
         status: "in_progress".into(),
         progress: 0.5,
-        message: "halfway done".into(),
+        message: "draft summary complete".into(),
         partial_output: vec![],
     };
-    send(
+    let ack = send_as(
         &mut client,
-        "task_update",
-        Envelope {
-            macp_version: "1.0".into(),
-            mode: "macp.mode.task.v1".into(),
-            message_type: "TaskUpdate".into(),
-            message_id: "m3".into(),
-            session_id: "task-1".into(),
-            sender: "worker".into(),
-            timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
-            payload: update.encode_to_vec(),
-        },
+        "worker",
+        envelope(
+            "macp.mode.task.v1",
+            "TaskUpdate",
+            "m3",
+            "task-demo-1",
+            "worker",
+            update.encode_to_vec(),
+        ),
     )
-    .await;
+    .await?;
+    print_ack("task_update", &ack);
 
-    // 5) TaskComplete
     let complete = TaskCompletePayload {
         task_id: "t1".into(),
         assignee: "worker".into(),
-        output: b"Executive summary: Revenue up 15%".to_vec(),
-        summary: "completed".into(),
+        output: b"Q4 summary".to_vec(),
+        summary: "Report summarized successfully".into(),
     };
-    send(
+    let ack = send_as(
         &mut client,
-        "task_complete",
-        Envelope {
-            macp_version: "1.0".into(),
-            mode: "macp.mode.task.v1".into(),
-            message_type: "TaskComplete".into(),
-            message_id: "m4".into(),
-            session_id: "task-1".into(),
-            sender: "worker".into(),
-            timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
-            payload: complete.encode_to_vec(),
-        },
+        "worker",
+        envelope(
+            "macp.mode.task.v1",
+            "TaskComplete",
+            "m4",
+            "task-demo-1",
+            "worker",
+            complete.encode_to_vec(),
+        ),
     )
-    .await;
+    .await?;
+    print_ack("task_complete", &ack);
 
-    // 6) Commitment
-    let commitment = macp_runtime::pb::CommitmentPayload {
-        commitment_id: "c1".into(),
-        action: "task.completed".into(),
-        authority_scope: "ops".into(),
-        reason: "task done".into(),
-        mode_version: "1.0.0".into(),
-        policy_version: String::new(),
-        configuration_version: String::new(),
-    };
-    send(
+    let ack = send_as(
         &mut client,
-        "commitment",
-        Envelope {
-            macp_version: "1.0".into(),
-            mode: "macp.mode.task.v1".into(),
-            message_type: "Commitment".into(),
-            message_id: "m5".into(),
-            session_id: "task-1".into(),
-            sender: "planner".into(),
-            timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
-            payload: commitment.encode_to_vec(),
-        },
+        "planner",
+        envelope(
+            "macp.mode.task.v1",
+            "Commitment",
+            "m5",
+            "task-demo-1",
+            "planner",
+            canonical_commitment_payload(
+                "c1",
+                "task.completed",
+                "workflow",
+                "worker completed task t1",
+            ),
+        ),
     )
-    .await;
+    .await?;
+    print_ack("commitment", &ack);
 
-    // 7) GetSession
-    match client
-        .get_session(GetSessionRequest {
-            session_id: "task-1".into(),
-        })
-        .await
-    {
-        Ok(resp) => {
-            let meta = resp.into_inner().metadata.unwrap();
-            println!("[get_session] state={} mode={}", meta.state, meta.mode);
-        }
-        Err(status) => println!("[get_session] error: {status}"),
-    }
+    let session = get_session_as(&mut client, "worker", "task-demo-1").await?;
+    let meta = session.metadata.expect("metadata");
+    println!("[get_session] state={} mode={}", meta.state, meta.mode);
 
-    println!("\n=== Demo Complete ===");
     Ok(())
 }

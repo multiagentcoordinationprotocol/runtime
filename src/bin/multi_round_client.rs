@@ -1,156 +1,93 @@
-use macp_runtime::pb::macp_runtime_service_client::MacpRuntimeServiceClient;
-use macp_runtime::pb::{Envelope, GetSessionRequest, SendRequest, SessionStartPayload};
-use prost::Message;
+#[path = "support/common.rs"]
+mod common;
 
-async fn send(
-    client: &mut MacpRuntimeServiceClient<tonic::transport::Channel>,
-    label: &str,
-    e: Envelope,
-) {
-    match client.send(SendRequest { envelope: Some(e) }).await {
-        Ok(resp) => {
-            let ack = resp.into_inner().ack.unwrap();
-            let err_code = ack.error.as_ref().map(|e| e.code.as_str()).unwrap_or("");
-            println!("[{label}] ok={} error='{}'", ack.ok, err_code);
-        }
-        Err(status) => {
-            println!("[{label}] grpc error: {status}");
-        }
-    }
-}
+use common::{envelope, get_session_as, print_ack, send_as};
+use macp_runtime::pb::SessionStartPayload;
+use prost::Message;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = MacpRuntimeServiceClient::connect("http://127.0.0.1:50051").await?;
+    let mut client = common::connect_client().await?;
 
     println!("=== Multi-Round Convergence Demo ===\n");
 
-    // 1) SessionStart with multi_round mode
     let start_payload = SessionStartPayload {
         intent: "convergence test".into(),
-        ttl_ms: 60000,
+        ttl_ms: 60_000,
         participants: vec!["alice".into(), "bob".into()],
-        mode_version: String::new(),
-        configuration_version: String::new(),
+        mode_version: "experimental".into(),
+        configuration_version: "legacy".into(),
         policy_version: String::new(),
         context: vec![],
         roots: vec![],
     };
-    send(
+    let ack = send_as(
         &mut client,
-        "session_start",
-        Envelope {
-            macp_version: "1.0".into(),
-            mode: "multi_round".into(),
-            message_type: "SessionStart".into(),
-            message_id: "m0".into(),
-            session_id: "mr1".into(),
-            sender: "coordinator".into(),
-            timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
-            payload: start_payload.encode_to_vec(),
-        },
+        "coordinator",
+        envelope(
+            "macp.mode.multi_round.v1",
+            "SessionStart",
+            "m0",
+            "multi-round-demo-1",
+            "coordinator",
+            start_payload.encode_to_vec(),
+        ),
     )
-    .await;
+    .await?;
+    print_ack("session_start", &ack);
 
-    // 2) Alice contributes "option_a"
-    send(
+    let ack = send_as(
         &mut client,
-        "alice_contributes_a",
-        Envelope {
-            macp_version: "1.0".into(),
-            mode: "multi_round".into(),
-            message_type: "Contribute".into(),
-            message_id: "m1".into(),
-            session_id: "mr1".into(),
-            sender: "alice".into(),
-            timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
-            payload: br#"{"value":"option_a"}"#.to_vec(),
-        },
+        "alice",
+        envelope(
+            "macp.mode.multi_round.v1",
+            "Contribute",
+            "m1",
+            "multi-round-demo-1",
+            "alice",
+            br#"{"value":"option_a"}"#.to_vec(),
+        ),
     )
-    .await;
+    .await?;
+    print_ack("alice_contributes", &ack);
 
-    // 3) Bob contributes "option_b" (no convergence yet)
-    send(
+    let ack = send_as(
         &mut client,
-        "bob_contributes_b",
-        Envelope {
-            macp_version: "1.0".into(),
-            mode: "multi_round".into(),
-            message_type: "Contribute".into(),
-            message_id: "m2".into(),
-            session_id: "mr1".into(),
-            sender: "bob".into(),
-            timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
-            payload: br#"{"value":"option_b"}"#.to_vec(),
-        },
+        "bob",
+        envelope(
+            "macp.mode.multi_round.v1",
+            "Contribute",
+            "m2",
+            "multi-round-demo-1",
+            "bob",
+            br#"{"value":"option_b"}"#.to_vec(),
+        ),
     )
-    .await;
+    .await?;
+    print_ack("bob_contributes_b", &ack);
 
-    // Query session state — should be Open
-    match client
-        .get_session(GetSessionRequest {
-            session_id: "mr1".into(),
-        })
-        .await
-    {
-        Ok(resp) => {
-            let meta = resp.into_inner().metadata.unwrap();
-            println!("[get_session] state={} mode={}", meta.state, meta.mode);
-        }
-        Err(status) => println!("[get_session] error: {status}"),
-    }
+    let session = get_session_as(&mut client, "alice", "multi-round-demo-1").await?;
+    let meta = session.metadata.expect("metadata");
+    println!("[get_session] state={} mode={}", meta.state, meta.mode);
 
-    // 4) Bob revises to "option_a" (convergence -> auto-resolved)
-    send(
+    let ack = send_as(
         &mut client,
-        "bob_revises_to_a",
-        Envelope {
-            macp_version: "1.0".into(),
-            mode: "multi_round".into(),
-            message_type: "Contribute".into(),
-            message_id: "m3".into(),
-            session_id: "mr1".into(),
-            sender: "bob".into(),
-            timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
-            payload: br#"{"value":"option_a"}"#.to_vec(),
-        },
+        "bob",
+        envelope(
+            "macp.mode.multi_round.v1",
+            "Contribute",
+            "m3",
+            "multi-round-demo-1",
+            "bob",
+            br#"{"value":"option_a"}"#.to_vec(),
+        ),
     )
-    .await;
+    .await?;
+    print_ack("bob_revises", &ack);
 
-    // Query session state — should be Resolved
-    match client
-        .get_session(GetSessionRequest {
-            session_id: "mr1".into(),
-        })
-        .await
-    {
-        Ok(resp) => {
-            let meta = resp.into_inner().metadata.unwrap();
-            println!(
-                "[get_session] state={} mode_version={}",
-                meta.state, meta.mode_version
-            );
-        }
-        Err(status) => println!("[get_session] error: {status}"),
-    }
+    let session = get_session_as(&mut client, "alice", "multi-round-demo-1").await?;
+    let meta = session.metadata.expect("metadata");
+    println!("[get_session] state={} mode={}", meta.state, meta.mode);
 
-    // 5) Another message — should be rejected: SessionNotOpen
-    send(
-        &mut client,
-        "after_convergence",
-        Envelope {
-            macp_version: "1.0".into(),
-            mode: "multi_round".into(),
-            message_type: "Contribute".into(),
-            message_id: "m4".into(),
-            session_id: "mr1".into(),
-            sender: "alice".into(),
-            timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
-            payload: br#"{"value":"option_c"}"#.to_vec(),
-        },
-    )
-    .await;
-
-    println!("\n=== Demo Complete ===");
     Ok(())
 }

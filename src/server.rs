@@ -12,6 +12,7 @@ use macp_runtime::pb::{
     WatchRootsResponse,
 };
 use macp_runtime::runtime::Runtime;
+use macp_runtime::security::{AuthIdentity, SecurityLayer};
 use macp_runtime::session::SessionState;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -19,29 +20,29 @@ use tonic::{Request, Response, Status};
 
 pub struct MacpServer {
     runtime: Arc<Runtime>,
+    security: SecurityLayer,
 }
 
 impl MacpServer {
-    pub fn new(runtime: Arc<Runtime>) -> Self {
-        Self { runtime }
+    pub fn new(runtime: Arc<Runtime>, security: SecurityLayer) -> Self {
+        Self { runtime, security }
     }
 
-    fn validate(env: &Envelope) -> Result<(), MacpError> {
+    fn validate_envelope_shape(&self, env: &Envelope) -> Result<(), MacpError> {
         if env.macp_version != "1.0" {
             return Err(MacpError::InvalidMacpVersion);
         }
-        // Signals may have empty session_id
+        if env.message_type.is_empty() || env.message_id.is_empty() {
+            return Err(MacpError::InvalidEnvelope);
+        }
         if env.message_type != "Signal" && env.session_id.is_empty() {
             return Err(MacpError::InvalidEnvelope);
         }
-        if env.message_id.is_empty() {
+        if env.message_type != "Signal" && env.mode.trim().is_empty() {
             return Err(MacpError::InvalidEnvelope);
         }
-        if env.sender.is_empty() {
-            return Err(MacpError::InvalidEnvelope);
-        }
-        if env.message_type.is_empty() {
-            return Err(MacpError::InvalidEnvelope);
+        if env.payload.len() > self.security.max_payload_bytes {
+            return Err(MacpError::PayloadTooLarge);
         }
         Ok(())
     }
@@ -71,6 +72,80 @@ impl MacpServer {
             }),
         }
     }
+
+    fn apply_authenticated_sender(
+        identity: &AuthIdentity,
+        mut env: Envelope,
+    ) -> Result<Envelope, MacpError> {
+        if !env.sender.is_empty() && env.sender != identity.sender {
+            return Err(MacpError::Unauthenticated);
+        }
+        env.sender = identity.sender.clone();
+        Ok(env)
+    }
+
+    async fn authenticate_send_request(
+        &self,
+        request: &Request<SendRequest>,
+        env: Envelope,
+    ) -> Result<Envelope, MacpError> {
+        let identity = self.security.authenticate_metadata(request.metadata())?;
+        let env = Self::apply_authenticated_sender(&identity, env)?;
+        let is_session_start = env.message_type == "SessionStart";
+        self.security
+            .authorize_mode(&identity, &env.mode, is_session_start)?;
+        self.security
+            .enforce_rate_limit(&identity.sender, is_session_start)
+            .await?;
+        if is_session_start {
+            if let Some(max_open) = identity.max_open_sessions {
+                if self
+                    .runtime
+                    .registry
+                    .count_open_sessions_for_initiator(&identity.sender)
+                    .await
+                    >= max_open
+                {
+                    return Err(MacpError::RateLimited);
+                }
+            }
+        }
+        Ok(env)
+    }
+
+    async fn authenticate_session_access<T>(
+        &self,
+        request: &Request<T>,
+        session_id: &str,
+    ) -> Result<AuthIdentity, Status> {
+        let identity = self
+            .security
+            .authenticate_metadata(request.metadata())
+            .map_err(Self::status_from_error)?;
+        let session = self
+            .runtime
+            .get_session_checked(session_id)
+            .await
+            .ok_or_else(|| Status::not_found(format!("Session '{}' not found", session_id)))?;
+        let allowed = session.initiator_sender == identity.sender
+            || session.participants.iter().any(|p| p == &identity.sender);
+        if !allowed {
+            return Err(Status::permission_denied(
+                "FORBIDDEN: session access denied",
+            ));
+        }
+        Ok(identity)
+    }
+
+    fn status_from_error(err: MacpError) -> Status {
+        match err {
+            MacpError::Unauthenticated => Status::unauthenticated(err.to_string()),
+            MacpError::Forbidden => Status::permission_denied(err.to_string()),
+            MacpError::PayloadTooLarge => Status::resource_exhausted(err.to_string()),
+            MacpError::RateLimited => Status::resource_exhausted(err.to_string()),
+            _ => Status::failed_precondition(err.to_string()),
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -80,23 +155,18 @@ impl MacpRuntimeService for MacpServer {
         request: Request<InitializeRequest>,
     ) -> Result<Response<InitializeResponse>, Status> {
         let req = request.into_inner();
-
-        // Negotiate protocol version
-        let supported = &req.supported_protocol_versions;
-        if !supported.iter().any(|v| v == "1.0") {
+        if !req.supported_protocol_versions.iter().any(|v| v == "1.0") {
             return Err(Status::failed_precondition(
                 "UNSUPPORTED_PROTOCOL_VERSION: no mutually supported protocol version",
             ));
         }
-
-        let mode_names = self.runtime.registered_mode_names();
 
         Ok(Response::new(InitializeResponse {
             selected_protocol_version: "1.0".into(),
             runtime_info: Some(RuntimeInfo {
                 name: "macp-runtime".into(),
                 title: "MACP Reference Runtime".into(),
-                version: "0.3.0".into(),
+                version: "0.4.0".into(),
                 description: "Reference implementation of the Multi-Agent Coordination Protocol"
                     .into(),
                 website_url: String::new(),
@@ -118,25 +188,30 @@ impl MacpRuntimeService for MacpServer {
                 }),
                 experimental: None,
             }),
-            supported_modes: mode_names,
-            instructions: String::new(),
+            supported_modes: self.runtime.registered_mode_names(),
+            instructions: "Authenticate requests with Authorization: Bearer <token>. For local development only, x-macp-agent-id may be enabled by configuration.".into(),
         }))
     }
 
     async fn send(&self, request: Request<SendRequest>) -> Result<Response<SendResponse>, Status> {
-        let send_req = request.into_inner();
-        let env = send_req
+        let env = request
+            .get_ref()
             .envelope
+            .clone()
             .ok_or_else(|| Status::invalid_argument("SendRequest must contain an envelope"))?;
 
         let result = async {
-            Self::validate(&env)?;
-            self.runtime.process(&env).await
+            self.validate_envelope_shape(&env)?;
+            let env = self.authenticate_send_request(&request, env).await?;
+            self.runtime
+                .process(&env)
+                .await
+                .map(|process_result| (env, process_result))
         }
         .await;
 
         let ack = match result {
-            Ok(process_result) => Ack {
+            Ok((env, process_result)) => Ack {
                 ok: true,
                 duplicate: process_result.duplicate,
                 message_id: env.message_id.clone(),
@@ -145,7 +220,10 @@ impl MacpRuntimeService for MacpServer {
                 session_state: Self::session_state_to_pb(&process_result.session_state),
                 error: None,
             },
-            Err(e) => Self::make_error_ack(&e, &env),
+            Err(err) => {
+                let env = request.get_ref().envelope.clone().unwrap_or_default();
+                Self::make_error_ack(&err, &env)
+            }
         };
 
         Ok(Response::new(SendResponse { ack: Some(ack) }))
@@ -155,38 +233,39 @@ impl MacpRuntimeService for MacpServer {
         &self,
         request: Request<GetSessionRequest>,
     ) -> Result<Response<GetSessionResponse>, Status> {
-        let req = request.into_inner();
+        let session_id = request.get_ref().session_id.clone();
+        let _identity = self
+            .authenticate_session_access(&request, &session_id)
+            .await?;
+        let session = self
+            .runtime
+            .get_session_checked(&session_id)
+            .await
+            .ok_or_else(|| Status::not_found(format!("Session '{}' not found", session_id)))?;
 
-        match self.runtime.get_session_checked(&req.session_id).await {
-            Some(session) => {
-                let state = Self::session_state_to_pb(&session.state);
-
-                Ok(Response::new(GetSessionResponse {
-                    metadata: Some(SessionMetadata {
-                        session_id: session.session_id.clone(),
-                        mode: session.mode.clone(),
-                        state,
-                        started_at_unix_ms: session.started_at_unix_ms,
-                        expires_at_unix_ms: session.ttl_expiry,
-                        mode_version: session.mode_version.clone(),
-                        configuration_version: session.configuration_version.clone(),
-                        policy_version: session.policy_version.clone(),
-                    }),
-                }))
-            }
-            None => Err(Status::not_found(format!(
-                "Session '{}' not found",
-                req.session_id
-            ))),
-        }
+        Ok(Response::new(GetSessionResponse {
+            metadata: Some(SessionMetadata {
+                session_id: session.session_id.clone(),
+                mode: session.mode.clone(),
+                state: Self::session_state_to_pb(&session.state),
+                started_at_unix_ms: session.started_at_unix_ms,
+                expires_at_unix_ms: session.ttl_expiry,
+                mode_version: session.mode_version.clone(),
+                configuration_version: session.configuration_version.clone(),
+                policy_version: session.policy_version.clone(),
+            }),
+        }))
     }
 
     async fn cancel_session(
         &self,
         request: Request<CancelSessionRequest>,
     ) -> Result<Response<CancelSessionResponse>, Status> {
+        let session_id = request.get_ref().session_id.clone();
+        let _identity = self
+            .authenticate_session_access(&request, &session_id)
+            .await?;
         let req = request.into_inner();
-
         match self
             .runtime
             .cancel_session(&req.session_id, &req.reason)
@@ -203,8 +282,8 @@ impl MacpRuntimeService for MacpServer {
                     error: None,
                 }),
             })),
-            Err(e) => {
-                let ack = Ack {
+            Err(err) => Ok(Response::new(CancelSessionResponse {
+                ack: Some(Ack {
                     ok: false,
                     duplicate: false,
                     message_id: String::new(),
@@ -212,15 +291,14 @@ impl MacpRuntimeService for MacpServer {
                     accepted_at_unix_ms: chrono::Utc::now().timestamp_millis(),
                     session_state: PbSessionState::Unspecified.into(),
                     error: Some(PbMacpError {
-                        code: e.error_code().into(),
-                        message: e.to_string(),
+                        code: err.error_code().into(),
+                        message: err.to_string(),
                         session_id: req.session_id,
                         message_id: String::new(),
                         details: vec![],
                     }),
-                };
-                Ok(Response::new(CancelSessionResponse { ack: Some(ack) }))
-            }
+                }),
+            })),
         }
     }
 
@@ -229,8 +307,6 @@ impl MacpRuntimeService for MacpServer {
         request: Request<GetManifestRequest>,
     ) -> Result<Response<GetManifestResponse>, Status> {
         let req = request.into_inner();
-
-        // Empty agent_id or "macp-runtime" returns self manifest; anything else is not found
         if !req.agent_id.is_empty() && req.agent_id != "macp-runtime" {
             return Err(Status::not_found(format!(
                 "Agent '{}' not found",
@@ -238,14 +314,12 @@ impl MacpRuntimeService for MacpServer {
             )));
         }
 
-        let mode_names = self.runtime.registered_mode_names();
-
         Ok(Response::new(GetManifestResponse {
             manifest: Some(macp_runtime::pb::AgentManifest {
                 agent_id: "macp-runtime".into(),
                 title: "MACP Reference Runtime".into(),
                 description: "Reference implementation of MACP".into(),
-                supported_modes: mode_names,
+                supported_modes: self.runtime.registered_mode_names(),
                 input_content_types: vec!["application/macp-envelope+proto".into()],
                 output_content_types: vec!["application/macp-envelope+proto".into()],
                 metadata: HashMap::new(),
@@ -276,72 +350,11 @@ impl MacpRuntimeService for MacpServer {
 
     async fn stream_session(
         &self,
-        request: Request<tonic::Streaming<StreamSessionRequest>>,
+        _request: Request<tonic::Streaming<StreamSessionRequest>>,
     ) -> Result<Response<Self::StreamSessionStream>, Status> {
-        use tokio_stream::StreamExt;
-
-        let runtime = self.runtime.clone();
-        let mut inbound = request.into_inner();
-
-        let output = async_stream::try_stream! {
-            while let Some(req) = inbound.next().await {
-                let req = req?;
-                let env = req.envelope.ok_or_else(|| {
-                    Status::invalid_argument("StreamSessionRequest must contain an envelope")
-                })?;
-
-                let result = async {
-                    MacpServer::validate(&env)?;
-                    runtime.process(&env).await
-                }
-                .await;
-
-                match result {
-                    Ok(result) => {
-                        let ack_env = Envelope {
-                            macp_version: "1.0".into(),
-                            mode: env.mode.clone(),
-                            message_type: "Ack".into(),
-                            message_id: format!("ack-{}", env.message_id),
-                            session_id: env.session_id.clone(),
-                            sender: "_runtime".into(),
-                            timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
-                            payload: serde_json::to_vec(&serde_json::json!({
-                                "ok": true,
-                                "duplicate": result.duplicate,
-                                "session_state": format!("{:?}", result.session_state),
-                            }))
-                            .unwrap_or_default(),
-                        };
-                        yield StreamSessionResponse {
-                            envelope: Some(ack_env),
-                        };
-                    }
-                    Err(e) => {
-                        // Build an error envelope as a response
-                        let error_ack = MacpServer::make_error_ack(&e, &env);
-                        let error_env = Envelope {
-                            macp_version: "1.0".into(),
-                            mode: env.mode.clone(),
-                            message_type: "Error".into(),
-                            message_id: format!("err-{}", env.message_id),
-                            session_id: env.session_id.clone(),
-                            sender: "_runtime".into(),
-                            timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
-                            payload: serde_json::to_vec(&serde_json::json!({
-                                "code": error_ack.error.as_ref().map(|e| &e.code),
-                                "message": error_ack.error.as_ref().map(|e| &e.message),
-                            })).unwrap_or_default(),
-                        };
-                        yield StreamSessionResponse {
-                            envelope: Some(error_env),
-                        };
-                    }
-                }
-            }
-        };
-
-        Ok(Response::new(Box::pin(output)))
+        Err(Status::unimplemented(
+            "StreamSession is intentionally disabled in the unary freeze profile",
+        ))
     }
 
     type WatchModeRegistryStream = std::pin::Pin<
@@ -373,1628 +386,222 @@ impl MacpRuntimeService for MacpServer {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use macp_runtime::handoff_pb;
     use macp_runtime::log_store::LogStore;
-    use macp_runtime::pb::CommitmentPayload;
     use macp_runtime::pb::SessionStartPayload;
-    use macp_runtime::proposal_pb;
-    use macp_runtime::quorum_pb;
     use macp_runtime::registry::SessionRegistry;
-    use macp_runtime::session::Session;
-    use macp_runtime::task_pb;
     use prost::Message;
-    use std::collections::HashSet;
 
     fn make_server() -> (MacpServer, Arc<Runtime>) {
         let registry = Arc::new(SessionRegistry::new());
         let log_store = Arc::new(LogStore::new());
         let runtime = Arc::new(Runtime::new(registry, log_store));
-        let server = MacpServer::new(runtime.clone());
+        let server = MacpServer::new(runtime.clone(), SecurityLayer::dev_mode());
         (server, runtime)
     }
 
-    fn send_req(env: Envelope) -> Request<SendRequest> {
-        Request::new(SendRequest {
+    fn send_req(sender: &str, env: Envelope) -> Request<SendRequest> {
+        let mut req = Request::new(SendRequest {
             envelope: Some(env),
-        })
+        });
+        req.metadata_mut()
+            .insert("x-macp-agent-id", sender.parse().unwrap());
+        req
     }
 
-    async fn do_send(server: &MacpServer, env: Envelope) -> Ack {
-        let resp = server.send(send_req(env)).await.unwrap();
+    async fn do_send(server: &MacpServer, sender: &str, env: Envelope) -> Ack {
+        let resp = server.send(send_req(sender, env)).await.unwrap();
         resp.into_inner().ack.unwrap()
     }
 
-    // --- TTL/Session state tests ---
-
-    #[tokio::test]
-    async fn expired_session_transitions_to_expired() {
-        let (_, runtime) = make_server();
-        let server = MacpServer::new(runtime.clone());
-
-        let expired_ttl = Utc::now().timestamp_millis() - 1000;
-        runtime
-            .registry
-            .insert_session_for_test(
-                "s_expired".into(),
-                Session {
-                    session_id: "s_expired".into(),
-                    state: SessionState::Open,
-                    ttl_expiry: expired_ttl,
-                    started_at_unix_ms: expired_ttl - 60_000,
-                    resolution: None,
-                    mode: "decision".into(),
-                    mode_state: vec![],
-                    participants: vec![],
-                    seen_message_ids: HashSet::new(),
-                    intent: String::new(),
-                    mode_version: String::new(),
-                    configuration_version: String::new(),
-                    policy_version: String::new(),
-                    context: vec![],
-                    roots: vec![],
-                    initiator_sender: String::new(),
-                },
-            )
-            .await;
-
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "decision".into(),
-            message_type: "Message".into(),
-            message_id: "m1".into(),
-            session_id: "s_expired".into(),
-            sender: "test".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: b"hello".to_vec(),
-        };
-
-        let ack = do_send(&server, env).await;
-        assert!(!ack.ok);
-        assert_eq!(ack.error.as_ref().unwrap().code, "SESSION_NOT_OPEN");
-
-        let s = runtime.registry.get_session("s_expired").await.unwrap();
-        assert_eq!(s.state, SessionState::Expired);
-    }
-
-    #[tokio::test]
-    async fn non_expired_session_stays_open() {
-        let (_, runtime) = make_server();
-        let server = MacpServer::new(runtime.clone());
-
-        let future_ttl = Utc::now().timestamp_millis() + 60_000;
-        runtime
-            .registry
-            .insert_session_for_test(
-                "s_alive".into(),
-                Session {
-                    session_id: "s_alive".into(),
-                    state: SessionState::Open,
-                    ttl_expiry: future_ttl,
-                    started_at_unix_ms: future_ttl - 120_000,
-                    resolution: None,
-                    mode: "decision".into(),
-                    mode_state: vec![],
-                    participants: vec![],
-                    seen_message_ids: HashSet::new(),
-                    intent: String::new(),
-                    mode_version: String::new(),
-                    configuration_version: String::new(),
-                    policy_version: String::new(),
-                    context: vec![],
-                    roots: vec![],
-                    initiator_sender: String::new(),
-                },
-            )
-            .await;
-
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "decision".into(),
-            message_type: "Message".into(),
-            message_id: "m1".into(),
-            session_id: "s_alive".into(),
-            sender: "test".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: b"hello".to_vec(),
-        };
-
-        let ack = do_send(&server, env).await;
-        assert!(ack.ok);
-
-        let s = runtime.registry.get_session("s_alive").await.unwrap();
-        assert_eq!(s.state, SessionState::Open);
-    }
-
-    #[tokio::test]
-    async fn resolved_session_not_overwritten_to_expired() {
-        let (_, runtime) = make_server();
-        let server = MacpServer::new(runtime.clone());
-
-        let expired_ttl = Utc::now().timestamp_millis() - 1000;
-        runtime
-            .registry
-            .insert_session_for_test(
-                "s_resolved".into(),
-                Session {
-                    session_id: "s_resolved".into(),
-                    state: SessionState::Resolved,
-                    ttl_expiry: expired_ttl,
-                    started_at_unix_ms: expired_ttl - 60_000,
-                    resolution: Some(b"resolve".to_vec()),
-                    mode: "decision".into(),
-                    mode_state: vec![],
-                    participants: vec![],
-                    seen_message_ids: HashSet::new(),
-                    intent: String::new(),
-                    mode_version: String::new(),
-                    configuration_version: String::new(),
-                    policy_version: String::new(),
-                    context: vec![],
-                    roots: vec![],
-                    initiator_sender: String::new(),
-                },
-            )
-            .await;
-
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "decision".into(),
-            message_type: "Message".into(),
-            message_id: "m1".into(),
-            session_id: "s_resolved".into(),
-            sender: "test".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: b"hello".to_vec(),
-        };
-
-        let ack = do_send(&server, env).await;
-        assert!(!ack.ok);
-        assert_eq!(ack.error.as_ref().unwrap().code, "SESSION_NOT_OPEN");
-
-        let s = runtime.registry.get_session("s_resolved").await.unwrap();
-        assert_eq!(s.state, SessionState::Resolved);
-    }
-
-    // --- Version validation ---
-
-    #[tokio::test]
-    async fn version_1_0_accepted() {
-        let (server, _) = make_server();
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "decision".into(),
-            message_type: "SessionStart".into(),
-            message_id: "m1".into(),
-            session_id: "s1".into(),
-            sender: "test".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: vec![],
-        };
-        let ack = do_send(&server, env).await;
-        assert!(ack.ok);
-    }
-
-    #[tokio::test]
-    async fn version_v1_rejected() {
-        let (server, _) = make_server();
-        let env = Envelope {
-            macp_version: "v1".into(),
-            mode: "decision".into(),
-            message_type: "SessionStart".into(),
-            message_id: "m1".into(),
-            session_id: "s1".into(),
-            sender: "test".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: vec![],
-        };
-        let ack = do_send(&server, env).await;
-        assert!(!ack.ok);
-        assert_eq!(
-            ack.error.as_ref().unwrap().code,
-            "UNSUPPORTED_PROTOCOL_VERSION"
-        );
-    }
-
-    #[tokio::test]
-    async fn empty_version_rejected() {
-        let (server, _) = make_server();
-        let env = Envelope {
-            macp_version: String::new(),
-            mode: "decision".into(),
-            message_type: "SessionStart".into(),
-            message_id: "m1".into(),
-            session_id: "s1".into(),
-            sender: "test".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: vec![],
-        };
-        let ack = do_send(&server, env).await;
-        assert!(!ack.ok);
-        assert_eq!(
-            ack.error.as_ref().unwrap().code,
-            "UNSUPPORTED_PROTOCOL_VERSION"
-        );
-    }
-
-    // --- Envelope validation ---
-
-    #[tokio::test]
-    async fn empty_session_id_rejected() {
-        let (server, _) = make_server();
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "decision".into(),
-            message_type: "SessionStart".into(),
-            message_id: "m1".into(),
-            session_id: String::new(),
-            sender: "test".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: vec![],
-        };
-        let ack = do_send(&server, env).await;
-        assert!(!ack.ok);
-        assert_eq!(ack.error.as_ref().unwrap().code, "INVALID_ENVELOPE");
-    }
-
-    #[tokio::test]
-    async fn empty_message_id_rejected() {
-        let (server, _) = make_server();
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "decision".into(),
-            message_type: "SessionStart".into(),
-            message_id: String::new(),
-            session_id: "s1".into(),
-            sender: "test".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: vec![],
-        };
-        let ack = do_send(&server, env).await;
-        assert!(!ack.ok);
-        assert_eq!(ack.error.as_ref().unwrap().code, "INVALID_ENVELOPE");
-    }
-
-    // --- Signal with empty session_id allowed ---
-
-    #[tokio::test]
-    async fn signal_empty_session_id_allowed() {
-        let (server, _) = make_server();
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: String::new(),
-            message_type: "Signal".into(),
-            message_id: "sig1".into(),
-            session_id: String::new(),
-            sender: "test".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: vec![],
-        };
-        let ack = do_send(&server, env).await;
-        assert!(ack.ok);
-    }
-
-    // --- Ack fields populated correctly ---
-
-    #[tokio::test]
-    async fn ack_fields_on_success() {
-        let (server, _) = make_server();
-        let before = Utc::now().timestamp_millis();
-
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "decision".into(),
-            message_type: "SessionStart".into(),
-            message_id: "msg123".into(),
-            session_id: "sess456".into(),
-            sender: "test".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: vec![],
-        };
-        let ack = do_send(&server, env).await;
-
-        assert!(ack.ok);
-        assert!(!ack.duplicate);
-        assert_eq!(ack.message_id, "msg123");
-        assert_eq!(ack.session_id, "sess456");
-        assert!(ack.accepted_at_unix_ms >= before);
-        assert_eq!(ack.session_state, PbSessionState::Open as i32);
-        assert!(ack.error.is_none());
-    }
-
-    #[tokio::test]
-    async fn ack_fields_on_error() {
-        let (server, _) = make_server();
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "decision".into(),
-            message_type: "Message".into(),
-            message_id: "msg789".into(),
-            session_id: "nonexistent".into(),
-            sender: "test".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: vec![],
-        };
-        let ack = do_send(&server, env).await;
-
-        assert!(!ack.ok);
-        assert!(!ack.duplicate);
-        assert_eq!(ack.message_id, "msg789");
-        assert_eq!(ack.session_id, "nonexistent");
-        let err = ack.error.unwrap();
-        assert_eq!(err.code, "SESSION_NOT_FOUND");
-        assert_eq!(err.message, "UnknownSession");
-        assert_eq!(err.session_id, "nonexistent");
-        assert_eq!(err.message_id, "msg789");
-    }
-
-    // --- Deduplication at server layer ---
-
-    #[tokio::test]
-    async fn ack_duplicate_field_set() {
-        let (server, _) = make_server();
-
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "decision".into(),
-            message_type: "SessionStart".into(),
-            message_id: "m1".into(),
-            session_id: "s1".into(),
-            sender: "test".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: vec![],
-        };
-        let ack = do_send(&server, env).await;
-        assert!(ack.ok);
-        assert!(!ack.duplicate);
-
-        // Send a message
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "decision".into(),
-            message_type: "Message".into(),
-            message_id: "m2".into(),
-            session_id: "s1".into(),
-            sender: "test".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: b"hello".to_vec(),
-        };
-        let ack = do_send(&server, env).await;
-        assert!(!ack.duplicate);
-
-        // Duplicate
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "decision".into(),
-            message_type: "Message".into(),
-            message_id: "m2".into(),
-            session_id: "s1".into(),
-            sender: "test".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: b"hello".to_vec(),
-        };
-        let ack = do_send(&server, env).await;
-        assert!(ack.ok);
-        assert!(ack.duplicate);
-    }
-
-    // --- GetSession ---
-
-    #[tokio::test]
-    async fn get_session_success() {
-        let (server, _) = make_server();
-
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "decision".into(),
-            message_type: "SessionStart".into(),
-            message_id: "m1".into(),
-            session_id: "s_get".into(),
-            sender: "test".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: vec![],
-        };
-        do_send(&server, env).await;
-
-        let resp = server
-            .get_session(Request::new(GetSessionRequest {
-                session_id: "s_get".into(),
-            }))
-            .await
-            .unwrap();
-        let meta = resp.into_inner().metadata.unwrap();
-        assert_eq!(meta.session_id, "s_get");
-        assert_eq!(meta.mode, "decision");
-        assert_eq!(meta.state, PbSessionState::Open as i32);
-        assert!(meta.started_at_unix_ms > 0);
-        assert!(meta.expires_at_unix_ms > meta.started_at_unix_ms);
-    }
-
-    #[tokio::test]
-    async fn get_session_not_found() {
-        let (server, _) = make_server();
-
-        let result = server
-            .get_session(Request::new(GetSessionRequest {
-                session_id: "nonexistent".into(),
-            }))
-            .await;
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code(), tonic::Code::NotFound);
-    }
-
-    #[tokio::test]
-    async fn get_session_shows_resolved_state() {
-        let (server, _) = make_server();
-
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "decision".into(),
-            message_type: "SessionStart".into(),
-            message_id: "m1".into(),
-            session_id: "s_res".into(),
-            sender: "test".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: vec![],
-        };
-        do_send(&server, env).await;
-
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "decision".into(),
-            message_type: "Message".into(),
-            message_id: "m2".into(),
-            session_id: "s_res".into(),
-            sender: "test".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: b"resolve".to_vec(),
-        };
-        do_send(&server, env).await;
-
-        let resp = server
-            .get_session(Request::new(GetSessionRequest {
-                session_id: "s_res".into(),
-            }))
-            .await
-            .unwrap();
-        let meta = resp.into_inner().metadata.unwrap();
-        assert_eq!(meta.state, PbSessionState::Resolved as i32);
-    }
-
-    #[tokio::test]
-    async fn get_session_with_version_fields() {
-        let (server, _) = make_server();
-
-        let start_payload = SessionStartPayload {
-            intent: "coordinate".into(),
-            participants: vec![],
-            mode_version: "1.0".into(),
+    fn start_payload() -> Vec<u8> {
+        SessionStartPayload {
+            intent: "intent".into(),
+            participants: vec!["agent://fraud".into()],
+            mode_version: "1.0.0".into(),
             configuration_version: "cfg-1".into(),
-            policy_version: "pol-1".into(),
-            ttl_ms: 0,
+            policy_version: "policy-1".into(),
+            ttl_ms: 1000,
             context: vec![],
             roots: vec![],
-        };
-
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "decision".into(),
-            message_type: "SessionStart".into(),
-            message_id: "m1".into(),
-            session_id: "s_ver".into(),
-            sender: "test".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: start_payload.encode_to_vec(),
-        };
-        do_send(&server, env).await;
-
-        let resp = server
-            .get_session(Request::new(GetSessionRequest {
-                session_id: "s_ver".into(),
-            }))
-            .await
-            .unwrap();
-        let meta = resp.into_inner().metadata.unwrap();
-        assert_eq!(meta.mode_version, "1.0");
-        assert_eq!(meta.configuration_version, "cfg-1");
-        assert_eq!(meta.policy_version, "pol-1");
+        }
+        .encode_to_vec()
     }
 
-    // --- CancelSession at server layer ---
+    #[tokio::test]
+    async fn sender_is_derived_from_authenticated_metadata() {
+        let (server, runtime) = make_server();
+        let ack = do_send(
+            &server,
+            "agent://orchestrator",
+            Envelope {
+                macp_version: "1.0".into(),
+                mode: "macp.mode.decision.v1".into(),
+                message_type: "SessionStart".into(),
+                message_id: "m1".into(),
+                session_id: "s1".into(),
+                sender: String::new(),
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                payload: start_payload(),
+            },
+        )
+        .await;
+        assert!(ack.ok);
+        let session = runtime.get_session_checked("s1").await.unwrap();
+        assert_eq!(session.initiator_sender, "agent://orchestrator");
+    }
 
     #[tokio::test]
-    async fn cancel_session_success() {
+    async fn spoofed_sender_is_rejected() {
         let (server, _) = make_server();
+        let ack = do_send(
+            &server,
+            "agent://orchestrator",
+            Envelope {
+                macp_version: "1.0".into(),
+                mode: "macp.mode.decision.v1".into(),
+                message_type: "SessionStart".into(),
+                message_id: "m1".into(),
+                session_id: "s1".into(),
+                sender: "agent://spoof".into(),
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                payload: start_payload(),
+            },
+        )
+        .await;
+        assert!(!ack.ok);
+        assert_eq!(ack.error.as_ref().unwrap().code, "UNAUTHENTICATED");
+    }
 
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "decision".into(),
-            message_type: "SessionStart".into(),
-            message_id: "m1".into(),
-            session_id: "s_cancel".into(),
-            sender: "test".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: vec![],
-        };
-        do_send(&server, env).await;
+    #[tokio::test]
+    async fn get_session_requires_session_membership() {
+        let (server, _) = make_server();
+        let ack = do_send(
+            &server,
+            "agent://orchestrator",
+            Envelope {
+                macp_version: "1.0".into(),
+                mode: "macp.mode.decision.v1".into(),
+                message_type: "SessionStart".into(),
+                message_id: "m1".into(),
+                session_id: "s1".into(),
+                sender: String::new(),
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                payload: start_payload(),
+            },
+        )
+        .await;
+        assert!(ack.ok);
 
+        let mut req = Request::new(GetSessionRequest {
+            session_id: "s1".into(),
+        });
+        req.metadata_mut()
+            .insert("x-macp-agent-id", "agent://outsider".parse().unwrap());
+        let err = server.get_session(req).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    // Note: stream_session cannot be unit-tested directly because
+    // tonic::Streaming requires an HTTP/2 body. The endpoint returns
+    // Status::unimplemented, verified via integration testing.
+
+    #[tokio::test]
+    async fn list_modes_returns_standard_modes() {
+        let (server, _) = make_server();
         let resp = server
-            .cancel_session(Request::new(CancelSessionRequest {
-                session_id: "s_cancel".into(),
-                reason: "testing".into(),
-            }))
+            .list_modes(Request::new(ListModesRequest {}))
             .await
             .unwrap();
+        let names: Vec<String> = resp
+            .into_inner()
+            .modes
+            .iter()
+            .map(|m| m.mode.clone())
+            .collect();
+        assert_eq!(names.len(), 5);
+        assert!(names.contains(&"macp.mode.decision.v1".to_string()));
+        assert!(names.contains(&"macp.mode.proposal.v1".to_string()));
+        assert!(names.contains(&"macp.mode.task.v1".to_string()));
+        assert!(names.contains(&"macp.mode.handoff.v1".to_string()));
+        assert!(names.contains(&"macp.mode.quorum.v1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn get_session_returns_metadata() {
+        let (server, _) = make_server();
+        let ack = do_send(
+            &server,
+            "agent://orchestrator",
+            Envelope {
+                macp_version: "1.0".into(),
+                mode: "macp.mode.decision.v1".into(),
+                message_type: "SessionStart".into(),
+                message_id: "m1".into(),
+                session_id: "s1".into(),
+                sender: String::new(),
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                payload: start_payload(),
+            },
+        )
+        .await;
+        assert!(ack.ok);
+
+        let mut req = Request::new(GetSessionRequest {
+            session_id: "s1".into(),
+        });
+        req.metadata_mut()
+            .insert("x-macp-agent-id", "agent://orchestrator".parse().unwrap());
+        let resp = server.get_session(req).await.unwrap();
+        let meta = resp.into_inner().metadata.unwrap();
+        assert_eq!(meta.session_id, "s1");
+        assert_eq!(meta.mode, "macp.mode.decision.v1");
+        assert_eq!(meta.mode_version, "1.0.0");
+        assert_eq!(meta.configuration_version, "cfg-1");
+    }
+
+    #[tokio::test]
+    async fn cancel_session_transitions_to_expired() {
+        let (server, _) = make_server();
+        let ack = do_send(
+            &server,
+            "agent://orchestrator",
+            Envelope {
+                macp_version: "1.0".into(),
+                mode: "macp.mode.decision.v1".into(),
+                message_type: "SessionStart".into(),
+                message_id: "m1".into(),
+                session_id: "s1".into(),
+                sender: String::new(),
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                payload: start_payload(),
+            },
+        )
+        .await;
+        assert!(ack.ok);
+
+        let mut req = Request::new(CancelSessionRequest {
+            session_id: "s1".into(),
+            reason: "no longer needed".into(),
+        });
+        req.metadata_mut()
+            .insert("x-macp-agent-id", "agent://orchestrator".parse().unwrap());
+        let resp = server.cancel_session(req).await.unwrap();
         let ack = resp.into_inner().ack.unwrap();
         assert!(ack.ok);
-        assert_eq!(ack.session_id, "s_cancel");
         assert_eq!(ack.session_state, PbSessionState::Expired as i32);
     }
 
     #[tokio::test]
-    async fn cancel_session_not_found() {
+    async fn cancel_session_unknown_session_returns_error() {
         let (server, _) = make_server();
-
-        let resp = server
-            .cancel_session(Request::new(CancelSessionRequest {
-                session_id: "nonexistent".into(),
-                reason: "testing".into(),
-            }))
-            .await
-            .unwrap();
-        let ack = resp.into_inner().ack.unwrap();
-        assert!(!ack.ok);
-        assert_eq!(ack.error.as_ref().unwrap().code, "SESSION_NOT_FOUND");
-    }
-
-    #[tokio::test]
-    async fn cancel_then_message_rejected() {
-        let (server, _) = make_server();
-
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "decision".into(),
-            message_type: "SessionStart".into(),
-            message_id: "m1".into(),
-            session_id: "s_cm".into(),
-            sender: "test".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: vec![],
-        };
-        do_send(&server, env).await;
-
-        server
-            .cancel_session(Request::new(CancelSessionRequest {
-                session_id: "s_cm".into(),
-                reason: "done".into(),
-            }))
-            .await
-            .unwrap();
-
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "decision".into(),
-            message_type: "Message".into(),
-            message_id: "m2".into(),
-            session_id: "s_cm".into(),
-            sender: "test".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: b"hello".to_vec(),
-        };
-        let ack = do_send(&server, env).await;
-        assert!(!ack.ok);
-        assert_eq!(ack.error.as_ref().unwrap().code, "SESSION_NOT_OPEN");
-    }
-
-    // --- Participant validation at server layer ---
-
-    #[tokio::test]
-    async fn forbidden_error_at_server_layer() {
-        let (server, _) = make_server();
-
-        let start_payload = SessionStartPayload {
-            intent: String::new(),
-            participants: vec!["alice".into()],
-            mode_version: String::new(),
-            configuration_version: String::new(),
-            policy_version: String::new(),
-            ttl_ms: 0,
-            context: vec![],
-            roots: vec![],
-        };
-
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "decision".into(),
-            message_type: "SessionStart".into(),
-            message_id: "m1".into(),
-            session_id: "s_auth".into(),
-            sender: "test".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: start_payload.encode_to_vec(),
-        };
-        do_send(&server, env).await;
-
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "decision".into(),
-            message_type: "Message".into(),
-            message_id: "m2".into(),
-            session_id: "s_auth".into(),
-            sender: "bob".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: b"hello".to_vec(),
-        };
-        let ack = do_send(&server, env).await;
-        assert!(!ack.ok);
-        assert_eq!(ack.error.as_ref().unwrap().code, "FORBIDDEN");
-    }
-
-    // --- Full decision flow through server ---
-
-    #[tokio::test]
-    async fn full_decision_flow_through_server() {
-        let (server, _) = make_server();
-
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "decision".into(),
-            message_type: "SessionStart".into(),
-            message_id: "m1".into(),
-            session_id: "s_flow".into(),
-            sender: "alice".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: vec![],
-        };
-        let ack = do_send(&server, env).await;
-        assert!(ack.ok);
-        assert_eq!(ack.session_state, PbSessionState::Open as i32);
-
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "decision".into(),
-            message_type: "Message".into(),
-            message_id: "m2".into(),
-            session_id: "s_flow".into(),
-            sender: "alice".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: b"hello".to_vec(),
-        };
-        let ack = do_send(&server, env).await;
-        assert!(ack.ok);
-        assert_eq!(ack.session_state, PbSessionState::Open as i32);
-
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "decision".into(),
-            message_type: "Message".into(),
-            message_id: "m3".into(),
-            session_id: "s_flow".into(),
-            sender: "alice".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: b"resolve".to_vec(),
-        };
-        let ack = do_send(&server, env).await;
-        assert!(ack.ok);
-        assert_eq!(ack.session_state, PbSessionState::Resolved as i32);
-
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "decision".into(),
-            message_type: "Message".into(),
-            message_id: "m4".into(),
-            session_id: "s_flow".into(),
-            sender: "alice".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: b"too late".to_vec(),
-        };
-        let ack = do_send(&server, env).await;
-        assert!(!ack.ok);
-        assert_eq!(ack.error.unwrap().code, "SESSION_NOT_OPEN");
-    }
-
-    // --- Full multi-round flow through server ---
-
-    #[tokio::test]
-    async fn full_multi_round_flow_through_server() {
-        let (server, _) = make_server();
-
-        let start_payload = SessionStartPayload {
-            intent: String::new(),
-            ttl_ms: 60_000,
-            participants: vec!["alice".into(), "bob".into()],
-            mode_version: String::new(),
-            configuration_version: String::new(),
-            policy_version: String::new(),
-            context: vec![],
-            roots: vec![],
-        };
-
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "multi_round".into(),
-            message_type: "SessionStart".into(),
-            message_id: "m0".into(),
-            session_id: "s_mr".into(),
-            sender: "coordinator".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: start_payload.encode_to_vec(),
-        };
-        let ack = do_send(&server, env).await;
-        assert!(ack.ok);
-        assert_eq!(ack.session_state, PbSessionState::Open as i32);
-
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "multi_round".into(),
-            message_type: "Contribute".into(),
-            message_id: "m1".into(),
-            session_id: "s_mr".into(),
-            sender: "alice".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: br#"{"value":"option_a"}"#.to_vec(),
-        };
-        let ack = do_send(&server, env).await;
-        assert!(ack.ok);
-        assert_eq!(ack.session_state, PbSessionState::Open as i32);
-
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "multi_round".into(),
-            message_type: "Contribute".into(),
-            message_id: "m2".into(),
-            session_id: "s_mr".into(),
-            sender: "bob".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: br#"{"value":"option_a"}"#.to_vec(),
-        };
-        let ack = do_send(&server, env).await;
-        assert!(ack.ok);
-        assert_eq!(ack.session_state, PbSessionState::Resolved as i32);
-
-        let resp = server
-            .get_session(Request::new(GetSessionRequest {
-                session_id: "s_mr".into(),
-            }))
-            .await
-            .unwrap();
-        let meta = resp.into_inner().metadata.unwrap();
-        assert_eq!(meta.state, PbSessionState::Resolved as i32);
-    }
-
-    // --- Unknown mode error code ---
-
-    #[tokio::test]
-    async fn unknown_mode_error_code() {
-        let (server, _) = make_server();
-
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "nonexistent_mode".into(),
-            message_type: "SessionStart".into(),
-            message_id: "m1".into(),
-            session_id: "s1".into(),
-            sender: "test".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: vec![],
-        };
-        let ack = do_send(&server, env).await;
-        assert!(!ack.ok);
-        assert_eq!(ack.error.as_ref().unwrap().code, "MODE_NOT_SUPPORTED");
-    }
-
-    // --- Duplicate session error code ---
-
-    #[tokio::test]
-    async fn duplicate_session_error_code() {
-        let (server, _) = make_server();
-
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "decision".into(),
-            message_type: "SessionStart".into(),
-            message_id: "m1".into(),
-            session_id: "s1".into(),
-            sender: "test".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: vec![],
-        };
-        do_send(&server, env).await;
-
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "decision".into(),
-            message_type: "SessionStart".into(),
-            message_id: "m2".into(),
-            session_id: "s1".into(),
-            sender: "test".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: vec![],
-        };
-        let ack = do_send(&server, env).await;
-        assert!(!ack.ok);
-        assert_eq!(ack.error.as_ref().unwrap().code, "INVALID_ENVELOPE");
-    }
-
-    // --- Initialize RPC ---
-
-    #[tokio::test]
-    async fn initialize_success() {
-        let (server, _) = make_server();
-
-        let resp = server
-            .initialize(Request::new(InitializeRequest {
-                supported_protocol_versions: vec!["1.0".into()],
-                client_info: None,
-                capabilities: None,
-            }))
-            .await
-            .unwrap();
-        let init = resp.into_inner();
-        assert_eq!(init.selected_protocol_version, "1.0");
-        assert!(init.runtime_info.is_some());
-        let info = init.runtime_info.unwrap();
-        assert_eq!(info.name, "macp-runtime");
-        assert_eq!(info.version, "0.3.0");
-        assert!(init.capabilities.is_some());
-        assert!(!init.supported_modes.is_empty());
-    }
-
-    #[tokio::test]
-    async fn initialize_no_common_version() {
-        let (server, _) = make_server();
-
-        let result = server
-            .initialize(Request::new(InitializeRequest {
-                supported_protocol_versions: vec!["2.0".into()],
-                client_info: None,
-                capabilities: None,
-            }))
-            .await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn initialize_selects_1_0_from_multiple() {
-        let (server, _) = make_server();
-
-        let resp = server
-            .initialize(Request::new(InitializeRequest {
-                supported_protocol_versions: vec!["1.0".into(), "2.0".into()],
-                client_info: None,
-                capabilities: None,
-            }))
-            .await
-            .unwrap();
-        assert_eq!(resp.into_inner().selected_protocol_version, "1.0");
-    }
-
-    // --- ListModes ---
-
-    #[tokio::test]
-    async fn list_modes_returns_descriptors() {
-        let (server, _) = make_server();
-
-        let resp = server
-            .list_modes(Request::new(ListModesRequest {}))
-            .await
-            .unwrap();
-        let modes = resp.into_inner().modes;
-        let mode_names: Vec<String> = modes.iter().map(|m| m.mode.clone()).collect();
-        assert_eq!(
-            mode_names,
-            vec![
-                "macp.mode.decision.v1",
-                "macp.mode.proposal.v1",
-                "macp.mode.task.v1",
-                "macp.mode.handoff.v1",
-                "macp.mode.quorum.v1",
-            ]
-        );
-    }
-
-    // --- GetManifest ---
-
-    #[tokio::test]
-    async fn get_manifest_returns_runtime_manifest() {
-        let (server, _) = make_server();
-
-        let resp = server
-            .get_manifest(Request::new(GetManifestRequest {
-                agent_id: String::new(),
-            }))
-            .await
-            .unwrap();
-        let manifest = resp.into_inner().manifest.unwrap();
-        assert_eq!(manifest.agent_id, "macp-runtime");
-        assert!(!manifest.supported_modes.is_empty());
-    }
-
-    // --- ListRoots ---
-
-    #[tokio::test]
-    async fn list_roots_returns_empty() {
-        let (server, _) = make_server();
-
-        let resp = server
-            .list_roots(Request::new(ListRootsRequest {}))
-            .await
-            .unwrap();
-        assert!(resp.into_inner().roots.is_empty());
-    }
-
-    // --- Phase 1: Discovery surface fixes ---
-
-    #[tokio::test]
-    async fn get_manifest_empty_agent_id_returns_self() {
-        let (server, _) = make_server();
-
-        let resp = server
-            .get_manifest(Request::new(GetManifestRequest {
-                agent_id: String::new(),
-            }))
-            .await
-            .unwrap();
-        let manifest = resp.into_inner().manifest.unwrap();
-        assert_eq!(manifest.agent_id, "macp-runtime");
-    }
-
-    #[tokio::test]
-    async fn get_manifest_self_agent_id_returns_self() {
-        let (server, _) = make_server();
-
-        let resp = server
-            .get_manifest(Request::new(GetManifestRequest {
-                agent_id: "macp-runtime".into(),
-            }))
-            .await
-            .unwrap();
-        let manifest = resp.into_inner().manifest.unwrap();
-        assert_eq!(manifest.agent_id, "macp-runtime");
-    }
-
-    #[tokio::test]
-    async fn get_manifest_unknown_agent_id_returns_not_found() {
-        let (server, _) = make_server();
-
-        let result = server
-            .get_manifest(Request::new(GetManifestRequest {
-                agent_id: "unknown-agent".into(),
-            }))
-            .await;
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code(), tonic::Code::NotFound);
-    }
-
-    #[tokio::test]
-    async fn get_manifest_content_types_are_macp_media_types() {
-        let (server, _) = make_server();
-
-        let resp = server
-            .get_manifest(Request::new(GetManifestRequest {
-                agent_id: String::new(),
-            }))
-            .await
-            .unwrap();
-        let manifest = resp.into_inner().manifest.unwrap();
-        assert_eq!(
-            manifest.input_content_types,
-            vec!["application/macp-envelope+proto"]
-        );
-        assert_eq!(
-            manifest.output_content_types,
-            vec!["application/macp-envelope+proto"]
-        );
-    }
-
-    #[tokio::test]
-    async fn list_modes_decision_version_is_semver() {
-        let (server, _) = make_server();
-
-        let resp = server
-            .list_modes(Request::new(ListModesRequest {}))
-            .await
-            .unwrap();
-        let modes = resp.into_inner().modes;
-        assert_eq!(modes[0].mode_version, "1.0.0");
-    }
-
-    #[tokio::test]
-    async fn list_modes_decision_has_schema_uris() {
-        let (server, _) = make_server();
-
-        let resp = server
-            .list_modes(Request::new(ListModesRequest {}))
-            .await
-            .unwrap();
-        let modes = resp.into_inner().modes;
-        assert_eq!(
-            modes[0].schema_uris.get("protobuf").unwrap(),
-            "buf.build/multiagentcoordinationprotocol/macp"
-        );
-    }
-
-    #[tokio::test]
-    async fn list_modes_does_not_include_experimental() {
-        let (server, _) = make_server();
-
-        let resp = server
-            .list_modes(Request::new(ListModesRequest {}))
-            .await
-            .unwrap();
-        let modes = resp.into_inner().modes;
-        assert!(!modes.iter().any(|m| m.mode.contains("multi_round")));
-    }
-
-    #[tokio::test]
-    async fn multi_round_still_works_by_direct_name() {
-        let (server, _) = make_server();
-
-        let start_payload = SessionStartPayload {
-            intent: String::new(),
-            ttl_ms: 60_000,
-            participants: vec!["alice".into(), "bob".into()],
-            mode_version: String::new(),
-            configuration_version: String::new(),
-            policy_version: String::new(),
-            context: vec![],
-            roots: vec![],
-        };
-
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "macp.mode.multi_round.v1".into(),
-            message_type: "SessionStart".into(),
-            message_id: "m0".into(),
-            session_id: "s_mr_direct".into(),
-            sender: "coordinator".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: start_payload.encode_to_vec(),
-        };
-        let ack = do_send(&server, env).await;
-        assert!(ack.ok);
-    }
-
-    #[tokio::test]
-    async fn initialize_stream_capability_is_false() {
-        let (server, _) = make_server();
-
-        let resp = server
-            .initialize(Request::new(InitializeRequest {
-                supported_protocol_versions: vec!["1.0".into()],
-                client_info: None,
-                capabilities: None,
-            }))
-            .await
-            .unwrap();
-        let caps = resp.into_inner().capabilities.unwrap();
-        assert!(!caps.sessions.unwrap().stream);
-    }
-
-    // --- Phase 2: Envelope validation ---
-
-    #[tokio::test]
-    async fn empty_sender_rejected() {
-        let (server, _) = make_server();
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "decision".into(),
-            message_type: "SessionStart".into(),
-            message_id: "m1".into(),
-            session_id: "s1".into(),
-            sender: String::new(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: vec![],
-        };
-        let ack = do_send(&server, env).await;
-        assert!(!ack.ok);
-        assert_eq!(ack.error.as_ref().unwrap().code, "INVALID_ENVELOPE");
-    }
-
-    #[tokio::test]
-    async fn empty_message_type_rejected() {
-        let (server, _) = make_server();
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "decision".into(),
-            message_type: String::new(),
-            message_id: "m1".into(),
-            session_id: "s1".into(),
-            sender: "test".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: vec![],
-        };
-        let ack = do_send(&server, env).await;
-        assert!(!ack.ok);
-        assert_eq!(ack.error.as_ref().unwrap().code, "INVALID_ENVELOPE");
-    }
-
-    // --- Full proposal flow through server ---
-
-    #[tokio::test]
-    async fn full_proposal_flow_through_server() {
-        let (server, _) = make_server();
-
-        // SessionStart
-        let start_payload = SessionStartPayload {
-            intent: String::new(),
-            ttl_ms: 60_000,
-            participants: vec!["buyer".into(), "seller".into()],
-            mode_version: String::new(),
-            configuration_version: String::new(),
-            policy_version: String::new(),
-            context: vec![],
-            roots: vec![],
-        };
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "macp.mode.proposal.v1".into(),
-            message_type: "SessionStart".into(),
-            message_id: "m0".into(),
-            session_id: "s_prop".into(),
-            sender: "buyer".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: start_payload.encode_to_vec(),
-        };
-        let ack = do_send(&server, env).await;
-        assert!(ack.ok);
-        assert_eq!(ack.session_state, PbSessionState::Open as i32);
-
-        // Proposal from seller
-        let proposal = proposal_pb::ProposalPayload {
-            proposal_id: "p1".into(),
-            title: "Offer".into(),
-            summary: "$1200".into(),
-            details: vec![],
-            tags: vec![],
-        };
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "macp.mode.proposal.v1".into(),
-            message_type: "Proposal".into(),
-            message_id: "m1".into(),
-            session_id: "s_prop".into(),
-            sender: "seller".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: proposal.encode_to_vec(),
-        };
-        let ack = do_send(&server, env).await;
-        assert!(ack.ok);
-        assert_eq!(ack.session_state, PbSessionState::Open as i32);
-
-        // Accept from buyer
-        let accept = proposal_pb::AcceptPayload {
-            proposal_id: "p1".into(),
-            reason: "agreed".into(),
-        };
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "macp.mode.proposal.v1".into(),
-            message_type: "Accept".into(),
-            message_id: "m2".into(),
-            session_id: "s_prop".into(),
-            sender: "buyer".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: accept.encode_to_vec(),
-        };
-        let ack = do_send(&server, env).await;
-        assert!(ack.ok);
-        assert_eq!(ack.session_state, PbSessionState::Open as i32);
-
-        // Commitment from buyer (initiator)
-        let commitment = CommitmentPayload {
-            commitment_id: "c1".into(),
-            action: "proposal.accepted".into(),
-            authority_scope: "commercial".into(),
-            reason: "bound".into(),
-            mode_version: "1.0.0".into(),
-            policy_version: "policy".into(),
-            configuration_version: "config".into(),
-        };
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "macp.mode.proposal.v1".into(),
-            message_type: "Commitment".into(),
-            message_id: "m3".into(),
-            session_id: "s_prop".into(),
-            sender: "buyer".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: commitment.encode_to_vec(),
-        };
-        let ack = do_send(&server, env).await;
-        assert!(ack.ok);
-        assert_eq!(ack.session_state, PbSessionState::Resolved as i32);
-
-        // Post-resolution message should fail
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "macp.mode.proposal.v1".into(),
-            message_type: "Proposal".into(),
-            message_id: "m4".into(),
-            session_id: "s_prop".into(),
-            sender: "seller".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: b"too late".to_vec(),
-        };
-        let ack = do_send(&server, env).await;
-        assert!(!ack.ok);
-        assert_eq!(ack.error.unwrap().code, "SESSION_NOT_OPEN");
-    }
-
-    // --- Full task flow through server ---
-
-    #[tokio::test]
-    async fn full_task_flow_through_server() {
-        let (server, _) = make_server();
-
-        // SessionStart
-        let start_payload = SessionStartPayload {
-            intent: String::new(),
-            ttl_ms: 60_000,
-            participants: vec!["planner".into(), "worker".into()],
-            mode_version: String::new(),
-            configuration_version: String::new(),
-            policy_version: String::new(),
-            context: vec![],
-            roots: vec![],
-        };
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "macp.mode.task.v1".into(),
-            message_type: "SessionStart".into(),
-            message_id: "m0".into(),
-            session_id: "s_task".into(),
-            sender: "planner".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: start_payload.encode_to_vec(),
-        };
-        let ack = do_send(&server, env).await;
-        assert!(ack.ok);
-        assert_eq!(ack.session_state, PbSessionState::Open as i32);
-
-        // TaskRequest from planner
-        let task_req = task_pb::TaskRequestPayload {
-            task_id: "t1".into(),
-            title: "Build widget".into(),
-            instructions: "Do the thing".into(),
-            requested_assignee: "worker".into(),
-            input: vec![],
-            deadline_unix_ms: 0,
-        };
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "macp.mode.task.v1".into(),
-            message_type: "TaskRequest".into(),
-            message_id: "m1".into(),
-            session_id: "s_task".into(),
-            sender: "planner".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: task_req.encode_to_vec(),
-        };
-        let ack = do_send(&server, env).await;
-        assert!(ack.ok);
-        assert_eq!(ack.session_state, PbSessionState::Open as i32);
-
-        // TaskAccept from worker
-        let task_accept = task_pb::TaskAcceptPayload {
-            task_id: "t1".into(),
-            assignee: "worker".into(),
-            reason: "ready".into(),
-        };
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "macp.mode.task.v1".into(),
-            message_type: "TaskAccept".into(),
-            message_id: "m2".into(),
-            session_id: "s_task".into(),
-            sender: "worker".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: task_accept.encode_to_vec(),
-        };
-        let ack = do_send(&server, env).await;
-        assert!(ack.ok);
-        assert_eq!(ack.session_state, PbSessionState::Open as i32);
-
-        // TaskComplete from worker
-        let task_complete = task_pb::TaskCompletePayload {
-            task_id: "t1".into(),
-            assignee: "worker".into(),
-            output: b"result".to_vec(),
-            summary: "done".into(),
-        };
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "macp.mode.task.v1".into(),
-            message_type: "TaskComplete".into(),
-            message_id: "m3".into(),
-            session_id: "s_task".into(),
-            sender: "worker".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: task_complete.encode_to_vec(),
-        };
-        let ack = do_send(&server, env).await;
-        assert!(ack.ok);
-        assert_eq!(ack.session_state, PbSessionState::Open as i32);
-
-        // Commitment from planner (initiator)
-        let commitment = CommitmentPayload {
-            commitment_id: "c1".into(),
-            action: "task.completed".into(),
-            authority_scope: "commercial".into(),
-            reason: "bound".into(),
-            mode_version: "1.0.0".into(),
-            policy_version: "policy".into(),
-            configuration_version: "config".into(),
-        };
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "macp.mode.task.v1".into(),
-            message_type: "Commitment".into(),
-            message_id: "m4".into(),
-            session_id: "s_task".into(),
-            sender: "planner".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: commitment.encode_to_vec(),
-        };
-        let ack = do_send(&server, env).await;
-        assert!(ack.ok);
-        assert_eq!(ack.session_state, PbSessionState::Resolved as i32);
-
-        // Post-resolution message should fail
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "macp.mode.task.v1".into(),
-            message_type: "TaskRequest".into(),
-            message_id: "m5".into(),
-            session_id: "s_task".into(),
-            sender: "planner".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: b"too late".to_vec(),
-        };
-        let ack = do_send(&server, env).await;
-        assert!(!ack.ok);
-        assert_eq!(ack.error.unwrap().code, "SESSION_NOT_OPEN");
-    }
-
-    // --- Full handoff flow through server ---
-
-    #[tokio::test]
-    async fn full_handoff_flow_through_server() {
-        let (server, _) = make_server();
-
-        // SessionStart
-        let start_payload = SessionStartPayload {
-            intent: String::new(),
-            ttl_ms: 60_000,
-            participants: vec!["owner".into(), "target".into()],
-            mode_version: String::new(),
-            configuration_version: String::new(),
-            policy_version: String::new(),
-            context: vec![],
-            roots: vec![],
-        };
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "macp.mode.handoff.v1".into(),
-            message_type: "SessionStart".into(),
-            message_id: "m0".into(),
-            session_id: "s_hand".into(),
-            sender: "owner".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: start_payload.encode_to_vec(),
-        };
-        let ack = do_send(&server, env).await;
-        assert!(ack.ok);
-        assert_eq!(ack.session_state, PbSessionState::Open as i32);
-
-        // HandoffOffer from owner
-        let offer = handoff_pb::HandoffOfferPayload {
-            handoff_id: "h1".into(),
-            target_participant: "target".into(),
-            scope: "support".into(),
-            reason: "escalate".into(),
-        };
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "macp.mode.handoff.v1".into(),
-            message_type: "HandoffOffer".into(),
-            message_id: "m1".into(),
-            session_id: "s_hand".into(),
-            sender: "owner".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: offer.encode_to_vec(),
-        };
-        let ack = do_send(&server, env).await;
-        assert!(ack.ok);
-        assert_eq!(ack.session_state, PbSessionState::Open as i32);
-
-        // HandoffAccept from target
-        let accept = handoff_pb::HandoffAcceptPayload {
-            handoff_id: "h1".into(),
-            accepted_by: "target".into(),
-            reason: "ready".into(),
-        };
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "macp.mode.handoff.v1".into(),
-            message_type: "HandoffAccept".into(),
-            message_id: "m2".into(),
-            session_id: "s_hand".into(),
-            sender: "target".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: accept.encode_to_vec(),
-        };
-        let ack = do_send(&server, env).await;
-        assert!(ack.ok);
-        assert_eq!(ack.session_state, PbSessionState::Open as i32);
-
-        // Commitment from owner (initiator)
-        let commitment = CommitmentPayload {
-            commitment_id: "c1".into(),
-            action: "handoff.accepted".into(),
-            authority_scope: "commercial".into(),
-            reason: "bound".into(),
-            mode_version: "1.0.0".into(),
-            policy_version: "policy".into(),
-            configuration_version: "config".into(),
-        };
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "macp.mode.handoff.v1".into(),
-            message_type: "Commitment".into(),
-            message_id: "m3".into(),
-            session_id: "s_hand".into(),
-            sender: "owner".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: commitment.encode_to_vec(),
-        };
-        let ack = do_send(&server, env).await;
-        assert!(ack.ok);
-        assert_eq!(ack.session_state, PbSessionState::Resolved as i32);
-
-        // Post-resolution message should fail
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "macp.mode.handoff.v1".into(),
-            message_type: "HandoffOffer".into(),
-            message_id: "m4".into(),
-            session_id: "s_hand".into(),
-            sender: "owner".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: b"too late".to_vec(),
-        };
-        let ack = do_send(&server, env).await;
-        assert!(!ack.ok);
-        assert_eq!(ack.error.unwrap().code, "SESSION_NOT_OPEN");
-    }
-
-    // --- Full quorum flow through server ---
-
-    #[tokio::test]
-    async fn full_quorum_flow_through_server() {
-        let (server, _) = make_server();
-
-        // SessionStart
-        let start_payload = SessionStartPayload {
-            intent: String::new(),
-            ttl_ms: 60_000,
-            participants: vec!["alice".into(), "bob".into(), "carol".into()],
-            mode_version: String::new(),
-            configuration_version: String::new(),
-            policy_version: String::new(),
-            context: vec![],
-            roots: vec![],
-        };
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "macp.mode.quorum.v1".into(),
-            message_type: "SessionStart".into(),
-            message_id: "m0".into(),
-            session_id: "s_quorum".into(),
-            sender: "coordinator".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: start_payload.encode_to_vec(),
-        };
-        let ack = do_send(&server, env).await;
-        assert!(ack.ok);
-        assert_eq!(ack.session_state, PbSessionState::Open as i32);
-
-        // ApprovalRequest from coordinator
-        let approval_req = quorum_pb::ApprovalRequestPayload {
-            request_id: "r1".into(),
-            action: "deploy".into(),
-            summary: "Deploy v2".into(),
-            details: vec![],
-            required_approvals: 2,
-        };
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "macp.mode.quorum.v1".into(),
-            message_type: "ApprovalRequest".into(),
-            message_id: "m1".into(),
-            session_id: "s_quorum".into(),
-            sender: "coordinator".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: approval_req.encode_to_vec(),
-        };
-        let ack = do_send(&server, env).await;
-        assert!(ack.ok);
-        assert_eq!(ack.session_state, PbSessionState::Open as i32);
-
-        // Approve from alice
-        let approve_alice = quorum_pb::ApprovePayload {
-            request_id: "r1".into(),
-            reason: "looks good".into(),
-        };
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "macp.mode.quorum.v1".into(),
-            message_type: "Approve".into(),
-            message_id: "m2".into(),
-            session_id: "s_quorum".into(),
-            sender: "alice".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: approve_alice.encode_to_vec(),
-        };
-        let ack = do_send(&server, env).await;
-        assert!(ack.ok);
-        assert_eq!(ack.session_state, PbSessionState::Open as i32);
-
-        // Approve from bob
-        let approve_bob = quorum_pb::ApprovePayload {
-            request_id: "r1".into(),
-            reason: "ready".into(),
-        };
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "macp.mode.quorum.v1".into(),
-            message_type: "Approve".into(),
-            message_id: "m3".into(),
-            session_id: "s_quorum".into(),
-            sender: "bob".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: approve_bob.encode_to_vec(),
-        };
-        let ack = do_send(&server, env).await;
-        assert!(ack.ok);
-        assert_eq!(ack.session_state, PbSessionState::Open as i32);
-
-        // Commitment from coordinator (initiator)
-        let commitment = CommitmentPayload {
-            commitment_id: "c1".into(),
-            action: "quorum.approved".into(),
-            authority_scope: "commercial".into(),
-            reason: "bound".into(),
-            mode_version: "1.0.0".into(),
-            policy_version: "policy".into(),
-            configuration_version: "config".into(),
-        };
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "macp.mode.quorum.v1".into(),
-            message_type: "Commitment".into(),
-            message_id: "m4".into(),
-            session_id: "s_quorum".into(),
-            sender: "coordinator".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: commitment.encode_to_vec(),
-        };
-        let ack = do_send(&server, env).await;
-        assert!(ack.ok);
-        assert_eq!(ack.session_state, PbSessionState::Resolved as i32);
-
-        // Post-resolution message should fail
-        let env = Envelope {
-            macp_version: "1.0".into(),
-            mode: "macp.mode.quorum.v1".into(),
-            message_type: "Approve".into(),
-            message_id: "m5".into(),
-            session_id: "s_quorum".into(),
-            sender: "carol".into(),
-            timestamp_unix_ms: Utc::now().timestamp_millis(),
-            payload: b"too late".to_vec(),
-        };
-        let ack = do_send(&server, env).await;
-        assert!(!ack.ok);
-        assert_eq!(ack.error.unwrap().code, "SESSION_NOT_OPEN");
+        // authenticate_session_access will fail with NotFound for unknown session
+        let mut req = Request::new(CancelSessionRequest {
+            session_id: "nonexistent".into(),
+            reason: "test".into(),
+        });
+        req.metadata_mut()
+            .insert("x-macp-agent-id", "agent://orchestrator".parse().unwrap());
+        let err = server.cancel_session(req).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
     }
 }

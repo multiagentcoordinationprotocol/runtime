@@ -1,157 +1,209 @@
-# macp-runtime v0.3
+# macp-runtime v0.4.0
 
-**Minimal Coordination Runtime (MCR)** — an RFC-0001-compliant gRPC server implementing the Multi-Agent Coordination Protocol (MACP).
+Reference runtime for the Multi-Agent Coordination Protocol (MACP).
 
-The MACP Runtime provides session-based message coordination between autonomous agents. It manages session lifecycles, enforces protocol invariants, routes messages through a pluggable Mode system, and ensures deterministic state transitions — so that agents can focus on coordination logic rather than infrastructure plumbing.
+This runtime implements the current MACP core/service surface, the five standards-track modes in the main RFC repository, and one experimental `multi_round` mode that remains available only by explicit canonical name. The focus of this release is freeze-readiness for SDKs and real-world unary integrations: strict `SessionStart`, mode-semantic correctness, authenticated senders, bounded resources, and durable restart recovery.
 
-## Features
+## What changed in v0.4.0
 
-- **RFC-0001 Compliant Protocol** — Structured protobuf schema with versioned envelope, typed errors, and capability negotiation
-- **Initialize Handshake** — Protocol version negotiation and capability discovery before any session work begins
-- **Pluggable Mode System** — Coordination logic is decoupled from runtime physics; ship new modes without touching the kernel
-- **Decision Mode** — Full Proposal → Evaluation → Objection → Vote → Commitment workflow with declared participant model and mode-aware authorization
-- **Proposal Mode** — Lightweight propose/accept/reject lifecycle with peer participant model
-- **Task Mode** — Orchestrated task assignment and completion tracking with structural-only determinism
-- **Handoff Mode** — Delegated context transfer between agents with context-frozen semantics
-- **Quorum Mode** — Threshold-based voting with quorum participant model and semantic-deterministic resolution
-- **Multi-Round Convergence Mode (Experimental)** — Participant-based `all_equal` convergence strategy with automatic resolution (not advertised via discovery RPCs)
-- **Session Cancellation** — Explicit `CancelSession` RPC to terminate sessions with a recorded reason
-- **Message Deduplication** — Idempotent message handling via `seen_message_ids` tracking
-- **Mode-Aware Authorization** — Sender authorization delegated to modes; Decision Mode allows orchestrator Commitment bypass per RFC
-- **Participant Validation** — Sender membership enforcement when a participant list is configured
-- **Signal Messages** — Ambient, session-less messages for out-of-band coordination signals
-- **Mode & Manifest Discovery** — `ListModes` and `GetManifest` RPCs for runtime introspection
-- **Structured Errors** — `MACPError` with RFC error codes, session/message correlation, and detail payloads
-- **Append-Only Audit Log** — Log-before-mutate ordering for every session event
-- **CI/CD Pipeline** — GitHub Actions workflow with formatting, linting, and test gates
+- **Strict canonical `SessionStart` for standard modes**
+  - no empty payloads
+  - no implicit default mode
+  - explicit `mode_version`, `configuration_version`, and positive `ttl_ms`
+  - explicit unique participants for standards-track modes
+- **Decision Mode authority clarified**
+  - initiator/coordinator may emit `Proposal` and `Commitment`
+  - participants emit `Evaluation`, `Objection`, and `Vote`
+  - duplicate `proposal_id` values are rejected
+  - votes are tracked per proposal, per sender
+- **Proposal Mode commitment gating fixed**
+  - `Commitment` is accepted only after acceptance convergence or a terminal rejection
+- **Security boundary added**
+  - TLS-capable startup
+  - authenticated sender derivation via bearer token or dev header mode
+  - per-request authorization
+  - payload size limits
+  - rate limiting
+- **Durable local persistence**
+  - session registry snapshots
+  - accepted-history log snapshots
+  - dedup state survives restart
+- **Unary freeze profile**
+  - `StreamSession` is intentionally disabled in this profile
+  - `WatchModeRegistry` and `WatchRoots` remain unimplemented
 
-## Prerequisites
+## Implemented modes
 
-- [Rust](https://www.rust-lang.org/tools/install) (stable toolchain)
-- [Protocol Buffers compiler (`protoc`)](https://grpc.io/docs/protoc-installation/)
+Standards-track modes:
 
-## Quick Start
+- `macp.mode.decision.v1`
+- `macp.mode.proposal.v1`
+- `macp.mode.task.v1`
+- `macp.mode.handoff.v1`
+- `macp.mode.quorum.v1`
+
+Experimental mode:
+
+- `macp.mode.multi_round.v1`
+
+## Runtime behavior that SDKs should assume
+
+### Session bootstrap
+
+For the five standards-track modes, `SessionStartPayload` must include:
+
+- `participants`
+- `mode_version`
+- `configuration_version`
+- `ttl_ms`
+
+`policy_version` is optional unless your policy requires it. Empty `mode` is rejected. Empty `SessionStartPayload` is rejected.
+
+### Security
+
+In production, requests should be authenticated with a bearer token. The runtime derives `Envelope.sender` from the authenticated identity and rejects spoofed sender values.
+
+For local development, you may opt into insecure/dev mode with:
 
 ```bash
-# Build the project
-cargo build
+MACP_ALLOW_INSECURE=1
+MACP_ALLOW_DEV_SENDER_HEADER=1
+```
 
-# Run the server (listens on 127.0.0.1:50051)
+When dev header mode is enabled, clients can set `x-macp-agent-id` metadata instead of bearer tokens.
+
+### Persistence
+
+Unless `MACP_MEMORY_ONLY=1` is set, the runtime persists session and log snapshots under `MACP_DATA_DIR` (default: `.macp-data`).
+
+## Configuration
+
+### Core server configuration
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `MACP_BIND_ADDR` | bind address | `127.0.0.1:50051` |
+| `MACP_DATA_DIR` | persistence directory | `.macp-data` |
+| `MACP_MEMORY_ONLY` | disable persistence when set to `1` | unset |
+| `MACP_ALLOW_INSECURE` | allow plaintext transport when set to `1` | unset |
+| `MACP_TLS_CERT_PATH` | PEM certificate for TLS | unset |
+| `MACP_TLS_KEY_PATH` | PEM private key for TLS | unset |
+
+### Authentication and authorization
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `MACP_AUTH_TOKENS_JSON` | inline auth config JSON | unset |
+| `MACP_AUTH_TOKENS_FILE` | path to auth config JSON | unset |
+| `MACP_ALLOW_DEV_SENDER_HEADER` | allow `x-macp-agent-id` for local dev | unset |
+
+Token JSON may be either a raw list or an object with a `tokens` array. Example:
+
+```json
+{
+  "tokens": [
+    {
+      "token": "demo-coordinator-token",
+      "sender": "coordinator",
+      "allowed_modes": [
+        "macp.mode.decision.v1",
+        "macp.mode.quorum.v1"
+      ],
+      "can_start_sessions": true,
+      "max_open_sessions": 25
+    },
+    {
+      "token": "demo-worker-token",
+      "sender": "worker",
+      "allowed_modes": [
+        "macp.mode.task.v1"
+      ],
+      "can_start_sessions": false
+    }
+  ]
+}
+```
+
+### Resource limits
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `MACP_MAX_PAYLOAD_BYTES` | max envelope payload size | `1048576` |
+| `MACP_SESSION_START_LIMIT_PER_MINUTE` | per-sender session start limit | `60` |
+| `MACP_MESSAGE_LIMIT_PER_MINUTE` | per-sender message limit | `600` |
+
+## Quick start
+
+### Production-style startup with TLS
+
+```bash
+export MACP_TLS_CERT_PATH=/path/to/server.crt
+export MACP_TLS_KEY_PATH=/path/to/server.key
+export MACP_AUTH_TOKENS_FILE=/path/to/tokens.json
 cargo run
-
-# Run test clients (server must be running in another terminal)
-cargo run --bin client                # basic decision mode demo
-cargo run --bin fuzz_client           # all error paths + multi-round + new RPCs
-cargo run --bin multi_round_client    # multi-round convergence demo
-cargo run --bin proposal_client       # proposal mode demo
-cargo run --bin task_client           # task mode demo
-cargo run --bin handoff_client        # handoff mode demo
-cargo run --bin quorum_client         # quorum mode demo
 ```
 
-## Build & Development Commands
+### Local development startup
 
 ```bash
-cargo build          # compile the project
-cargo run            # start the runtime server
-cargo test           # run the test suite
-cargo check          # type-check without building
-cargo fmt            # format all code
-cargo clippy         # run the linter
-
-# Or use the Makefile:
-make setup           # configure git hooks
-make build           # cargo build
-make test            # cargo test
-make fmt             # cargo fmt
-make clippy          # cargo clippy with -D warnings
-make check           # fmt + clippy + test
+export MACP_ALLOW_INSECURE=1
+export MACP_ALLOW_DEV_SENDER_HEADER=1
+cargo run
 ```
 
-## Project Structure
+### Running the example clients
 
+The example clients in `src/bin` assume the local development startup shown above.
+
+```bash
+cargo run --bin client
+cargo run --bin proposal_client
+cargo run --bin task_client
+cargo run --bin handoff_client
+cargo run --bin quorum_client
+cargo run --bin multi_round_client
+cargo run --bin fuzz_client
 ```
+
+## Freeze-profile capability summary
+
+| RPC | Status |
+|---|---|
+| `Initialize` | implemented |
+| `Send` | implemented |
+| `GetSession` | implemented |
+| `CancelSession` | implemented |
+| `GetManifest` | implemented |
+| `ListModes` | implemented |
+| `ListRoots` | implemented |
+| `StreamSession` | intentionally disabled in freeze profile |
+| `WatchModeRegistry` | unimplemented |
+| `WatchRoots` | unimplemented |
+
+## Project structure
+
+```text
 runtime/
-├── proto/
-│   ├── buf.yaml                              # Buf linter configuration
-│   └── macp/
-│       ├── v1/
-│       │   ├── envelope.proto                # Envelope, Ack, MACPError, SessionState
-│       │   └── core.proto                    # Full service definition + all message types
-│       └── modes/
-│           ├── decision/
-│           │   └── v1/
-│           │       └── decision.proto        # Decision mode payload types
-│           ├── proposal/
-│           │   └── v1/
-│           │       └── proposal.proto        # Proposal mode payload types
-│           ├── task/
-│           │   └── v1/
-│           │       └── task.proto            # Task mode payload types
-│           ├── handoff/
-│           │   └── v1/
-│           │       └── handoff.proto         # Handoff mode payload types
-│           └── quorum/
-│               └── v1/
-│                   └── quorum.proto          # Quorum mode payload types
+├── proto/                # protobuf schemas copied from the RFC/spec repository
 ├── src/
-│   ├── main.rs                               # Entry point — wires Runtime + gRPC server
-│   ├── lib.rs                                # Library root — proto modules + re-exports
-│   ├── server.rs                             # gRPC adapter (MacpRuntimeService impl)
-│   ├── error.rs                              # MacpError enum + RFC error codes
-│   ├── session.rs                            # Session struct, SessionState, TTL parsing
-│   ├── registry.rs                           # SessionRegistry (thread-safe session store)
-│   ├── log_store.rs                          # Append-only LogStore for audit trails
-│   ├── runtime.rs                            # Runtime kernel (dispatch + apply ModeResponse)
-│   ├── mode/
-│   │   ├── mod.rs                            # Mode trait + ModeResponse enum
-│   │   ├── util.rs                           # Shared mode utilities
-│   │   ├── decision.rs                       # DecisionMode (RFC lifecycle)
-│   │   ├── proposal.rs                       # ProposalMode (peer propose/accept/reject)
-│   │   ├── task.rs                           # TaskMode (orchestrated task tracking)
-│   │   ├── handoff.rs                        # HandoffMode (delegated context transfer)
-│   │   ├── quorum.rs                         # QuorumMode (threshold-based voting)
-│   │   └── multi_round.rs                    # MultiRoundMode (convergence)
-│   └── bin/
-│       ├── client.rs                         # Basic decision mode demo client
-│       ├── fuzz_client.rs                    # Comprehensive error-path test client
-│       ├── multi_round_client.rs             # Multi-round convergence demo client
-│       ├── proposal_client.rs                # Proposal mode demo client
-│       ├── task_client.rs                    # Task mode demo client
-│       ├── handoff_client.rs                 # Handoff mode demo client
-│       └── quorum_client.rs                  # Quorum mode demo client
-├── build.rs                                  # tonic-build proto compilation
-├── Cargo.toml                                # Dependencies and project config
-├── Makefile                                  # Development shortcuts
-└── .github/
-    └── workflows/
-        └── ci.yml                            # CI/CD pipeline
+│   ├── main.rs           # server startup, TLS, persistence, auth wiring
+│   ├── server.rs         # gRPC adapter and request authentication
+│   ├── runtime.rs        # coordination kernel and mode dispatch
+│   ├── security.rs       # auth config, sender derivation, rate limiting
+│   ├── session.rs        # canonical SessionStart validation and session model
+│   ├── registry.rs       # session store with optional persistence
+│   ├── log_store.rs      # accepted-history log store with optional persistence
+│   ├── mode/             # mode implementations
+│   └── bin/              # local development example clients
+├── docs/
+└── build.rs
 ```
 
-## gRPC Service
+## Development notes
 
-The runtime exposes `MACPRuntimeService` on `127.0.0.1:50051` with the following RPCs:
+- The RFC/spec repository remains the normative source for protocol semantics.
+- This runtime only accepts the canonical standards-track mode identifiers for the five main modes.
+- `multi_round` remains experimental and is not advertised by discovery RPCs.
+- `StreamSession` is intentionally not part of the freeze surface for the first SDKs.
 
-| RPC | Description |
-|-----|-------------|
-| `Initialize` | Protocol version negotiation and capability exchange |
-| `Send` | Send an Envelope, receive an Ack |
-| `StreamSession` | Bidirectional streaming for session events (not yet fully implemented) |
-| `GetSession` | Query session metadata by ID |
-| `CancelSession` | Cancel an active session with a reason |
-| `GetManifest` | Retrieve agent manifest and supported modes |
-| `ListModes` | Discover registered mode descriptors |
-| `ListRoots` | List resource roots |
-| `WatchModeRegistry` | Stream mode registry change notifications |
-| `WatchRoots` | Stream root change notifications |
-
-## Documentation
-
-- **[docs/README.md](./docs/README.md)** — Getting started guide and key concepts
-- **[docs/protocol.md](./docs/protocol.md)** — Full MACP v1.0 protocol specification
-- **[docs/architecture.md](./docs/architecture.md)** — Internal architecture and design principles
-- **[docs/examples.md](./docs/examples.md)** — Step-by-step usage examples and common patterns
-
-## License
-
-See the repository root for license information.
+See `docs/README.md` and `docs/examples.md` for the updated local development and usage guidance.
