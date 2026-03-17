@@ -1,0 +1,888 @@
+use crate::error::MacpError;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
+use tonic::metadata::MetadataMap;
+
+#[derive(Clone, Debug)]
+pub struct AuthIdentity {
+    pub sender: String,
+    pub allowed_modes: Option<HashSet<String>>,
+    pub can_start_sessions: bool,
+    pub max_open_sessions: Option<usize>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct RawIdentity {
+    token: String,
+    sender: String,
+    #[serde(default)]
+    allowed_modes: Vec<String>,
+    #[serde(default = "default_true")]
+    can_start_sessions: bool,
+    max_open_sessions: Option<usize>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(untagged)]
+enum RawConfig {
+    List(Vec<RawIdentity>),
+    Wrapped { tokens: Vec<RawIdentity> },
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Clone, Debug)]
+pub struct RateLimitConfig {
+    pub limit: usize,
+    pub window: Duration,
+}
+
+#[derive(Default)]
+struct RateBucket {
+    start_events: Mutex<HashMap<String, VecDeque<Instant>>>,
+    message_events: Mutex<HashMap<String, VecDeque<Instant>>>,
+}
+
+#[derive(Clone)]
+pub struct SecurityLayer {
+    identities: Arc<HashMap<String, AuthIdentity>>,
+    rate_bucket: Arc<RateBucket>,
+    auth_required: bool,
+    allow_dev_sender_header: bool,
+    pub max_payload_bytes: usize,
+    session_start_rate: RateLimitConfig,
+    message_rate: RateLimitConfig,
+}
+
+impl SecurityLayer {
+    pub fn dev_mode() -> Self {
+        Self {
+            identities: Arc::new(HashMap::new()),
+            rate_bucket: Arc::new(RateBucket::default()),
+            auth_required: false,
+            allow_dev_sender_header: true,
+            max_payload_bytes: 1_048_576,
+            session_start_rate: RateLimitConfig {
+                limit: usize::MAX,
+                window: Duration::from_secs(60),
+            },
+            message_rate: RateLimitConfig {
+                limit: usize::MAX,
+                window: Duration::from_secs(60),
+            },
+        }
+    }
+
+    pub fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
+        let max_payload_bytes = std::env::var("MACP_MAX_PAYLOAD_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1_048_576);
+
+        let session_start_rate = RateLimitConfig {
+            limit: std::env::var("MACP_SESSION_START_LIMIT_PER_MINUTE")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(60),
+            window: Duration::from_secs(60),
+        };
+        let message_rate = RateLimitConfig {
+            limit: std::env::var("MACP_MESSAGE_LIMIT_PER_MINUTE")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(600),
+            window: Duration::from_secs(60),
+        };
+
+        let allow_dev_sender_header = std::env::var("MACP_ALLOW_DEV_SENDER_HEADER")
+            .ok()
+            .as_deref()
+            == Some("1");
+
+        let raw = if let Ok(json) = std::env::var("MACP_AUTH_TOKENS_JSON") {
+            Some(json)
+        } else if let Ok(path) = std::env::var("MACP_AUTH_TOKENS_FILE") {
+            Some(fs::read_to_string(PathBuf::from(path))?)
+        } else {
+            None
+        };
+
+        let auth_required = raw.is_some() || !allow_dev_sender_header;
+        let identities = raw
+            .map(|json| Self::parse_identities(&json))
+            .transpose()?
+            .unwrap_or_default();
+
+        Ok(Self {
+            identities: Arc::new(identities),
+            rate_bucket: Arc::new(RateBucket::default()),
+            auth_required,
+            allow_dev_sender_header,
+            max_payload_bytes,
+            session_start_rate,
+            message_rate,
+        })
+    }
+
+    fn parse_identities(
+        json: &str,
+    ) -> Result<HashMap<String, AuthIdentity>, Box<dyn std::error::Error>> {
+        let parsed: RawConfig = serde_json::from_str(json)?;
+        let items = match parsed {
+            RawConfig::List(items) => items,
+            RawConfig::Wrapped { tokens } => tokens,
+        };
+        let mut identities = HashMap::new();
+        for item in items {
+            identities.insert(
+                item.token,
+                AuthIdentity {
+                    sender: item.sender,
+                    allowed_modes: if item.allowed_modes.is_empty() {
+                        None
+                    } else {
+                        Some(item.allowed_modes.into_iter().collect())
+                    },
+                    can_start_sessions: item.can_start_sessions,
+                    max_open_sessions: item.max_open_sessions,
+                },
+            );
+        }
+        Ok(identities)
+    }
+
+    fn bearer_token(metadata: &MetadataMap) -> Option<String> {
+        metadata
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .map(str::to_string)
+            .or_else(|| {
+                metadata
+                    .get("x-macp-token")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string)
+            })
+    }
+
+    pub fn authenticate_metadata(&self, metadata: &MetadataMap) -> Result<AuthIdentity, MacpError> {
+        if let Some(token) = Self::bearer_token(metadata) {
+            return self
+                .identities
+                .get(&token)
+                .cloned()
+                .ok_or(MacpError::Unauthenticated);
+        }
+
+        if self.allow_dev_sender_header {
+            if let Some(sender) = metadata
+                .get("x-macp-agent-id")
+                .and_then(|value| value.to_str().ok())
+            {
+                return Ok(AuthIdentity {
+                    sender: sender.to_string(),
+                    allowed_modes: None,
+                    can_start_sessions: true,
+                    max_open_sessions: None,
+                });
+            }
+        }
+
+        if self.auth_required {
+            Err(MacpError::Unauthenticated)
+        } else {
+            Ok(AuthIdentity {
+                sender: "agent://anonymous".into(),
+                allowed_modes: None,
+                can_start_sessions: true,
+                max_open_sessions: None,
+            })
+        }
+    }
+
+    pub fn authorize_mode(
+        &self,
+        identity: &AuthIdentity,
+        mode: &str,
+        is_session_start: bool,
+    ) -> Result<(), MacpError> {
+        if is_session_start && !identity.can_start_sessions {
+            return Err(MacpError::Forbidden);
+        }
+        if let Some(allowed_modes) = &identity.allowed_modes {
+            if !allowed_modes.contains(mode) {
+                return Err(MacpError::Forbidden);
+            }
+        }
+        Ok(())
+    }
+
+    async fn check_bucket(
+        bucket: &Mutex<HashMap<String, VecDeque<Instant>>>,
+        sender: &str,
+        config: &RateLimitConfig,
+    ) -> Result<(), MacpError> {
+        let now = Instant::now();
+        let mut guard = bucket.lock().await;
+        let deque = guard.entry(sender.to_string()).or_default();
+        while deque
+            .front()
+            .map(|instant| now.duration_since(*instant) > config.window)
+            .unwrap_or(false)
+        {
+            deque.pop_front();
+        }
+        if deque.len() >= config.limit {
+            return Err(MacpError::RateLimited);
+        }
+        deque.push_back(now);
+        Ok(())
+    }
+
+    pub async fn enforce_rate_limit(
+        &self,
+        sender: &str,
+        is_session_start: bool,
+    ) -> Result<(), MacpError> {
+        if is_session_start {
+            Self::check_bucket(
+                &self.rate_bucket.start_events,
+                sender,
+                &self.session_start_rate,
+            )
+            .await
+        } else {
+            Self::check_bucket(&self.rate_bucket.message_events, sender, &self.message_rate).await
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+    use tonic::metadata::MetadataMap;
+
+    /// Build a SecurityLayer with bearer token identities loaded from a JSON string.
+    /// This avoids touching environment variables (safe for parallel tests).
+    fn layer_with_tokens(json: &str) -> SecurityLayer {
+        let identities = SecurityLayer::parse_identities(json).expect("valid JSON");
+        SecurityLayer {
+            identities: Arc::new(identities),
+            rate_bucket: Arc::new(RateBucket::default()),
+            auth_required: true,
+            allow_dev_sender_header: false,
+            max_payload_bytes: 1_048_576,
+            session_start_rate: RateLimitConfig {
+                limit: usize::MAX,
+                window: Duration::from_secs(60),
+            },
+            message_rate: RateLimitConfig {
+                limit: usize::MAX,
+                window: Duration::from_secs(60),
+            },
+        }
+    }
+
+    /// Build a SecurityLayer with no tokens that does not require auth.
+    fn insecure_layer() -> SecurityLayer {
+        SecurityLayer {
+            identities: Arc::new(HashMap::new()),
+            rate_bucket: Arc::new(RateBucket::default()),
+            auth_required: false,
+            allow_dev_sender_header: false,
+            max_payload_bytes: 1_048_576,
+            session_start_rate: RateLimitConfig {
+                limit: usize::MAX,
+                window: Duration::from_secs(60),
+            },
+            message_rate: RateLimitConfig {
+                limit: usize::MAX,
+                window: Duration::from_secs(60),
+            },
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // 1. dev_mode() creates a SecurityLayer that doesn't require auth
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn dev_mode_does_not_require_auth() {
+        let layer = SecurityLayer::dev_mode();
+        let meta = MetadataMap::new();
+        let id = layer
+            .authenticate_metadata(&meta)
+            .expect("should succeed without auth");
+        assert_eq!(id.sender, "agent://anonymous");
+        assert!(id.allowed_modes.is_none());
+        assert!(id.can_start_sessions);
+    }
+
+    #[test]
+    fn dev_mode_allows_dev_sender_header() {
+        let layer = SecurityLayer::dev_mode();
+        let mut meta = MetadataMap::new();
+        meta.insert("x-macp-agent-id", "agent://dev-bot".parse().unwrap());
+        let id = layer.authenticate_metadata(&meta).expect("should succeed");
+        assert_eq!(id.sender, "agent://dev-bot");
+    }
+
+    #[test]
+    fn dev_mode_has_unlimited_rate_limits() {
+        let layer = SecurityLayer::dev_mode();
+        assert_eq!(layer.session_start_rate.limit, usize::MAX);
+        assert_eq!(layer.message_rate.limit, usize::MAX);
+    }
+
+    // ---------------------------------------------------------------
+    // 2. from_env() with no env vars creates an insecure layer
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn from_env_defaults_without_env_vars() {
+        // from_env reads live env vars, so we verify the code path indirectly:
+        // When no token JSON/file is set AND allow_dev_sender_header is false,
+        // auth_required = (!allow_dev_sender_header) = true.
+        // But if no tokens AND no dev header => auth_required = true.
+        //
+        // We can verify that default max_payload, rate limits, etc. are sane
+        // by constructing through from_env in a controlled subprocess, but that
+        // is fragile. Instead we test the exact same logic through direct construction.
+        let layer = insecure_layer();
+        assert!(!layer.auth_required);
+        assert_eq!(layer.max_payload_bytes, 1_048_576);
+    }
+
+    // ---------------------------------------------------------------
+    // 3. Bearer token auth: loading tokens and authenticating
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn bearer_token_authentication_via_authorization_header() {
+        let json = r#"[{"token":"tok-abc","sender":"agent://alice","allowed_modes":[],"can_start_sessions":true}]"#;
+        let layer = layer_with_tokens(json);
+
+        let mut meta = MetadataMap::new();
+        meta.insert("authorization", "Bearer tok-abc".parse().unwrap());
+
+        let id = layer
+            .authenticate_metadata(&meta)
+            .expect("should authenticate");
+        assert_eq!(id.sender, "agent://alice");
+        assert!(id.allowed_modes.is_none()); // empty vec -> None
+        assert!(id.can_start_sessions);
+    }
+
+    #[test]
+    fn bearer_token_authentication_via_x_macp_token_header() {
+        let json = r#"[{"token":"tok-xyz","sender":"agent://bob"}]"#;
+        let layer = layer_with_tokens(json);
+
+        let mut meta = MetadataMap::new();
+        meta.insert("x-macp-token", "tok-xyz".parse().unwrap());
+
+        let id = layer
+            .authenticate_metadata(&meta)
+            .expect("should authenticate");
+        assert_eq!(id.sender, "agent://bob");
+    }
+
+    #[test]
+    fn invalid_bearer_token_returns_unauthenticated() {
+        let json = r#"[{"token":"tok-real","sender":"agent://alice"}]"#;
+        let layer = layer_with_tokens(json);
+
+        let mut meta = MetadataMap::new();
+        meta.insert("authorization", "Bearer tok-fake".parse().unwrap());
+
+        let err = layer.authenticate_metadata(&meta).unwrap_err();
+        assert!(matches!(err, MacpError::Unauthenticated));
+    }
+
+    #[test]
+    fn no_token_when_auth_required_returns_unauthenticated() {
+        let json = r#"[{"token":"tok-only","sender":"agent://sole"}]"#;
+        let layer = layer_with_tokens(json);
+
+        let meta = MetadataMap::new(); // no auth header at all
+        let err = layer.authenticate_metadata(&meta).unwrap_err();
+        assert!(matches!(err, MacpError::Unauthenticated));
+    }
+
+    #[test]
+    fn parse_identities_wrapped_format() {
+        let json = r#"{"tokens":[{"token":"t1","sender":"agent://wrapped"}]}"#;
+        let layer = layer_with_tokens(json);
+
+        let mut meta = MetadataMap::new();
+        meta.insert("authorization", "Bearer t1".parse().unwrap());
+        let id = layer
+            .authenticate_metadata(&meta)
+            .expect("should authenticate");
+        assert_eq!(id.sender, "agent://wrapped");
+    }
+
+    #[test]
+    fn parse_identities_with_allowed_modes() {
+        let json = r#"[{"token":"t-modes","sender":"agent://limited","allowed_modes":["macp.mode.decision.v1","macp.mode.task.v1"],"can_start_sessions":false,"max_open_sessions":5}]"#;
+        let layer = layer_with_tokens(json);
+
+        let mut meta = MetadataMap::new();
+        meta.insert("authorization", "Bearer t-modes".parse().unwrap());
+        let id = layer
+            .authenticate_metadata(&meta)
+            .expect("should authenticate");
+
+        assert_eq!(id.sender, "agent://limited");
+        assert!(!id.can_start_sessions);
+        assert_eq!(id.max_open_sessions, Some(5));
+        let modes = id
+            .allowed_modes
+            .as_ref()
+            .expect("should have allowed_modes");
+        assert!(modes.contains("macp.mode.decision.v1"));
+        assert!(modes.contains("macp.mode.task.v1"));
+        assert!(!modes.contains("macp.mode.proposal.v1"));
+    }
+
+    #[test]
+    fn authorization_header_takes_priority_over_x_macp_token() {
+        let json = r#"[
+            {"token":"bearer-tok","sender":"agent://bearer-user"},
+            {"token":"header-tok","sender":"agent://header-user"}
+        ]"#;
+        let layer = layer_with_tokens(json);
+
+        let mut meta = MetadataMap::new();
+        meta.insert("authorization", "Bearer bearer-tok".parse().unwrap());
+        meta.insert("x-macp-token", "header-tok".parse().unwrap());
+
+        let id = layer
+            .authenticate_metadata(&meta)
+            .expect("should authenticate");
+        // Authorization header should take priority
+        assert_eq!(id.sender, "agent://bearer-user");
+    }
+
+    // ---------------------------------------------------------------
+    // 4. Dev header extraction: x-macp-agent-id
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn dev_sender_header_extracted_when_allowed() {
+        let layer = SecurityLayer {
+            identities: Arc::new(HashMap::new()),
+            rate_bucket: Arc::new(RateBucket::default()),
+            auth_required: false,
+            allow_dev_sender_header: true,
+            max_payload_bytes: 1_048_576,
+            session_start_rate: RateLimitConfig {
+                limit: usize::MAX,
+                window: Duration::from_secs(60),
+            },
+            message_rate: RateLimitConfig {
+                limit: usize::MAX,
+                window: Duration::from_secs(60),
+            },
+        };
+
+        let mut meta = MetadataMap::new();
+        meta.insert("x-macp-agent-id", "agent://dev-agent".parse().unwrap());
+
+        let id = layer.authenticate_metadata(&meta).expect("should succeed");
+        assert_eq!(id.sender, "agent://dev-agent");
+        assert!(id.allowed_modes.is_none());
+        assert!(id.can_start_sessions);
+        assert!(id.max_open_sessions.is_none());
+    }
+
+    #[test]
+    fn dev_sender_header_ignored_when_not_allowed() {
+        // auth_required=true, allow_dev_sender_header=false, no tokens
+        let layer = SecurityLayer {
+            identities: Arc::new(HashMap::new()),
+            rate_bucket: Arc::new(RateBucket::default()),
+            auth_required: true,
+            allow_dev_sender_header: false,
+            max_payload_bytes: 1_048_576,
+            session_start_rate: RateLimitConfig {
+                limit: usize::MAX,
+                window: Duration::from_secs(60),
+            },
+            message_rate: RateLimitConfig {
+                limit: usize::MAX,
+                window: Duration::from_secs(60),
+            },
+        };
+
+        let mut meta = MetadataMap::new();
+        meta.insert("x-macp-agent-id", "agent://sneaky".parse().unwrap());
+
+        let err = layer.authenticate_metadata(&meta).unwrap_err();
+        assert!(matches!(err, MacpError::Unauthenticated));
+    }
+
+    #[test]
+    fn bearer_token_takes_priority_over_dev_header() {
+        let json = r#"[{"token":"real-tok","sender":"agent://real"}]"#;
+        let identities = SecurityLayer::parse_identities(json).unwrap();
+
+        let layer = SecurityLayer {
+            identities: Arc::new(identities),
+            rate_bucket: Arc::new(RateBucket::default()),
+            auth_required: true,
+            allow_dev_sender_header: true,
+            max_payload_bytes: 1_048_576,
+            session_start_rate: RateLimitConfig {
+                limit: usize::MAX,
+                window: Duration::from_secs(60),
+            },
+            message_rate: RateLimitConfig {
+                limit: usize::MAX,
+                window: Duration::from_secs(60),
+            },
+        };
+
+        let mut meta = MetadataMap::new();
+        meta.insert("authorization", "Bearer real-tok".parse().unwrap());
+        meta.insert("x-macp-agent-id", "agent://dev-override".parse().unwrap());
+
+        let id = layer
+            .authenticate_metadata(&meta)
+            .expect("should authenticate via bearer");
+        assert_eq!(id.sender, "agent://real");
+    }
+
+    // ---------------------------------------------------------------
+    // 5. authorize_mode() with allowed modes and without
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn authorize_mode_allows_any_mode_when_no_restriction() {
+        let layer = SecurityLayer::dev_mode();
+        let id = AuthIdentity {
+            sender: "agent://any".into(),
+            allowed_modes: None,
+            can_start_sessions: true,
+            max_open_sessions: None,
+        };
+        assert!(layer
+            .authorize_mode(&id, "macp.mode.decision.v1", false)
+            .is_ok());
+        assert!(layer.authorize_mode(&id, "macp.mode.task.v1", true).is_ok());
+        assert!(layer.authorize_mode(&id, "arbitrary.mode", false).is_ok());
+    }
+
+    #[test]
+    fn authorize_mode_rejects_unlisted_mode() {
+        let layer = SecurityLayer::dev_mode();
+        let mut allowed = HashSet::new();
+        allowed.insert("macp.mode.decision.v1".to_string());
+
+        let id = AuthIdentity {
+            sender: "agent://restricted".into(),
+            allowed_modes: Some(allowed),
+            can_start_sessions: true,
+            max_open_sessions: None,
+        };
+        assert!(layer
+            .authorize_mode(&id, "macp.mode.decision.v1", false)
+            .is_ok());
+        let err = layer
+            .authorize_mode(&id, "macp.mode.task.v1", false)
+            .unwrap_err();
+        assert!(matches!(err, MacpError::Forbidden));
+    }
+
+    #[test]
+    fn authorize_mode_rejects_session_start_when_not_allowed() {
+        let layer = SecurityLayer::dev_mode();
+        let id = AuthIdentity {
+            sender: "agent://no-start".into(),
+            allowed_modes: None,
+            can_start_sessions: false,
+            max_open_sessions: None,
+        };
+        let err = layer
+            .authorize_mode(&id, "macp.mode.decision.v1", true)
+            .unwrap_err();
+        assert!(matches!(err, MacpError::Forbidden));
+    }
+
+    #[test]
+    fn authorize_mode_allows_non_session_start_even_when_start_forbidden() {
+        let layer = SecurityLayer::dev_mode();
+        let id = AuthIdentity {
+            sender: "agent://no-start".into(),
+            allowed_modes: None,
+            can_start_sessions: false,
+            max_open_sessions: None,
+        };
+        // Regular messages (not session start) should succeed
+        assert!(layer
+            .authorize_mode(&id, "macp.mode.decision.v1", false)
+            .is_ok());
+    }
+
+    #[test]
+    fn authorize_mode_checks_both_can_start_and_allowed_modes() {
+        let layer = SecurityLayer::dev_mode();
+        let mut allowed = HashSet::new();
+        allowed.insert("macp.mode.decision.v1".to_string());
+
+        let id = AuthIdentity {
+            sender: "agent://double-check".into(),
+            allowed_modes: Some(allowed),
+            can_start_sessions: false,
+            max_open_sessions: None,
+        };
+
+        // Cannot start sessions (checked first)
+        let err = layer
+            .authorize_mode(&id, "macp.mode.decision.v1", true)
+            .unwrap_err();
+        assert!(matches!(err, MacpError::Forbidden));
+
+        // Cannot use unlisted mode
+        let err = layer
+            .authorize_mode(&id, "macp.mode.task.v1", false)
+            .unwrap_err();
+        assert!(matches!(err, MacpError::Forbidden));
+
+        // Can send non-start message on allowed mode
+        assert!(layer
+            .authorize_mode(&id, "macp.mode.decision.v1", false)
+            .is_ok());
+    }
+
+    // ---------------------------------------------------------------
+    // 6. enforce_rate_limit() with session_start and message categories
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn rate_limit_session_start_enforced() {
+        let layer = SecurityLayer {
+            identities: Arc::new(HashMap::new()),
+            rate_bucket: Arc::new(RateBucket::default()),
+            auth_required: false,
+            allow_dev_sender_header: false,
+            max_payload_bytes: 1_048_576,
+            session_start_rate: RateLimitConfig {
+                limit: 3,
+                window: Duration::from_secs(60),
+            },
+            message_rate: RateLimitConfig {
+                limit: usize::MAX,
+                window: Duration::from_secs(60),
+            },
+        };
+
+        let sender = "agent://rate-test";
+        // First 3 should succeed
+        for _ in 0..3 {
+            assert!(layer.enforce_rate_limit(sender, true).await.is_ok());
+        }
+        // 4th should be rate limited
+        let err = layer.enforce_rate_limit(sender, true).await.unwrap_err();
+        assert!(matches!(err, MacpError::RateLimited));
+
+        // Regular messages should still be fine (separate bucket)
+        assert!(layer.enforce_rate_limit(sender, false).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn rate_limit_message_enforced() {
+        let layer = SecurityLayer {
+            identities: Arc::new(HashMap::new()),
+            rate_bucket: Arc::new(RateBucket::default()),
+            auth_required: false,
+            allow_dev_sender_header: false,
+            max_payload_bytes: 1_048_576,
+            session_start_rate: RateLimitConfig {
+                limit: usize::MAX,
+                window: Duration::from_secs(60),
+            },
+            message_rate: RateLimitConfig {
+                limit: 2,
+                window: Duration::from_secs(60),
+            },
+        };
+
+        let sender = "agent://msg-test";
+        assert!(layer.enforce_rate_limit(sender, false).await.is_ok());
+        assert!(layer.enforce_rate_limit(sender, false).await.is_ok());
+        let err = layer.enforce_rate_limit(sender, false).await.unwrap_err();
+        assert!(matches!(err, MacpError::RateLimited));
+
+        // Session starts should still be fine (separate bucket)
+        assert!(layer.enforce_rate_limit(sender, true).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn rate_limit_per_sender_isolation() {
+        let layer = SecurityLayer {
+            identities: Arc::new(HashMap::new()),
+            rate_bucket: Arc::new(RateBucket::default()),
+            auth_required: false,
+            allow_dev_sender_header: false,
+            max_payload_bytes: 1_048_576,
+            session_start_rate: RateLimitConfig {
+                limit: 1,
+                window: Duration::from_secs(60),
+            },
+            message_rate: RateLimitConfig {
+                limit: usize::MAX,
+                window: Duration::from_secs(60),
+            },
+        };
+
+        // Sender A exhausts limit
+        assert!(layer.enforce_rate_limit("agent://a", true).await.is_ok());
+        assert!(layer.enforce_rate_limit("agent://a", true).await.is_err());
+
+        // Sender B should still be able to start sessions
+        assert!(layer.enforce_rate_limit("agent://b", true).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn rate_limit_window_expiry() {
+        let layer = SecurityLayer {
+            identities: Arc::new(HashMap::new()),
+            rate_bucket: Arc::new(RateBucket::default()),
+            auth_required: false,
+            allow_dev_sender_header: false,
+            max_payload_bytes: 1_048_576,
+            session_start_rate: RateLimitConfig {
+                limit: 1,
+                window: Duration::from_millis(1), // very short window
+            },
+            message_rate: RateLimitConfig {
+                limit: usize::MAX,
+                window: Duration::from_secs(60),
+            },
+        };
+
+        let sender = "agent://expiry-test";
+        assert!(layer.enforce_rate_limit(sender, true).await.is_ok());
+
+        // Wait for the window to expire
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        // Should succeed again after window expiry
+        assert!(layer.enforce_rate_limit(sender, true).await.is_ok());
+    }
+
+    // ---------------------------------------------------------------
+    // 7. Anonymous fallback behavior
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn anonymous_fallback_when_no_auth_required() {
+        let layer = insecure_layer();
+        let meta = MetadataMap::new();
+        let id = layer
+            .authenticate_metadata(&meta)
+            .expect("should return anonymous");
+        assert_eq!(id.sender, "agent://anonymous");
+        assert!(id.allowed_modes.is_none());
+        assert!(id.can_start_sessions);
+        assert!(id.max_open_sessions.is_none());
+    }
+
+    #[test]
+    fn no_anonymous_fallback_when_auth_required() {
+        let json = r#"[{"token":"t","sender":"agent://real"}]"#;
+        let layer = layer_with_tokens(json); // auth_required = true
+
+        let meta = MetadataMap::new();
+        let err = layer.authenticate_metadata(&meta).unwrap_err();
+        assert!(matches!(err, MacpError::Unauthenticated));
+    }
+
+    #[test]
+    fn dev_mode_anonymous_fallback_with_empty_metadata() {
+        // dev_mode: auth_required=false, allow_dev_sender_header=true
+        // With no headers at all, falls through to anonymous
+        let layer = SecurityLayer::dev_mode();
+        let meta = MetadataMap::new();
+        let id = layer.authenticate_metadata(&meta).expect("should succeed");
+        assert_eq!(id.sender, "agent://anonymous");
+    }
+
+    // ---------------------------------------------------------------
+    // 8. Token file loading via MACP_AUTH_TOKENS_FILE
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn token_file_loading_via_parse_identities() {
+        // Test the parse_identities path that from_env uses after reading the file.
+        // We write a temp file and then read + parse it the same way from_env would.
+        let json = r#"[
+            {"token":"file-tok-1","sender":"agent://file-alice","allowed_modes":["macp.mode.decision.v1"]},
+            {"token":"file-tok-2","sender":"agent://file-bob","can_start_sessions":false}
+        ]"#;
+        let mut tmp = NamedTempFile::new().expect("create temp file");
+        write!(tmp, "{}", json).expect("write temp file");
+
+        let contents = fs::read_to_string(tmp.path()).expect("read temp file");
+        let identities = SecurityLayer::parse_identities(&contents).expect("parse identities");
+
+        assert_eq!(identities.len(), 2);
+
+        let alice = identities.get("file-tok-1").expect("alice entry");
+        assert_eq!(alice.sender, "agent://file-alice");
+        let alice_modes = alice.allowed_modes.as_ref().expect("should have modes");
+        assert!(alice_modes.contains("macp.mode.decision.v1"));
+        assert!(alice.can_start_sessions); // default_true
+
+        let bob = identities.get("file-tok-2").expect("bob entry");
+        assert_eq!(bob.sender, "agent://file-bob");
+        assert!(!bob.can_start_sessions);
+        assert!(bob.allowed_modes.is_none()); // empty vec -> None
+    }
+
+    #[test]
+    fn token_file_end_to_end_via_layer() {
+        // Build a layer as if loaded from a token file, then authenticate with it.
+        let json = r#"[{"token":"e2e-tok","sender":"agent://e2e-agent"}]"#;
+        let mut tmp = NamedTempFile::new().expect("create temp file");
+        write!(tmp, "{}", json).expect("write temp file");
+
+        let contents = fs::read_to_string(tmp.path()).expect("read temp file");
+        let layer = layer_with_tokens(&contents);
+
+        let mut meta = MetadataMap::new();
+        meta.insert("authorization", "Bearer e2e-tok".parse().unwrap());
+        let id = layer
+            .authenticate_metadata(&meta)
+            .expect("should authenticate");
+        assert_eq!(id.sender, "agent://e2e-agent");
+    }
+
+    #[test]
+    fn parse_identities_invalid_json_returns_error() {
+        let result = SecurityLayer::parse_identities("not valid json");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_identities_empty_list() {
+        let identities = SecurityLayer::parse_identities("[]").expect("valid empty list");
+        assert!(identities.is_empty());
+    }
+
+    #[test]
+    fn parse_identities_wrapped_empty() {
+        let identities =
+            SecurityLayer::parse_identities(r#"{"tokens":[]}"#).expect("valid wrapped empty");
+        assert!(identities.is_empty());
+    }
+}

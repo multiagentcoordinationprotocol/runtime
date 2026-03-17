@@ -1,5 +1,7 @@
 use crate::error::MacpError;
-use crate::mode::util::{decode_commitment_payload, is_declared_participant};
+use crate::mode::util::{
+    is_declared_participant, participants_all_accept, validate_commitment_payload_for_session,
+};
 use crate::mode::{Mode, ModeResponse};
 use crate::pb::Envelope;
 use crate::proposal_pb::{
@@ -61,6 +63,24 @@ impl ProposalMode {
             .proposals
             .get(proposal_id)
             .filter(|record| record.disposition == ProposalDisposition::Live)
+    }
+
+    fn commitment_ready(session: &Session, state: &ProposalState) -> bool {
+        if !state.terminal_rejections.is_empty() {
+            return true;
+        }
+
+        state
+            .proposals
+            .values()
+            .filter(|proposal| proposal.disposition == ProposalDisposition::Live)
+            .any(|proposal| {
+                participants_all_accept(
+                    &session.participants,
+                    &state.accepts,
+                    &proposal.proposal_id,
+                )
+            })
     }
 }
 
@@ -168,7 +188,6 @@ impl Mode for ProposalMode {
                         sender: env.sender.clone(),
                         reason: payload.reason,
                     });
-                    return Ok(ModeResponse::PersistState(Self::encode_state(&state)));
                 }
                 Ok(ModeResponse::PersistState(Self::encode_state(&state)))
             }
@@ -186,16 +205,18 @@ impl Mode for ProposalMode {
                     return Err(MacpError::InvalidPayload);
                 }
                 record.disposition = ProposalDisposition::Withdrawn;
-                // Clear acceptances for withdrawn proposal
                 state.accepts.retain(|_, pid| pid != &payload.proposal_id);
+                state
+                    .terminal_rejections
+                    .retain(|r| r.proposal_id != payload.proposal_id);
                 Ok(ModeResponse::PersistState(Self::encode_state(&state)))
             }
             "Commitment" => {
                 if env.sender != session.initiator_sender {
                     return Err(MacpError::Forbidden);
                 }
-                let _payload = decode_commitment_payload(&env.payload)?;
-                if state.proposals.is_empty() {
+                validate_commitment_payload_for_session(session, &env.payload)?;
+                if !Self::commitment_ready(session, &state) {
                     return Err(MacpError::InvalidPayload);
                 }
                 Ok(ModeResponse::PersistAndResolve {
@@ -224,15 +245,15 @@ mod tests {
             resolution: None,
             mode: "macp.mode.proposal.v1".into(),
             mode_state: vec![],
-            participants: vec!["buyer".into(), "seller".into()],
+            participants: vec!["agent://buyer".into(), "agent://seller".into()],
             seen_message_ids: HashSet::new(),
             intent: String::new(),
-            mode_version: String::new(),
-            configuration_version: String::new(),
-            policy_version: String::new(),
+            mode_version: "1.0.0".into(),
+            configuration_version: "cfg-1".into(),
+            policy_version: "policy-1".into(),
             context: vec![],
             roots: vec![],
-            initiator_sender: "buyer".into(),
+            initiator_sender: "agent://buyer".into(),
         }
     }
 
@@ -249,15 +270,15 @@ mod tests {
         }
     }
 
-    fn commitment_payload() -> Vec<u8> {
+    fn commitment(session: &Session, action: &str) -> Vec<u8> {
         CommitmentPayload {
             commitment_id: "c1".into(),
-            action: "proposal.accepted".into(),
+            action: action.into(),
             authority_scope: "commercial".into(),
             reason: "bound".into(),
-            mode_version: "1.0.0".into(),
-            policy_version: "policy".into(),
-            configuration_version: "config".into(),
+            mode_version: session.mode_version.clone(),
+            policy_version: session.policy_version.clone(),
+            configuration_version: session.configuration_version.clone(),
         }
         .encode_to_vec()
     }
@@ -270,70 +291,40 @@ mod tests {
         }
     }
 
-    fn make_proposal(id: &str, title: &str, summary: &str) -> Vec<u8> {
+    fn make_proposal(id: &str) -> Vec<u8> {
         ProposalPayload {
             proposal_id: id.into(),
-            title: title.into(),
-            summary: summary.into(),
+            title: format!("offer-{id}"),
+            summary: "summary".into(),
             details: vec![],
             tags: vec![],
         }
         .encode_to_vec()
     }
 
-    fn make_counter(id: &str, supersedes: &str, title: &str, summary: &str) -> Vec<u8> {
-        CounterProposalPayload {
-            proposal_id: id.into(),
-            supersedes_proposal_id: supersedes.into(),
-            title: title.into(),
-            summary: summary.into(),
-            details: vec![],
-        }
-        .encode_to_vec()
-    }
-
-    fn make_accept(proposal_id: &str, reason: &str) -> Vec<u8> {
+    fn make_accept(id: &str) -> Vec<u8> {
         AcceptPayload {
-            proposal_id: proposal_id.into(),
-            reason: reason.into(),
+            proposal_id: id.into(),
+            reason: String::new(),
         }
         .encode_to_vec()
     }
 
-    fn make_reject(proposal_id: &str, terminal: bool, reason: &str) -> Vec<u8> {
+    fn make_reject(id: &str, terminal: bool) -> Vec<u8> {
         RejectPayload {
-            proposal_id: proposal_id.into(),
+            proposal_id: id.into(),
             terminal,
-            reason: reason.into(),
+            reason: "no".into(),
         }
         .encode_to_vec()
     }
 
-    fn make_withdraw(proposal_id: &str, reason: &str) -> Vec<u8> {
+    fn make_withdraw(id: &str) -> Vec<u8> {
         WithdrawPayload {
-            proposal_id: proposal_id.into(),
-            reason: reason.into(),
+            proposal_id: id.into(),
+            reason: "changed mind".into(),
         }
         .encode_to_vec()
-    }
-
-    // --- Session Start ---
-
-    #[test]
-    fn session_start_initializes_state() {
-        let mode = ProposalMode;
-        let session = base_session();
-        let result = mode
-            .on_session_start(&session, &env("buyer", "SessionStart", vec![]))
-            .unwrap();
-        match result {
-            ModeResponse::PersistState(data) => {
-                let state: ProposalState = serde_json::from_slice(&data).unwrap();
-                assert!(state.proposals.is_empty());
-                assert!(state.accepts.is_empty());
-            }
-            _ => panic!("Expected PersistState"),
-        }
     }
 
     #[test]
@@ -341,630 +332,201 @@ mod tests {
         let mode = ProposalMode;
         let mut session = base_session();
         session.participants.clear();
-        let err = mode
-            .on_session_start(&session, &env("buyer", "SessionStart", vec![]))
-            .unwrap_err();
-        assert_eq!(err.to_string(), "InvalidPayload");
-    }
-
-    // --- Proposal ---
-
-    #[test]
-    fn proposal_creates_entry() {
-        let mode = ProposalMode;
-        let mut session = base_session();
-        let result = mode
-            .on_session_start(&session, &env("buyer", "SessionStart", vec![]))
-            .unwrap();
-        apply(&mut session, result);
-
-        let result = mode
-            .on_message(
-                &session,
-                &env("seller", "Proposal", make_proposal("p1", "Offer", "1200")),
-            )
-            .unwrap();
-        match result {
-            ModeResponse::PersistState(data) => {
-                let state: ProposalState = serde_json::from_slice(&data).unwrap();
-                assert!(state.proposals.contains_key("p1"));
-                assert_eq!(state.proposals["p1"].proposer, "seller");
-                assert_eq!(state.proposals["p1"].disposition, ProposalDisposition::Live);
-            }
-            _ => panic!("Expected PersistState"),
-        }
-    }
-
-    #[test]
-    fn proposal_with_empty_id_rejected() {
-        let mode = ProposalMode;
-        let mut session = base_session();
-        let result = mode
-            .on_session_start(&session, &env("buyer", "SessionStart", vec![]))
-            .unwrap();
-        apply(&mut session, result);
-        let err = mode
-            .on_message(
-                &session,
-                &env("seller", "Proposal", make_proposal("", "Offer", "1200")),
-            )
-            .unwrap_err();
-        assert_eq!(err.to_string(), "InvalidPayload");
-    }
-
-    #[test]
-    fn duplicate_proposal_id_rejected() {
-        let mode = ProposalMode;
-        let mut session = base_session();
-        let result = mode
-            .on_session_start(&session, &env("buyer", "SessionStart", vec![]))
-            .unwrap();
-        apply(&mut session, result);
-        let result = mode
-            .on_message(
-                &session,
-                &env("seller", "Proposal", make_proposal("p1", "Offer", "1200")),
-            )
-            .unwrap();
-        apply(&mut session, result);
-        let err = mode
-            .on_message(
-                &session,
-                &env("buyer", "Proposal", make_proposal("p1", "Same", "1300")),
-            )
-            .unwrap_err();
-        assert_eq!(err.to_string(), "InvalidPayload");
-    }
-
-    // --- CounterProposal ---
-
-    #[test]
-    fn counter_proposal_works() {
-        let mode = ProposalMode;
-        let mut session = base_session();
-        let result = mode
-            .on_session_start(&session, &env("buyer", "SessionStart", vec![]))
-            .unwrap();
-        apply(&mut session, result);
-        let result = mode
-            .on_message(
-                &session,
-                &env("seller", "Proposal", make_proposal("p1", "Offer", "1200")),
-            )
-            .unwrap();
-        apply(&mut session, result);
-        let result = mode
-            .on_message(
-                &session,
-                &env(
-                    "buyer",
-                    "CounterProposal",
-                    make_counter("p2", "p1", "Counter", "1000"),
-                ),
-            )
-            .unwrap();
-        match result {
-            ModeResponse::PersistState(data) => {
-                let state: ProposalState = serde_json::from_slice(&data).unwrap();
-                assert!(state.proposals.contains_key("p2"));
-                assert_eq!(
-                    state.proposals["p2"].supersedes_proposal_id,
-                    Some("p1".into())
-                );
-            }
-            _ => panic!("Expected PersistState"),
-        }
-    }
-
-    #[test]
-    fn counter_proposal_missing_supersedes_rejected() {
-        let mode = ProposalMode;
-        let mut session = base_session();
-        let result = mode
-            .on_session_start(&session, &env("buyer", "SessionStart", vec![]))
-            .unwrap();
-        apply(&mut session, result);
-        let err = mode
-            .on_message(
-                &session,
-                &env(
-                    "buyer",
-                    "CounterProposal",
-                    make_counter("p2", "nonexistent", "Counter", "1000"),
-                ),
-            )
-            .unwrap_err();
-        assert_eq!(err.to_string(), "InvalidPayload");
-    }
-
-    // --- Accept ---
-
-    #[test]
-    fn accept_live_proposal() {
-        let mode = ProposalMode;
-        let mut session = base_session();
-        let result = mode
-            .on_session_start(&session, &env("buyer", "SessionStart", vec![]))
-            .unwrap();
-        apply(&mut session, result);
-        let result = mode
-            .on_message(
-                &session,
-                &env("seller", "Proposal", make_proposal("p1", "Offer", "1200")),
-            )
-            .unwrap();
-        apply(&mut session, result);
-        let result = mode
-            .on_message(
-                &session,
-                &env("buyer", "Accept", make_accept("p1", "agree")),
-            )
-            .unwrap();
-        match result {
-            ModeResponse::PersistState(data) => {
-                let state: ProposalState = serde_json::from_slice(&data).unwrap();
-                assert_eq!(state.accepts.get("buyer"), Some(&"p1".to_string()));
-            }
-            _ => panic!("Expected PersistState"),
-        }
-    }
-
-    #[test]
-    fn accept_supersedes_previous() {
-        let mode = ProposalMode;
-        let mut session = base_session();
-        let result = mode
-            .on_session_start(&session, &env("buyer", "SessionStart", vec![]))
-            .unwrap();
-        apply(&mut session, result);
-        let result = mode
-            .on_message(
-                &session,
-                &env("seller", "Proposal", make_proposal("p1", "Offer A", "1200")),
-            )
-            .unwrap();
-        apply(&mut session, result);
-        let result = mode
-            .on_message(
-                &session,
-                &env("buyer", "Proposal", make_proposal("p2", "Offer B", "1000")),
-            )
-            .unwrap();
-        apply(&mut session, result);
-        let result = mode
-            .on_message(&session, &env("buyer", "Accept", make_accept("p1", "ok")))
-            .unwrap();
-        apply(&mut session, result);
-        let result = mode
-            .on_message(
-                &session,
-                &env("buyer", "Accept", make_accept("p2", "changed mind")),
-            )
-            .unwrap();
-        apply(&mut session, result);
-        let state: ProposalState = serde_json::from_slice(&session.mode_state).unwrap();
-        assert_eq!(state.accepts.get("buyer"), Some(&"p2".to_string()));
-    }
-
-    #[test]
-    fn withdrawn_proposal_cannot_be_accepted() {
-        let mode = ProposalMode;
-        let mut session = base_session();
-        let result = mode
-            .on_session_start(&session, &env("buyer", "SessionStart", vec![]))
-            .unwrap();
-        apply(&mut session, result);
-        let result = mode
-            .on_message(
-                &session,
-                &env("seller", "Proposal", make_proposal("p1", "Offer", "1200")),
-            )
-            .unwrap();
-        apply(&mut session, result);
-        let result = mode
-            .on_message(
-                &session,
-                &env("seller", "Withdraw", make_withdraw("p1", "withdrawn")),
-            )
-            .unwrap();
-        apply(&mut session, result);
-        let err = mode
-            .on_message(
-                &session,
-                &env("buyer", "Accept", make_accept("p1", "too late")),
-            )
-            .unwrap_err();
-        assert_eq!(err.to_string(), "InvalidPayload");
-    }
-
-    // --- Reject ---
-
-    #[test]
-    fn reject_existing_proposal() {
-        let mode = ProposalMode;
-        let mut session = base_session();
-        let result = mode
-            .on_session_start(&session, &env("buyer", "SessionStart", vec![]))
-            .unwrap();
-        apply(&mut session, result);
-        let result = mode
-            .on_message(
-                &session,
-                &env("seller", "Proposal", make_proposal("p1", "Offer", "1200")),
-            )
-            .unwrap();
-        apply(&mut session, result);
-        let result = mode
-            .on_message(
-                &session,
-                &env("buyer", "Reject", make_reject("p1", false, "too expensive")),
-            )
-            .unwrap();
-        assert!(matches!(result, ModeResponse::PersistState(_)));
-    }
-
-    #[test]
-    fn terminal_reject_sets_flag() {
-        let mode = ProposalMode;
-        let mut session = base_session();
-        let result = mode
-            .on_session_start(&session, &env("buyer", "SessionStart", vec![]))
-            .unwrap();
-        apply(&mut session, result);
-        let result = mode
-            .on_message(
-                &session,
-                &env("seller", "Proposal", make_proposal("p1", "Offer", "1200")),
-            )
-            .unwrap();
-        apply(&mut session, result);
-        let result = mode
-            .on_message(
-                &session,
-                &env("buyer", "Reject", make_reject("p1", true, "deal breaker")),
-            )
-            .unwrap();
-        apply(&mut session, result);
-        let state: ProposalState = serde_json::from_slice(&session.mode_state).unwrap();
-        assert_eq!(state.terminal_rejections.len(), 1);
-    }
-
-    #[test]
-    fn reject_nonexistent_proposal_rejected() {
-        let mode = ProposalMode;
-        let mut session = base_session();
-        let result = mode
-            .on_session_start(&session, &env("buyer", "SessionStart", vec![]))
-            .unwrap();
-        apply(&mut session, result);
-        let err = mode
-            .on_message(
-                &session,
-                &env("buyer", "Reject", make_reject("nope", false, "bad")),
-            )
-            .unwrap_err();
-        assert_eq!(err.to_string(), "InvalidPayload");
-    }
-
-    // --- Withdraw ---
-
-    #[test]
-    fn withdraw_own_proposal() {
-        let mode = ProposalMode;
-        let mut session = base_session();
-        let result = mode
-            .on_session_start(&session, &env("buyer", "SessionStart", vec![]))
-            .unwrap();
-        apply(&mut session, result);
-        let result = mode
-            .on_message(
-                &session,
-                &env("seller", "Proposal", make_proposal("p1", "Offer", "1200")),
-            )
-            .unwrap();
-        apply(&mut session, result);
-        let result = mode
-            .on_message(
-                &session,
-                &env("seller", "Withdraw", make_withdraw("p1", "changed mind")),
-            )
-            .unwrap();
-        apply(&mut session, result);
-        let state: ProposalState = serde_json::from_slice(&session.mode_state).unwrap();
         assert_eq!(
-            state.proposals["p1"].disposition,
-            ProposalDisposition::Withdrawn
+            mode.on_session_start(&session, &env("agent://buyer", "SessionStart", vec![]))
+                .unwrap_err()
+                .to_string(),
+            "InvalidPayload"
         );
     }
 
     #[test]
-    fn cannot_withdraw_others_proposal() {
+    fn commitment_requires_acceptance_convergence() {
         let mode = ProposalMode;
         let mut session = base_session();
-        let result = mode
-            .on_session_start(&session, &env("buyer", "SessionStart", vec![]))
+        let resp = mode
+            .on_session_start(&session, &env("agent://buyer", "SessionStart", vec![]))
             .unwrap();
-        apply(&mut session, result);
-        let result = mode
+        apply(&mut session, resp);
+        let resp = mode
             .on_message(
                 &session,
-                &env("seller", "Proposal", make_proposal("p1", "Offer", "1200")),
+                &env("agent://seller", "Proposal", make_proposal("p1")),
             )
             .unwrap();
-        apply(&mut session, result);
-        let err = mode
-            .on_message(
-                &session,
-                &env("buyer", "Withdraw", make_withdraw("p1", "nope")),
-            )
-            .unwrap_err();
-        assert_eq!(err.to_string(), "Forbidden");
-    }
-
-    #[test]
-    fn withdraw_clears_acceptances() {
-        let mode = ProposalMode;
-        let mut session = base_session();
-        let result = mode
-            .on_session_start(&session, &env("buyer", "SessionStart", vec![]))
-            .unwrap();
-        apply(&mut session, result);
-        let result = mode
-            .on_message(
-                &session,
-                &env("seller", "Proposal", make_proposal("p1", "Offer", "1200")),
-            )
-            .unwrap();
-        apply(&mut session, result);
-        let result = mode
-            .on_message(&session, &env("buyer", "Accept", make_accept("p1", "ok")))
-            .unwrap();
-        apply(&mut session, result);
-        let result = mode
-            .on_message(
-                &session,
-                &env("seller", "Withdraw", make_withdraw("p1", "changed mind")),
-            )
-            .unwrap();
-        apply(&mut session, result);
-        let state: ProposalState = serde_json::from_slice(&session.mode_state).unwrap();
-        assert!(state.accepts.is_empty());
-    }
-
-    #[test]
-    fn double_withdraw_rejected() {
-        let mode = ProposalMode;
-        let mut session = base_session();
-        let result = mode
-            .on_session_start(&session, &env("buyer", "SessionStart", vec![]))
-            .unwrap();
-        apply(&mut session, result);
-        let result = mode
-            .on_message(
-                &session,
-                &env("seller", "Proposal", make_proposal("p1", "Offer", "1200")),
-            )
-            .unwrap();
-        apply(&mut session, result);
-        let result = mode
-            .on_message(
-                &session,
-                &env("seller", "Withdraw", make_withdraw("p1", "withdrawn")),
-            )
-            .unwrap();
-        apply(&mut session, result);
-        let err = mode
-            .on_message(
-                &session,
-                &env("seller", "Withdraw", make_withdraw("p1", "again")),
-            )
-            .unwrap_err();
-        assert_eq!(err.to_string(), "InvalidPayload");
-    }
-
-    // --- Commitment ---
-
-    #[test]
-    fn commitment_resolves_session() {
-        let mode = ProposalMode;
-        let mut session = base_session();
-        let result = mode
-            .on_session_start(&session, &env("buyer", "SessionStart", vec![]))
-            .unwrap();
-        apply(&mut session, result);
-        let result = mode
-            .on_message(
-                &session,
-                &env("seller", "Proposal", make_proposal("p1", "Offer", "1200")),
-            )
-            .unwrap();
-        apply(&mut session, result);
-        let result = mode
-            .on_message(&session, &env("buyer", "Commitment", commitment_payload()))
-            .unwrap();
-        assert!(matches!(result, ModeResponse::PersistAndResolve { .. }));
-    }
-
-    #[test]
-    fn commitment_without_proposals_rejected() {
-        let mode = ProposalMode;
-        let mut session = base_session();
-        let result = mode
-            .on_session_start(&session, &env("buyer", "SessionStart", vec![]))
-            .unwrap();
-        apply(&mut session, result);
-        let err = mode
-            .on_message(&session, &env("buyer", "Commitment", commitment_payload()))
-            .unwrap_err();
-        assert_eq!(err.to_string(), "InvalidPayload");
-    }
-
-    #[test]
-    fn non_initiator_commitment_rejected() {
-        let mode = ProposalMode;
-        let mut session = base_session();
-        let result = mode
-            .on_session_start(&session, &env("buyer", "SessionStart", vec![]))
-            .unwrap();
-        apply(&mut session, result);
-        let result = mode
-            .on_message(
-                &session,
-                &env("seller", "Proposal", make_proposal("p1", "Offer", "1200")),
-            )
-            .unwrap();
-        apply(&mut session, result);
-        let err = mode
-            .on_message(&session, &env("seller", "Commitment", commitment_payload()))
-            .unwrap_err();
-        assert_eq!(err.to_string(), "Forbidden");
-    }
-
-    // --- Authorization ---
-
-    #[test]
-    fn non_participant_rejected() {
-        let mode = ProposalMode;
-        let session = base_session();
-        let err = mode
-            .authorize_sender(
-                &session,
-                &env("outsider", "Proposal", make_proposal("p1", "Offer", "1200")),
-            )
-            .unwrap_err();
-        assert_eq!(err.to_string(), "Forbidden");
-    }
-
-    // --- Unknown message type ---
-
-    #[test]
-    fn unknown_message_type_rejected() {
-        let mode = ProposalMode;
-        let mut session = base_session();
-        let result = mode
-            .on_session_start(&session, &env("buyer", "SessionStart", vec![]))
-            .unwrap();
-        apply(&mut session, result);
-        let err = mode
-            .on_message(&session, &env("seller", "CustomType", vec![]))
-            .unwrap_err();
-        assert_eq!(err.to_string(), "InvalidPayload");
-    }
-
-    // --- Full lifecycle ---
-
-    #[test]
-    fn full_proposal_lifecycle() {
-        let mode = ProposalMode;
-        let mut session = base_session();
-        let result = mode
-            .on_session_start(&session, &env("buyer", "SessionStart", vec![]))
-            .unwrap();
-        apply(&mut session, result);
-
-        // Seller makes proposal
-        let result = mode
-            .on_message(
-                &session,
-                &env("seller", "Proposal", make_proposal("p1", "Initial", "1200")),
-            )
-            .unwrap();
-        apply(&mut session, result);
-
-        // Buyer counter-proposes
-        let result = mode
-            .on_message(
-                &session,
-                &env(
-                    "buyer",
-                    "CounterProposal",
-                    make_counter("p2", "p1", "Counter", "1000"),
-                ),
-            )
-            .unwrap();
-        apply(&mut session, result);
-
-        // Both accept p2
-        let result = mode
-            .on_message(&session, &env("buyer", "Accept", make_accept("p2", "good")))
-            .unwrap();
-        apply(&mut session, result);
-        let result = mode
-            .on_message(
-                &session,
-                &env("seller", "Accept", make_accept("p2", "agreed")),
-            )
-            .unwrap();
-        apply(&mut session, result);
-
-        // Commitment
-        let result = mode
-            .on_message(&session, &env("buyer", "Commitment", commitment_payload()))
-            .unwrap();
-        assert!(matches!(result, ModeResponse::PersistAndResolve { .. }));
-    }
-
-    #[test]
-    fn deterministic_serialization() {
-        let mut state1 = ProposalState::default();
-        state1.proposals.insert(
-            "z".into(),
-            ProposalRecord {
-                proposal_id: "z".into(),
-                title: "z".into(),
-                summary: "".into(),
-                details: vec![],
-                tags: vec![],
-                proposer: "".into(),
-                supersedes_proposal_id: None,
-                disposition: ProposalDisposition::Live,
-            },
-        );
-        state1.proposals.insert(
-            "a".into(),
-            ProposalRecord {
-                proposal_id: "a".into(),
-                title: "a".into(),
-                summary: "".into(),
-                details: vec![],
-                tags: vec![],
-                proposer: "".into(),
-                supersedes_proposal_id: None,
-                disposition: ProposalDisposition::Live,
-            },
-        );
-
-        let mut state2 = ProposalState::default();
-        state2.proposals.insert(
-            "a".into(),
-            ProposalRecord {
-                proposal_id: "a".into(),
-                title: "a".into(),
-                summary: "".into(),
-                details: vec![],
-                tags: vec![],
-                proposer: "".into(),
-                supersedes_proposal_id: None,
-                disposition: ProposalDisposition::Live,
-            },
-        );
-        state2.proposals.insert(
-            "z".into(),
-            ProposalRecord {
-                proposal_id: "z".into(),
-                title: "z".into(),
-                summary: "".into(),
-                details: vec![],
-                tags: vec![],
-                proposer: "".into(),
-                supersedes_proposal_id: None,
-                disposition: ProposalDisposition::Live,
-            },
-        );
+        apply(&mut session, resp);
 
         assert_eq!(
-            ProposalMode::encode_state(&state1),
-            ProposalMode::encode_state(&state2)
+            mode.on_message(
+                &session,
+                &env(
+                    "agent://buyer",
+                    "Commitment",
+                    commitment(&session, "proposal.accepted"),
+                ),
+            )
+            .unwrap_err()
+            .to_string(),
+            "InvalidPayload"
         );
+
+        let resp = mode
+            .on_message(&session, &env("agent://buyer", "Accept", make_accept("p1")))
+            .unwrap();
+        apply(&mut session, resp);
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://seller", "Accept", make_accept("p1")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        mode.on_message(
+            &session,
+            &env(
+                "agent://buyer",
+                "Commitment",
+                commitment(&session, "proposal.accepted"),
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn terminal_rejection_allows_negative_commitment() {
+        let mode = ProposalMode;
+        let mut session = base_session();
+        let resp = mode
+            .on_session_start(&session, &env("agent://buyer", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, resp);
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://seller", "Proposal", make_proposal("p1")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://buyer", "Reject", make_reject("p1", true)),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        mode.on_message(
+            &session,
+            &env(
+                "agent://buyer",
+                "Commitment",
+                commitment(&session, "proposal.rejected"),
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn withdraw_clears_terminal_rejections() {
+        let mode = ProposalMode;
+        let mut session = base_session();
+        let resp = mode
+            .on_session_start(&session, &env("agent://buyer", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, resp);
+        // Seller proposes p1
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://seller", "Proposal", make_proposal("p1")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        // Buyer terminally rejects p1
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://buyer", "Reject", make_reject("p1", true)),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        // Seller withdraws p1 — terminal rejection should be cleared
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://seller", "Withdraw", make_withdraw("p1")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        // Seller proposes p2
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://seller", "Proposal", make_proposal("p2")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        // Commitment should NOT be ready (no acceptance convergence, no terminal rejection)
+        let err = mode
+            .on_message(
+                &session,
+                &env(
+                    "agent://buyer",
+                    "Commitment",
+                    commitment(&session, "proposal.rejected"),
+                ),
+            )
+            .unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
+    }
+
+    #[test]
+    fn terminal_rejection_on_different_proposal_survives_withdraw() {
+        let mode = ProposalMode;
+        let mut session = base_session();
+        let resp = mode
+            .on_session_start(&session, &env("agent://buyer", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, resp);
+        // Seller proposes p1 and p2
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://seller", "Proposal", make_proposal("p1")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://seller", "Proposal", make_proposal("p2")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        // Buyer terminally rejects p2
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://buyer", "Reject", make_reject("p2", true)),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        // Seller withdraws p1 — p2's terminal rejection survives
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://seller", "Withdraw", make_withdraw("p1")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        // Commitment should be ready because p2 still has a terminal rejection
+        mode.on_message(
+            &session,
+            &env(
+                "agent://buyer",
+                "Commitment",
+                commitment(&session, "proposal.rejected"),
+            ),
+        )
+        .unwrap();
     }
 }

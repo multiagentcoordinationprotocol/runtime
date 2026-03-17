@@ -26,6 +26,9 @@ pub enum MacpError {
     Forbidden,
     #[error("Unauthenticated")]
     Unauthenticated,
+    /// Kept for RFC error-code completeness.  The runtime currently represents
+    /// duplicate detection via `ProcessResult { duplicate: true }` at the Ack
+    /// level rather than returning this as an error.
     #[error("DuplicateMessage")]
     DuplicateMessage,
     #[error("PayloadTooLarge")]

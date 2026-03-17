@@ -1,5 +1,5 @@
 use crate::error::MacpError;
-use crate::mode::util::{decode_commitment_payload, is_declared_participant};
+use crate::mode::util::{is_declared_participant, validate_commitment_payload_for_session};
 use crate::mode::{Mode, ModeResponse};
 use crate::pb::Envelope;
 use crate::session::Session;
@@ -185,6 +185,9 @@ impl Mode for TaskMode {
                 if !Self::can_assignee_respond(session, task, &env.sender) {
                     return Err(MacpError::Forbidden);
                 }
+                if state.rejections.iter().any(|r| r.assignee == env.sender) {
+                    return Err(MacpError::InvalidPayload);
+                }
                 state.rejections.push(TaskRejectRecord {
                     task_id: payload.task_id,
                     assignee: env.sender.clone(),
@@ -259,7 +262,7 @@ impl Mode for TaskMode {
                 if env.sender != session.initiator_sender {
                     return Err(MacpError::Forbidden);
                 }
-                let _payload = decode_commitment_payload(&env.payload)?;
+                validate_commitment_payload_for_session(session, &env.payload)?;
                 if state.terminal_report.is_none() {
                     return Err(MacpError::InvalidPayload);
                 }
@@ -292,9 +295,9 @@ mod tests {
             participants: vec!["planner".into(), "worker".into()],
             seen_message_ids: HashSet::new(),
             intent: String::new(),
-            mode_version: String::new(),
-            configuration_version: String::new(),
-            policy_version: String::new(),
+            mode_version: "1.0.0".into(),
+            configuration_version: "config".into(),
+            policy_version: "policy".into(),
             context: vec![],
             roots: vec![],
             initiator_sender: "planner".into(),
@@ -922,6 +925,78 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(result, ModeResponse::PersistAndResolve { .. }));
+    }
+
+    // --- Duplicate rejection ---
+
+    #[test]
+    fn duplicate_rejection_from_same_sender_rejected() {
+        let mode = TaskMode;
+        let mut session = base_session();
+        session.participants = vec!["planner".into(), "w1".into(), "w2".into()];
+        let result = mode
+            .on_session_start(&session, &env("planner", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("planner", "TaskRequest", make_task_request("t1", "")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("w1", "TaskReject", make_task_reject("t1", "w1")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let err = mode
+            .on_message(
+                &session,
+                &env("w1", "TaskReject", make_task_reject("t1", "w1")),
+            )
+            .unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
+    }
+
+    #[test]
+    fn different_senders_can_both_reject() {
+        let mode = TaskMode;
+        let mut session = base_session();
+        session.participants = vec!["planner".into(), "w1".into(), "w2".into()];
+        let result = mode
+            .on_session_start(&session, &env("planner", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("planner", "TaskRequest", make_task_request("t1", "")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("w1", "TaskReject", make_task_reject("t1", "w1")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("w2", "TaskReject", make_task_reject("t1", "w2")),
+            )
+            .unwrap();
+        match result {
+            ModeResponse::PersistState(data) => {
+                let state: TaskState = serde_json::from_slice(&data).unwrap();
+                assert_eq!(state.rejections.len(), 2);
+            }
+            _ => panic!("Expected PersistState"),
+        }
     }
 
     // --- Unknown message type ---

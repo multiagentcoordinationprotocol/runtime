@@ -16,11 +16,12 @@ Cargo.lock
 
 # Claude Code
 .claude/
-CLAUDE.md
 /plans/
 /tmp/
 /temp/
+CLAUDE.md
 
 # OS
 .DS_Store
 Thumbs.db
+.macp-data/
