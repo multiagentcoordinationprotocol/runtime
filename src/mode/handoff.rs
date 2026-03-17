@@ -1,0 +1,735 @@
+use crate::error::MacpError;
+use crate::handoff_pb::{
+    HandoffAcceptPayload, HandoffContextPayload, HandoffDeclinePayload, HandoffOfferPayload,
+};
+use crate::mode::util::{decode_commitment_payload, is_declared_participant};
+use crate::mode::{Mode, ModeResponse};
+use crate::pb::Envelope;
+use crate::session::Session;
+use prost::Message;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum HandoffDisposition {
+    Offered,
+    Accepted,
+    Declined,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandoffOfferRecord {
+    pub handoff_id: String,
+    pub target_participant: String,
+    pub scope: String,
+    pub reason: String,
+    pub offered_by: String,
+    pub disposition: HandoffDisposition,
+    pub accepted_by: Option<String>,
+    pub declined_by: Option<String>,
+    pub outcome_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandoffContextRecord {
+    pub content_type: String,
+    pub context: Vec<u8>,
+    pub sender: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HandoffState {
+    pub offers: BTreeMap<String, HandoffOfferRecord>,
+    pub contexts: BTreeMap<String, Vec<HandoffContextRecord>>,
+}
+
+pub struct HandoffMode;
+
+impl HandoffMode {
+    fn encode_state(state: &HandoffState) -> Vec<u8> {
+        serde_json::to_vec(state).expect("HandoffState is always serializable")
+    }
+
+    fn decode_state(data: &[u8]) -> Result<HandoffState, MacpError> {
+        serde_json::from_slice(data).map_err(|_| MacpError::InvalidModeState)
+    }
+
+    fn commitment_ready(state: &HandoffState) -> bool {
+        state.offers.values().any(|offer| {
+            offer.disposition == HandoffDisposition::Accepted
+                || offer.disposition == HandoffDisposition::Declined
+        })
+    }
+}
+
+impl Mode for HandoffMode {
+    fn authorize_sender(&self, session: &Session, env: &Envelope) -> Result<(), MacpError> {
+        match env.message_type.as_str() {
+            "Commitment" if env.sender == session.initiator_sender => Ok(()),
+            "Commitment" => Err(MacpError::Forbidden),
+            "HandoffOffer" | "HandoffContext" if env.sender == session.initiator_sender => Ok(()),
+            _ if is_declared_participant(&session.participants, &env.sender) => Ok(()),
+            _ => Err(MacpError::Forbidden),
+        }
+    }
+
+    fn on_session_start(
+        &self,
+        session: &Session,
+        _env: &Envelope,
+    ) -> Result<ModeResponse, MacpError> {
+        if session.participants.len() < 2 {
+            return Err(MacpError::InvalidPayload);
+        }
+        Ok(ModeResponse::PersistState(Self::encode_state(
+            &HandoffState::default(),
+        )))
+    }
+
+    fn on_message(&self, session: &Session, env: &Envelope) -> Result<ModeResponse, MacpError> {
+        let mut state = if session.mode_state.is_empty() {
+            HandoffState::default()
+        } else {
+            Self::decode_state(&session.mode_state)?
+        };
+
+        match env.message_type.as_str() {
+            "HandoffOffer" => {
+                let payload = HandoffOfferPayload::decode(&*env.payload)
+                    .map_err(|_| MacpError::InvalidPayload)?;
+                if payload.handoff_id.is_empty()
+                    || payload.target_participant.is_empty()
+                    || state.offers.contains_key(&payload.handoff_id)
+                    || !is_declared_participant(&session.participants, &payload.target_participant)
+                    || payload.target_participant == env.sender
+                {
+                    return Err(MacpError::InvalidPayload);
+                }
+                state.offers.insert(
+                    payload.handoff_id.clone(),
+                    HandoffOfferRecord {
+                        handoff_id: payload.handoff_id,
+                        target_participant: payload.target_participant,
+                        scope: payload.scope,
+                        reason: payload.reason,
+                        offered_by: env.sender.clone(),
+                        disposition: HandoffDisposition::Offered,
+                        accepted_by: None,
+                        declined_by: None,
+                        outcome_reason: None,
+                    },
+                );
+                Ok(ModeResponse::PersistState(Self::encode_state(&state)))
+            }
+            "HandoffContext" => {
+                let payload = HandoffContextPayload::decode(&*env.payload)
+                    .map_err(|_| MacpError::InvalidPayload)?;
+                let offer = state
+                    .offers
+                    .get(&payload.handoff_id)
+                    .ok_or(MacpError::InvalidPayload)?;
+                if offer.offered_by != env.sender {
+                    return Err(MacpError::Forbidden);
+                }
+                state
+                    .contexts
+                    .entry(payload.handoff_id)
+                    .or_default()
+                    .push(HandoffContextRecord {
+                        content_type: payload.content_type,
+                        context: payload.context,
+                        sender: env.sender.clone(),
+                    });
+                Ok(ModeResponse::PersistState(Self::encode_state(&state)))
+            }
+            "HandoffAccept" => {
+                let payload = HandoffAcceptPayload::decode(&*env.payload)
+                    .map_err(|_| MacpError::InvalidPayload)?;
+                let offer = state
+                    .offers
+                    .get_mut(&payload.handoff_id)
+                    .ok_or(MacpError::InvalidPayload)?;
+                if offer.target_participant != env.sender {
+                    return Err(MacpError::Forbidden);
+                }
+                if !payload.accepted_by.is_empty() && payload.accepted_by != env.sender {
+                    return Err(MacpError::InvalidPayload);
+                }
+                if offer.disposition != HandoffDisposition::Offered {
+                    return Err(MacpError::InvalidPayload);
+                }
+                offer.disposition = HandoffDisposition::Accepted;
+                offer.accepted_by = Some(env.sender.clone());
+                offer.outcome_reason = Some(payload.reason);
+                Ok(ModeResponse::PersistState(Self::encode_state(&state)))
+            }
+            "HandoffDecline" => {
+                let payload = HandoffDeclinePayload::decode(&*env.payload)
+                    .map_err(|_| MacpError::InvalidPayload)?;
+                let offer = state
+                    .offers
+                    .get_mut(&payload.handoff_id)
+                    .ok_or(MacpError::InvalidPayload)?;
+                if offer.target_participant != env.sender {
+                    return Err(MacpError::Forbidden);
+                }
+                if !payload.declined_by.is_empty() && payload.declined_by != env.sender {
+                    return Err(MacpError::InvalidPayload);
+                }
+                if offer.disposition != HandoffDisposition::Offered {
+                    return Err(MacpError::InvalidPayload);
+                }
+                offer.disposition = HandoffDisposition::Declined;
+                offer.declined_by = Some(env.sender.clone());
+                offer.outcome_reason = Some(payload.reason);
+                Ok(ModeResponse::PersistState(Self::encode_state(&state)))
+            }
+            "Commitment" => {
+                if env.sender != session.initiator_sender {
+                    return Err(MacpError::Forbidden);
+                }
+                let _payload = decode_commitment_payload(&env.payload)?;
+                if !Self::commitment_ready(&state) {
+                    return Err(MacpError::InvalidPayload);
+                }
+                Ok(ModeResponse::PersistAndResolve {
+                    state: Self::encode_state(&state),
+                    resolution: env.payload.clone(),
+                })
+            }
+            _ => Err(MacpError::InvalidPayload),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pb::CommitmentPayload;
+    use crate::session::{Session, SessionState};
+    use std::collections::HashSet;
+
+    fn base_session() -> Session {
+        Session {
+            session_id: "s1".into(),
+            state: SessionState::Open,
+            ttl_expiry: i64::MAX,
+            started_at_unix_ms: 0,
+            resolution: None,
+            mode: "macp.mode.handoff.v1".into(),
+            mode_state: vec![],
+            participants: vec!["owner".into(), "target".into()],
+            seen_message_ids: HashSet::new(),
+            intent: String::new(),
+            mode_version: String::new(),
+            configuration_version: String::new(),
+            policy_version: String::new(),
+            context: vec![],
+            roots: vec![],
+            initiator_sender: "owner".into(),
+        }
+    }
+
+    fn env(sender: &str, message_type: &str, payload: Vec<u8>) -> Envelope {
+        Envelope {
+            macp_version: "1.0".into(),
+            mode: "macp.mode.handoff.v1".into(),
+            message_type: message_type.into(),
+            message_id: format!("{}-{}", sender, message_type),
+            session_id: "s1".into(),
+            sender: sender.into(),
+            timestamp_unix_ms: 0,
+            payload,
+        }
+    }
+
+    fn commitment_payload() -> Vec<u8> {
+        CommitmentPayload {
+            commitment_id: "c1".into(),
+            action: "handoff.accepted".into(),
+            authority_scope: "support".into(),
+            reason: "accepted".into(),
+            mode_version: "1.0.0".into(),
+            policy_version: "policy".into(),
+            configuration_version: "config".into(),
+        }
+        .encode_to_vec()
+    }
+
+    fn apply(session: &mut Session, result: ModeResponse) {
+        match result {
+            ModeResponse::PersistState(data) => session.mode_state = data,
+            ModeResponse::PersistAndResolve { state, .. } => session.mode_state = state,
+            _ => {}
+        }
+    }
+
+    fn make_offer(handoff_id: &str, target: &str) -> Vec<u8> {
+        HandoffOfferPayload {
+            handoff_id: handoff_id.into(),
+            target_participant: target.into(),
+            scope: "support".into(),
+            reason: "escalate".into(),
+        }
+        .encode_to_vec()
+    }
+
+    fn make_context(handoff_id: &str) -> Vec<u8> {
+        HandoffContextPayload {
+            handoff_id: handoff_id.into(),
+            content_type: "text/plain".into(),
+            context: b"background info".to_vec(),
+        }
+        .encode_to_vec()
+    }
+
+    fn make_accept(handoff_id: &str, accepted_by: &str) -> Vec<u8> {
+        HandoffAcceptPayload {
+            handoff_id: handoff_id.into(),
+            accepted_by: accepted_by.into(),
+            reason: "ready".into(),
+        }
+        .encode_to_vec()
+    }
+
+    fn make_decline(handoff_id: &str, declined_by: &str) -> Vec<u8> {
+        HandoffDeclinePayload {
+            handoff_id: handoff_id.into(),
+            declined_by: declined_by.into(),
+            reason: "busy".into(),
+        }
+        .encode_to_vec()
+    }
+
+    // --- Session Start ---
+
+    #[test]
+    fn session_start_initializes_state() {
+        let mode = HandoffMode;
+        let session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("owner", "SessionStart", vec![]))
+            .unwrap();
+        match result {
+            ModeResponse::PersistState(data) => {
+                let state: HandoffState = serde_json::from_slice(&data).unwrap();
+                assert!(state.offers.is_empty());
+            }
+            _ => panic!("Expected PersistState"),
+        }
+    }
+
+    #[test]
+    fn session_start_requires_two_participants() {
+        let mode = HandoffMode;
+        let mut session = base_session();
+        session.participants = vec!["owner".into()]; // only 1
+        let err = mode
+            .on_session_start(&session, &env("owner", "SessionStart", vec![]))
+            .unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
+    }
+
+    // --- HandoffOffer ---
+
+    #[test]
+    fn offer_creates_entry() {
+        let mode = HandoffMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("owner", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("owner", "HandoffOffer", make_offer("h1", "target")),
+            )
+            .unwrap();
+        match result {
+            ModeResponse::PersistState(data) => {
+                let state: HandoffState = serde_json::from_slice(&data).unwrap();
+                assert!(state.offers.contains_key("h1"));
+                assert_eq!(state.offers["h1"].disposition, HandoffDisposition::Offered);
+            }
+            _ => panic!("Expected PersistState"),
+        }
+    }
+
+    #[test]
+    fn duplicate_offer_id_rejected() {
+        let mode = HandoffMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("owner", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("owner", "HandoffOffer", make_offer("h1", "target")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let err = mode
+            .on_message(
+                &session,
+                &env("owner", "HandoffOffer", make_offer("h1", "target")),
+            )
+            .unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
+    }
+
+    #[test]
+    fn offer_to_self_rejected() {
+        let mode = HandoffMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("owner", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let err = mode
+            .on_message(
+                &session,
+                &env("owner", "HandoffOffer", make_offer("h1", "owner")),
+            )
+            .unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
+    }
+
+    #[test]
+    fn offer_to_non_participant_rejected() {
+        let mode = HandoffMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("owner", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let err = mode
+            .on_message(
+                &session,
+                &env("owner", "HandoffOffer", make_offer("h1", "outsider")),
+            )
+            .unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
+    }
+
+    // --- HandoffContext ---
+
+    #[test]
+    fn context_for_existing_offer() {
+        let mode = HandoffMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("owner", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("owner", "HandoffOffer", make_offer("h1", "target")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("owner", "HandoffContext", make_context("h1")),
+            )
+            .unwrap();
+        match result {
+            ModeResponse::PersistState(data) => {
+                let state: HandoffState = serde_json::from_slice(&data).unwrap();
+                assert_eq!(state.contexts["h1"].len(), 1);
+            }
+            _ => panic!("Expected PersistState"),
+        }
+    }
+
+    #[test]
+    fn context_from_non_offerer_rejected() {
+        let mode = HandoffMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("owner", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("owner", "HandoffOffer", make_offer("h1", "target")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let err = mode
+            .on_message(
+                &session,
+                &env("target", "HandoffContext", make_context("h1")),
+            )
+            .unwrap_err();
+        assert_eq!(err.to_string(), "Forbidden");
+    }
+
+    // --- HandoffAccept / HandoffDecline ---
+
+    #[test]
+    fn target_can_accept() {
+        let mode = HandoffMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("owner", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("owner", "HandoffOffer", make_offer("h1", "target")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("target", "HandoffAccept", make_accept("h1", "target")),
+            )
+            .unwrap();
+        match result {
+            ModeResponse::PersistState(data) => {
+                let state: HandoffState = serde_json::from_slice(&data).unwrap();
+                assert_eq!(state.offers["h1"].disposition, HandoffDisposition::Accepted);
+            }
+            _ => panic!("Expected PersistState"),
+        }
+    }
+
+    #[test]
+    fn wrong_target_cannot_accept() {
+        let mode = HandoffMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("owner", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("owner", "HandoffOffer", make_offer("h1", "target")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let err = mode
+            .on_message(
+                &session,
+                &env("owner", "HandoffAccept", make_accept("h1", "owner")),
+            )
+            .unwrap_err();
+        assert_eq!(err.to_string(), "Forbidden");
+    }
+
+    #[test]
+    fn target_can_decline() {
+        let mode = HandoffMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("owner", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("owner", "HandoffOffer", make_offer("h1", "target")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("target", "HandoffDecline", make_decline("h1", "target")),
+            )
+            .unwrap();
+        match result {
+            ModeResponse::PersistState(data) => {
+                let state: HandoffState = serde_json::from_slice(&data).unwrap();
+                assert_eq!(state.offers["h1"].disposition, HandoffDisposition::Declined);
+            }
+            _ => panic!("Expected PersistState"),
+        }
+    }
+
+    #[test]
+    fn cannot_accept_already_accepted() {
+        let mode = HandoffMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("owner", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("owner", "HandoffOffer", make_offer("h1", "target")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("target", "HandoffAccept", make_accept("h1", "target")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let err = mode
+            .on_message(
+                &session,
+                &env("target", "HandoffAccept", make_accept("h1", "target")),
+            )
+            .unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
+    }
+
+    // --- Commitment ---
+
+    #[test]
+    fn commitment_after_accept() {
+        let mode = HandoffMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("owner", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("owner", "HandoffOffer", make_offer("h1", "target")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("target", "HandoffAccept", make_accept("h1", "target")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(&session, &env("owner", "Commitment", commitment_payload()))
+            .unwrap();
+        assert!(matches!(result, ModeResponse::PersistAndResolve { .. }));
+    }
+
+    #[test]
+    fn commitment_after_decline() {
+        let mode = HandoffMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("owner", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("owner", "HandoffOffer", make_offer("h1", "target")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("target", "HandoffDecline", make_decline("h1", "target")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(&session, &env("owner", "Commitment", commitment_payload()))
+            .unwrap();
+        assert!(matches!(result, ModeResponse::PersistAndResolve { .. }));
+    }
+
+    #[test]
+    fn commitment_without_response_rejected() {
+        let mode = HandoffMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("owner", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("owner", "HandoffOffer", make_offer("h1", "target")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let err = mode
+            .on_message(&session, &env("owner", "Commitment", commitment_payload()))
+            .unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
+    }
+
+    #[test]
+    fn commitment_with_no_offers_rejected() {
+        let mode = HandoffMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("owner", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let err = mode
+            .on_message(&session, &env("owner", "Commitment", commitment_payload()))
+            .unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
+    }
+
+    // --- Full lifecycle ---
+
+    #[test]
+    fn full_handoff_lifecycle() {
+        let mode = HandoffMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("owner", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("owner", "HandoffOffer", make_offer("h1", "target")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("owner", "HandoffContext", make_context("h1")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("target", "HandoffAccept", make_accept("h1", "target")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(&session, &env("owner", "Commitment", commitment_payload()))
+            .unwrap();
+        assert!(matches!(result, ModeResponse::PersistAndResolve { .. }));
+    }
+
+    // --- Unknown message type ---
+
+    #[test]
+    fn unknown_message_type_rejected() {
+        let mode = HandoffMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("owner", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let err = mode
+            .on_message(&session, &env("owner", "CustomType", vec![]))
+            .unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
+    }
+}

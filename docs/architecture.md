@@ -69,9 +69,20 @@ This document explains how the MACP Runtime v0.3 is built internally. It walks t
 │  │ HashMap<name,    │  │                              │      │
 │  │   Box<dyn Mode>> │  │ DecisionMode                 │      │
 │  │                  │  │  - RFC lifecycle              │      │
-│  │ 4 entries:       │  │  - Proposal/Eval/Vote/Commit │      │
-│  │  decision (x2)   │  │  - Phase tracking            │      │
-│  │  multi_round(x2) │  │                              │      │
+│  │ 12 entries:      │  │  - Proposal/Eval/Vote/Commit │      │
+│  │  decision (x2)   │  │                              │      │
+│  │  proposal (x2)   │  │ ProposalMode                 │      │
+│  │  task (x2)       │  │  - Peer propose/accept/reject│      │
+│  │  handoff (x2)    │  │                              │      │
+│  │  quorum (x2)     │  │ TaskMode                     │      │
+│  │  multi_round(x2) │  │  - Orchestrated task tracking│      │
+│  │                  │  │                              │      │
+│  │                  │  │ HandoffMode                   │      │
+│  │                  │  │  - Delegated context transfer │      │
+│  │                  │  │                              │      │
+│  │                  │  │ QuorumMode                    │      │
+│  │                  │  │  - Threshold-based voting     │      │
+│  │                  │  │                              │      │
 │  │                  │  │ MultiRoundMode               │      │
 │  │                  │  │  - Convergence checking       │      │
 │  │                  │  │  - Round counting             │      │
@@ -244,7 +255,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 1. The address `127.0.0.1:50051` is parsed.
 2. A `SessionRegistry` is created — an empty, thread-safe hashmap for storing sessions.
 3. A `LogStore` is created — an empty, thread-safe hashmap for storing per-session event logs.
-4. A `Runtime` is created — it takes ownership of the registry and log store (via `Arc`), and registers the built-in modes (DecisionMode and MultiRoundMode with both RFC names and backward-compatible aliases).
+4. A `Runtime` is created — it takes ownership of the registry and log store (via `Arc`), and registers all six built-in modes (DecisionMode, ProposalMode, TaskMode, HandoffMode, QuorumMode, and MultiRoundMode). Only `decision` and `multi_round` have backward-compatible short aliases; the four new standard modes use canonical names only.
 5. A `MacpServer` is created — the gRPC adapter wrapping the runtime.
 6. Tonic's gRPC `Server` is started, listening on the configured address.
 
@@ -542,6 +553,58 @@ The mode inspects `envelope.message_type` and dispatches accordingly:
 - Phase transitions are one-way: `Proposal → Evaluation → Voting → Committed`.
 - The `Commitment` message is the terminal message — it resolves the session.
 
+### ProposalMode (mode/proposal.rs)
+
+The Proposal Mode implements a lightweight peer-based propose/accept/reject lifecycle. It maintains a `ProposalState` serialized as JSON in `session.mode_state`.
+
+**Message routing in `on_message()`:**
+
+| message_type | Handler | Returns |
+|-------------|---------|---------|
+| `"Propose"` | Parse proposal payload, record proposal | `PersistState` |
+| `"Accept"` | Record acceptance; check if all peers accepted | `PersistState` or `PersistAndResolve` |
+| `"Reject"` | Record rejection with reason | `PersistState` |
+| Anything else | Ignored | `NoOp` |
+
+### TaskMode (mode/task.rs)
+
+The Task Mode implements orchestrated task assignment and completion tracking. It maintains a `TaskState` serialized as JSON in `session.mode_state`.
+
+**Message routing in `on_message()`:**
+
+| message_type | Handler | Returns |
+|-------------|---------|---------|
+| `"Assign"` | Record task assignment to an agent | `PersistState` |
+| `"Progress"` | Update task progress | `PersistState` |
+| `"Complete"` | Mark task complete; check if all tasks are terminal | `PersistState` or `PersistAndResolve` |
+| `"Cancel"` | Mark task as cancelled | `PersistState` |
+| Anything else | Ignored | `NoOp` |
+
+### HandoffMode (mode/handoff.rs)
+
+The Handoff Mode implements delegated context transfer between agents. It maintains a `HandoffState` serialized as JSON in `session.mode_state`.
+
+**Message routing in `on_message()`:**
+
+| message_type | Handler | Returns |
+|-------------|---------|---------|
+| `"Initiate"` | Record handoff context (frozen at transfer) | `PersistState` |
+| `"Acknowledge"` | Resolve session with frozen context | `PersistAndResolve` |
+| `"Reject"` | Record rejection, allow re-initiation | `PersistState` |
+| Anything else | Ignored | `NoOp` |
+
+### QuorumMode (mode/quorum.rs)
+
+The Quorum Mode implements threshold-based voting. It maintains a `QuorumState` serialized as JSON in `session.mode_state`.
+
+**Message routing in `on_message()`:**
+
+| message_type | Handler | Returns |
+|-------------|---------|---------|
+| `"Vote"` | Record vote; check if quorum threshold is met | `PersistState` or `PersistAndResolve` |
+| `"Abstain"` | Record abstention (does not count toward quorum) | `PersistState` |
+| Anything else | Ignored | `NoOp` |
+
 ### MultiRoundMode (mode/multi_round.rs)
 
 The Multi-Round Mode implements participant-based convergence. It maintains a `MultiRoundState` serialized as JSON in `session.mode_state`.
@@ -605,10 +668,14 @@ pub struct ProcessResult {
 
 ### Mode Registration
 
-On construction, the runtime registers four entries:
+On construction, the runtime registers eight entries:
 
 ```rust
 modes.insert("macp.mode.decision.v1", DecisionMode);
+modes.insert("macp.mode.proposal.v1", ProposalMode);
+modes.insert("macp.mode.task.v1", TaskMode);
+modes.insert("macp.mode.handoff.v1", HandoffMode);
+modes.insert("macp.mode.quorum.v1", QuorumMode);
 modes.insert("macp.mode.multi_round.v1", MultiRoundMode);
 modes.insert("decision", DecisionMode);          // backward-compatible alias
 modes.insert("multi_round", MultiRoundMode);      // backward-compatible alias
@@ -948,9 +1015,21 @@ runtime/
 │       │   ├── envelope.proto                # Envelope, Ack, MACPError, SessionState
 │       │   └── core.proto                    # Service + all message types
 │       └── modes/
-│           └── decision/
+│           ├── decision/
+│           │   └── v1/
+│           │       └── decision.proto        # Decision mode payload types
+│           ├── proposal/
+│           │   └── v1/
+│           │       └── proposal.proto        # Proposal mode payload types
+│           ├── task/
+│           │   └── v1/
+│           │       └── task.proto            # Task mode payload types
+│           ├── handoff/
+│           │   └── v1/
+│           │       └── handoff.proto         # Handoff mode payload types
+│           └── quorum/
 │               └── v1/
-│                   └── decision.proto        # Decision mode payload types
+│                   └── quorum.proto          # Quorum mode payload types
 ├── src/
 │   ├── main.rs                               # Entry point — server startup
 │   ├── lib.rs                                # Library root — proto modules + exports
@@ -962,12 +1041,21 @@ runtime/
 │   ├── runtime.rs                            # Runtime kernel
 │   ├── mode/
 │   │   ├── mod.rs                            # Mode trait + ModeResponse
+│   │   ├── util.rs                           # Shared mode utilities
 │   │   ├── decision.rs                       # DecisionMode (RFC lifecycle)
+│   │   ├── proposal.rs                       # ProposalMode (peer propose/accept/reject)
+│   │   ├── task.rs                           # TaskMode (orchestrated task tracking)
+│   │   ├── handoff.rs                        # HandoffMode (delegated context transfer)
+│   │   ├── quorum.rs                         # QuorumMode (threshold-based voting)
 │   │   └── multi_round.rs                    # MultiRoundMode (convergence)
 │   └── bin/
 │       ├── client.rs                         # Basic demo client
 │       ├── fuzz_client.rs                    # Comprehensive error-path client
-│       └── multi_round_client.rs             # Multi-round convergence demo
+│       ├── multi_round_client.rs             # Multi-round convergence demo
+│       ├── proposal_client.rs                # Proposal mode demo
+│       ├── task_client.rs                    # Task mode demo
+│       ├── handoff_client.rs                 # Handoff mode demo
+│       └── quorum_client.rs                  # Quorum mode demo
 ├── build.rs                                  # tonic-build proto compilation
 ├── Cargo.toml                                # Dependencies
 ├── Makefile                                  # Development shortcuts
@@ -991,7 +1079,7 @@ runtime/
 
 ## Build Process
 
-1. **`build.rs` runs first** — reads the three `.proto` files from the `proto/` directory and generates Rust code via `tonic-build`. The generated code appears in `target/debug/build/macp-runtime-*/out/`.
+1. **`build.rs` runs first** — reads the seven `.proto` files from the `proto/` directory and generates Rust code via `tonic-build`. The generated code appears in `target/debug/build/macp-runtime-*/out/`.
 
 2. **Rust compiler compiles:**
    - `src/lib.rs` — the library crate with all modules.
@@ -999,12 +1087,20 @@ runtime/
    - `src/bin/client.rs` — the basic demo client.
    - `src/bin/fuzz_client.rs` — the comprehensive test client.
    - `src/bin/multi_round_client.rs` — the convergence demo client.
+   - `src/bin/proposal_client.rs` — the proposal mode demo client.
+   - `src/bin/task_client.rs` — the task mode demo client.
+   - `src/bin/handoff_client.rs` — the handoff mode demo client.
+   - `src/bin/quorum_client.rs` — the quorum mode demo client.
 
 3. **Output binaries:**
    - `target/debug/macp-runtime` — the server.
    - `target/debug/client` — the basic client.
    - `target/debug/fuzz_client` — the test client.
    - `target/debug/multi_round_client` — the convergence demo.
+   - `target/debug/proposal_client` — the proposal mode demo.
+   - `target/debug/task_client` — the task mode demo.
+   - `target/debug/handoff_client` — the handoff mode demo.
+   - `target/debug/quorum_client` — the quorum mode demo.
 
 ---
 

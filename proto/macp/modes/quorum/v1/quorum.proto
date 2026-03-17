@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+package macp.modes.quorum.v1;
+
+message ApprovalRequestPayload {
+  string request_id = 1;
+  string action = 2;
+  string summary = 3;
+  bytes details = 4;
+  uint32 required_approvals = 5;
+}
+
+message ApprovePayload {
+  string request_id = 1;
+  string reason = 2;
+}
+
+message RejectPayload {
+  string request_id = 1;
+  string reason = 2;
+}
+
+message AbstainPayload {
+  string request_id = 1;
+  string reason = 2;
+}
+
+// Quorum Mode terminates with macp.v1.CommitmentPayload.

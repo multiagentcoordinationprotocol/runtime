@@ -1,14 +1,15 @@
 use macp_runtime::error::MacpError;
+use macp_runtime::mode::standard_mode_descriptors;
 use macp_runtime::pb::macp_runtime_service_server::MacpRuntimeService;
 use macp_runtime::pb::{
     Ack, CancelSessionRequest, CancelSessionResponse, CancellationCapability, Capabilities,
     Envelope, GetManifestRequest, GetManifestResponse, GetSessionRequest, GetSessionResponse,
     InitializeRequest, InitializeResponse, ListModesRequest, ListModesResponse, ListRootsRequest,
-    ListRootsResponse, MacpError as PbMacpError, ManifestCapability, ModeDescriptor,
-    ModeRegistryCapability, ProgressCapability, RootsCapability, RuntimeInfo, SendRequest,
-    SendResponse, SessionMetadata, SessionState as PbSessionState, SessionsCapability,
-    StreamSessionRequest, StreamSessionResponse, WatchModeRegistryRequest,
-    WatchModeRegistryResponse, WatchRootsRequest, WatchRootsResponse,
+    ListRootsResponse, MacpError as PbMacpError, ManifestCapability, ModeRegistryCapability,
+    ProgressCapability, RootsCapability, RuntimeInfo, SendRequest, SendResponse, SessionMetadata,
+    SessionState as PbSessionState, SessionsCapability, StreamSessionRequest,
+    StreamSessionResponse, WatchModeRegistryRequest, WatchModeRegistryResponse, WatchRootsRequest,
+    WatchRootsResponse,
 };
 use macp_runtime::runtime::Runtime;
 use macp_runtime::session::SessionState;
@@ -257,29 +258,9 @@ impl MacpRuntimeService for MacpServer {
         &self,
         _request: Request<ListModesRequest>,
     ) -> Result<Response<ListModesResponse>, Status> {
-        let modes = vec![ModeDescriptor {
-            mode: "macp.mode.decision.v1".into(),
-            mode_version: "1.0.0".into(),
-            title: "Decision Mode".into(),
-            description: "Proposal-based decision making with voting".into(),
-            determinism_class: "semantic-deterministic".into(),
-            participant_model: "declared".into(),
-            message_types: vec![
-                "SessionStart".into(),
-                "Proposal".into(),
-                "Evaluation".into(),
-                "Objection".into(),
-                "Vote".into(),
-                "Commitment".into(),
-            ],
-            terminal_message_types: vec!["Commitment".into()],
-            schema_uris: HashMap::from([(
-                "protobuf".into(),
-                "buf.build/multiagentcoordinationprotocol/macp".into(),
-            )]),
-        }];
-
-        Ok(Response::new(ListModesResponse { modes }))
+        Ok(Response::new(ListModesResponse {
+            modes: standard_mode_descriptors(),
+        }))
     }
 
     async fn list_roots(
@@ -392,10 +373,15 @@ impl MacpRuntimeService for MacpServer {
 mod tests {
     use super::*;
     use chrono::Utc;
+    use macp_runtime::handoff_pb;
     use macp_runtime::log_store::LogStore;
+    use macp_runtime::pb::CommitmentPayload;
     use macp_runtime::pb::SessionStartPayload;
+    use macp_runtime::proposal_pb;
+    use macp_runtime::quorum_pb;
     use macp_runtime::registry::SessionRegistry;
     use macp_runtime::session::Session;
+    use macp_runtime::task_pb;
     use prost::Message;
     use std::collections::HashSet;
 
@@ -1293,8 +1279,17 @@ mod tests {
             .await
             .unwrap();
         let modes = resp.into_inner().modes;
-        assert_eq!(modes.len(), 1);
-        assert_eq!(modes[0].mode, "macp.mode.decision.v1");
+        let mode_names: Vec<String> = modes.iter().map(|m| m.mode.clone()).collect();
+        assert_eq!(
+            mode_names,
+            vec![
+                "macp.mode.decision.v1",
+                "macp.mode.proposal.v1",
+                "macp.mode.task.v1",
+                "macp.mode.handoff.v1",
+                "macp.mode.quorum.v1",
+            ]
+        );
     }
 
     // --- GetManifest ---
@@ -1511,5 +1506,495 @@ mod tests {
         let ack = do_send(&server, env).await;
         assert!(!ack.ok);
         assert_eq!(ack.error.as_ref().unwrap().code, "INVALID_ENVELOPE");
+    }
+
+    // --- Full proposal flow through server ---
+
+    #[tokio::test]
+    async fn full_proposal_flow_through_server() {
+        let (server, _) = make_server();
+
+        // SessionStart
+        let start_payload = SessionStartPayload {
+            intent: String::new(),
+            ttl_ms: 60_000,
+            participants: vec!["buyer".into(), "seller".into()],
+            mode_version: String::new(),
+            configuration_version: String::new(),
+            policy_version: String::new(),
+            context: vec![],
+            roots: vec![],
+        };
+        let env = Envelope {
+            macp_version: "1.0".into(),
+            mode: "macp.mode.proposal.v1".into(),
+            message_type: "SessionStart".into(),
+            message_id: "m0".into(),
+            session_id: "s_prop".into(),
+            sender: "buyer".into(),
+            timestamp_unix_ms: Utc::now().timestamp_millis(),
+            payload: start_payload.encode_to_vec(),
+        };
+        let ack = do_send(&server, env).await;
+        assert!(ack.ok);
+        assert_eq!(ack.session_state, PbSessionState::Open as i32);
+
+        // Proposal from seller
+        let proposal = proposal_pb::ProposalPayload {
+            proposal_id: "p1".into(),
+            title: "Offer".into(),
+            summary: "$1200".into(),
+            details: vec![],
+            tags: vec![],
+        };
+        let env = Envelope {
+            macp_version: "1.0".into(),
+            mode: "macp.mode.proposal.v1".into(),
+            message_type: "Proposal".into(),
+            message_id: "m1".into(),
+            session_id: "s_prop".into(),
+            sender: "seller".into(),
+            timestamp_unix_ms: Utc::now().timestamp_millis(),
+            payload: proposal.encode_to_vec(),
+        };
+        let ack = do_send(&server, env).await;
+        assert!(ack.ok);
+        assert_eq!(ack.session_state, PbSessionState::Open as i32);
+
+        // Accept from buyer
+        let accept = proposal_pb::AcceptPayload {
+            proposal_id: "p1".into(),
+            reason: "agreed".into(),
+        };
+        let env = Envelope {
+            macp_version: "1.0".into(),
+            mode: "macp.mode.proposal.v1".into(),
+            message_type: "Accept".into(),
+            message_id: "m2".into(),
+            session_id: "s_prop".into(),
+            sender: "buyer".into(),
+            timestamp_unix_ms: Utc::now().timestamp_millis(),
+            payload: accept.encode_to_vec(),
+        };
+        let ack = do_send(&server, env).await;
+        assert!(ack.ok);
+        assert_eq!(ack.session_state, PbSessionState::Open as i32);
+
+        // Commitment from buyer (initiator)
+        let commitment = CommitmentPayload {
+            commitment_id: "c1".into(),
+            action: "proposal.accepted".into(),
+            authority_scope: "commercial".into(),
+            reason: "bound".into(),
+            mode_version: "1.0.0".into(),
+            policy_version: "policy".into(),
+            configuration_version: "config".into(),
+        };
+        let env = Envelope {
+            macp_version: "1.0".into(),
+            mode: "macp.mode.proposal.v1".into(),
+            message_type: "Commitment".into(),
+            message_id: "m3".into(),
+            session_id: "s_prop".into(),
+            sender: "buyer".into(),
+            timestamp_unix_ms: Utc::now().timestamp_millis(),
+            payload: commitment.encode_to_vec(),
+        };
+        let ack = do_send(&server, env).await;
+        assert!(ack.ok);
+        assert_eq!(ack.session_state, PbSessionState::Resolved as i32);
+
+        // Post-resolution message should fail
+        let env = Envelope {
+            macp_version: "1.0".into(),
+            mode: "macp.mode.proposal.v1".into(),
+            message_type: "Proposal".into(),
+            message_id: "m4".into(),
+            session_id: "s_prop".into(),
+            sender: "seller".into(),
+            timestamp_unix_ms: Utc::now().timestamp_millis(),
+            payload: b"too late".to_vec(),
+        };
+        let ack = do_send(&server, env).await;
+        assert!(!ack.ok);
+        assert_eq!(ack.error.unwrap().code, "SESSION_NOT_OPEN");
+    }
+
+    // --- Full task flow through server ---
+
+    #[tokio::test]
+    async fn full_task_flow_through_server() {
+        let (server, _) = make_server();
+
+        // SessionStart
+        let start_payload = SessionStartPayload {
+            intent: String::new(),
+            ttl_ms: 60_000,
+            participants: vec!["planner".into(), "worker".into()],
+            mode_version: String::new(),
+            configuration_version: String::new(),
+            policy_version: String::new(),
+            context: vec![],
+            roots: vec![],
+        };
+        let env = Envelope {
+            macp_version: "1.0".into(),
+            mode: "macp.mode.task.v1".into(),
+            message_type: "SessionStart".into(),
+            message_id: "m0".into(),
+            session_id: "s_task".into(),
+            sender: "planner".into(),
+            timestamp_unix_ms: Utc::now().timestamp_millis(),
+            payload: start_payload.encode_to_vec(),
+        };
+        let ack = do_send(&server, env).await;
+        assert!(ack.ok);
+        assert_eq!(ack.session_state, PbSessionState::Open as i32);
+
+        // TaskRequest from planner
+        let task_req = task_pb::TaskRequestPayload {
+            task_id: "t1".into(),
+            title: "Build widget".into(),
+            instructions: "Do the thing".into(),
+            requested_assignee: "worker".into(),
+            input: vec![],
+            deadline_unix_ms: 0,
+        };
+        let env = Envelope {
+            macp_version: "1.0".into(),
+            mode: "macp.mode.task.v1".into(),
+            message_type: "TaskRequest".into(),
+            message_id: "m1".into(),
+            session_id: "s_task".into(),
+            sender: "planner".into(),
+            timestamp_unix_ms: Utc::now().timestamp_millis(),
+            payload: task_req.encode_to_vec(),
+        };
+        let ack = do_send(&server, env).await;
+        assert!(ack.ok);
+        assert_eq!(ack.session_state, PbSessionState::Open as i32);
+
+        // TaskAccept from worker
+        let task_accept = task_pb::TaskAcceptPayload {
+            task_id: "t1".into(),
+            assignee: "worker".into(),
+            reason: "ready".into(),
+        };
+        let env = Envelope {
+            macp_version: "1.0".into(),
+            mode: "macp.mode.task.v1".into(),
+            message_type: "TaskAccept".into(),
+            message_id: "m2".into(),
+            session_id: "s_task".into(),
+            sender: "worker".into(),
+            timestamp_unix_ms: Utc::now().timestamp_millis(),
+            payload: task_accept.encode_to_vec(),
+        };
+        let ack = do_send(&server, env).await;
+        assert!(ack.ok);
+        assert_eq!(ack.session_state, PbSessionState::Open as i32);
+
+        // TaskComplete from worker
+        let task_complete = task_pb::TaskCompletePayload {
+            task_id: "t1".into(),
+            assignee: "worker".into(),
+            output: b"result".to_vec(),
+            summary: "done".into(),
+        };
+        let env = Envelope {
+            macp_version: "1.0".into(),
+            mode: "macp.mode.task.v1".into(),
+            message_type: "TaskComplete".into(),
+            message_id: "m3".into(),
+            session_id: "s_task".into(),
+            sender: "worker".into(),
+            timestamp_unix_ms: Utc::now().timestamp_millis(),
+            payload: task_complete.encode_to_vec(),
+        };
+        let ack = do_send(&server, env).await;
+        assert!(ack.ok);
+        assert_eq!(ack.session_state, PbSessionState::Open as i32);
+
+        // Commitment from planner (initiator)
+        let commitment = CommitmentPayload {
+            commitment_id: "c1".into(),
+            action: "task.completed".into(),
+            authority_scope: "commercial".into(),
+            reason: "bound".into(),
+            mode_version: "1.0.0".into(),
+            policy_version: "policy".into(),
+            configuration_version: "config".into(),
+        };
+        let env = Envelope {
+            macp_version: "1.0".into(),
+            mode: "macp.mode.task.v1".into(),
+            message_type: "Commitment".into(),
+            message_id: "m4".into(),
+            session_id: "s_task".into(),
+            sender: "planner".into(),
+            timestamp_unix_ms: Utc::now().timestamp_millis(),
+            payload: commitment.encode_to_vec(),
+        };
+        let ack = do_send(&server, env).await;
+        assert!(ack.ok);
+        assert_eq!(ack.session_state, PbSessionState::Resolved as i32);
+
+        // Post-resolution message should fail
+        let env = Envelope {
+            macp_version: "1.0".into(),
+            mode: "macp.mode.task.v1".into(),
+            message_type: "TaskRequest".into(),
+            message_id: "m5".into(),
+            session_id: "s_task".into(),
+            sender: "planner".into(),
+            timestamp_unix_ms: Utc::now().timestamp_millis(),
+            payload: b"too late".to_vec(),
+        };
+        let ack = do_send(&server, env).await;
+        assert!(!ack.ok);
+        assert_eq!(ack.error.unwrap().code, "SESSION_NOT_OPEN");
+    }
+
+    // --- Full handoff flow through server ---
+
+    #[tokio::test]
+    async fn full_handoff_flow_through_server() {
+        let (server, _) = make_server();
+
+        // SessionStart
+        let start_payload = SessionStartPayload {
+            intent: String::new(),
+            ttl_ms: 60_000,
+            participants: vec!["owner".into(), "target".into()],
+            mode_version: String::new(),
+            configuration_version: String::new(),
+            policy_version: String::new(),
+            context: vec![],
+            roots: vec![],
+        };
+        let env = Envelope {
+            macp_version: "1.0".into(),
+            mode: "macp.mode.handoff.v1".into(),
+            message_type: "SessionStart".into(),
+            message_id: "m0".into(),
+            session_id: "s_hand".into(),
+            sender: "owner".into(),
+            timestamp_unix_ms: Utc::now().timestamp_millis(),
+            payload: start_payload.encode_to_vec(),
+        };
+        let ack = do_send(&server, env).await;
+        assert!(ack.ok);
+        assert_eq!(ack.session_state, PbSessionState::Open as i32);
+
+        // HandoffOffer from owner
+        let offer = handoff_pb::HandoffOfferPayload {
+            handoff_id: "h1".into(),
+            target_participant: "target".into(),
+            scope: "support".into(),
+            reason: "escalate".into(),
+        };
+        let env = Envelope {
+            macp_version: "1.0".into(),
+            mode: "macp.mode.handoff.v1".into(),
+            message_type: "HandoffOffer".into(),
+            message_id: "m1".into(),
+            session_id: "s_hand".into(),
+            sender: "owner".into(),
+            timestamp_unix_ms: Utc::now().timestamp_millis(),
+            payload: offer.encode_to_vec(),
+        };
+        let ack = do_send(&server, env).await;
+        assert!(ack.ok);
+        assert_eq!(ack.session_state, PbSessionState::Open as i32);
+
+        // HandoffAccept from target
+        let accept = handoff_pb::HandoffAcceptPayload {
+            handoff_id: "h1".into(),
+            accepted_by: "target".into(),
+            reason: "ready".into(),
+        };
+        let env = Envelope {
+            macp_version: "1.0".into(),
+            mode: "macp.mode.handoff.v1".into(),
+            message_type: "HandoffAccept".into(),
+            message_id: "m2".into(),
+            session_id: "s_hand".into(),
+            sender: "target".into(),
+            timestamp_unix_ms: Utc::now().timestamp_millis(),
+            payload: accept.encode_to_vec(),
+        };
+        let ack = do_send(&server, env).await;
+        assert!(ack.ok);
+        assert_eq!(ack.session_state, PbSessionState::Open as i32);
+
+        // Commitment from owner (initiator)
+        let commitment = CommitmentPayload {
+            commitment_id: "c1".into(),
+            action: "handoff.accepted".into(),
+            authority_scope: "commercial".into(),
+            reason: "bound".into(),
+            mode_version: "1.0.0".into(),
+            policy_version: "policy".into(),
+            configuration_version: "config".into(),
+        };
+        let env = Envelope {
+            macp_version: "1.0".into(),
+            mode: "macp.mode.handoff.v1".into(),
+            message_type: "Commitment".into(),
+            message_id: "m3".into(),
+            session_id: "s_hand".into(),
+            sender: "owner".into(),
+            timestamp_unix_ms: Utc::now().timestamp_millis(),
+            payload: commitment.encode_to_vec(),
+        };
+        let ack = do_send(&server, env).await;
+        assert!(ack.ok);
+        assert_eq!(ack.session_state, PbSessionState::Resolved as i32);
+
+        // Post-resolution message should fail
+        let env = Envelope {
+            macp_version: "1.0".into(),
+            mode: "macp.mode.handoff.v1".into(),
+            message_type: "HandoffOffer".into(),
+            message_id: "m4".into(),
+            session_id: "s_hand".into(),
+            sender: "owner".into(),
+            timestamp_unix_ms: Utc::now().timestamp_millis(),
+            payload: b"too late".to_vec(),
+        };
+        let ack = do_send(&server, env).await;
+        assert!(!ack.ok);
+        assert_eq!(ack.error.unwrap().code, "SESSION_NOT_OPEN");
+    }
+
+    // --- Full quorum flow through server ---
+
+    #[tokio::test]
+    async fn full_quorum_flow_through_server() {
+        let (server, _) = make_server();
+
+        // SessionStart
+        let start_payload = SessionStartPayload {
+            intent: String::new(),
+            ttl_ms: 60_000,
+            participants: vec!["alice".into(), "bob".into(), "carol".into()],
+            mode_version: String::new(),
+            configuration_version: String::new(),
+            policy_version: String::new(),
+            context: vec![],
+            roots: vec![],
+        };
+        let env = Envelope {
+            macp_version: "1.0".into(),
+            mode: "macp.mode.quorum.v1".into(),
+            message_type: "SessionStart".into(),
+            message_id: "m0".into(),
+            session_id: "s_quorum".into(),
+            sender: "coordinator".into(),
+            timestamp_unix_ms: Utc::now().timestamp_millis(),
+            payload: start_payload.encode_to_vec(),
+        };
+        let ack = do_send(&server, env).await;
+        assert!(ack.ok);
+        assert_eq!(ack.session_state, PbSessionState::Open as i32);
+
+        // ApprovalRequest from coordinator
+        let approval_req = quorum_pb::ApprovalRequestPayload {
+            request_id: "r1".into(),
+            action: "deploy".into(),
+            summary: "Deploy v2".into(),
+            details: vec![],
+            required_approvals: 2,
+        };
+        let env = Envelope {
+            macp_version: "1.0".into(),
+            mode: "macp.mode.quorum.v1".into(),
+            message_type: "ApprovalRequest".into(),
+            message_id: "m1".into(),
+            session_id: "s_quorum".into(),
+            sender: "coordinator".into(),
+            timestamp_unix_ms: Utc::now().timestamp_millis(),
+            payload: approval_req.encode_to_vec(),
+        };
+        let ack = do_send(&server, env).await;
+        assert!(ack.ok);
+        assert_eq!(ack.session_state, PbSessionState::Open as i32);
+
+        // Approve from alice
+        let approve_alice = quorum_pb::ApprovePayload {
+            request_id: "r1".into(),
+            reason: "looks good".into(),
+        };
+        let env = Envelope {
+            macp_version: "1.0".into(),
+            mode: "macp.mode.quorum.v1".into(),
+            message_type: "Approve".into(),
+            message_id: "m2".into(),
+            session_id: "s_quorum".into(),
+            sender: "alice".into(),
+            timestamp_unix_ms: Utc::now().timestamp_millis(),
+            payload: approve_alice.encode_to_vec(),
+        };
+        let ack = do_send(&server, env).await;
+        assert!(ack.ok);
+        assert_eq!(ack.session_state, PbSessionState::Open as i32);
+
+        // Approve from bob
+        let approve_bob = quorum_pb::ApprovePayload {
+            request_id: "r1".into(),
+            reason: "ready".into(),
+        };
+        let env = Envelope {
+            macp_version: "1.0".into(),
+            mode: "macp.mode.quorum.v1".into(),
+            message_type: "Approve".into(),
+            message_id: "m3".into(),
+            session_id: "s_quorum".into(),
+            sender: "bob".into(),
+            timestamp_unix_ms: Utc::now().timestamp_millis(),
+            payload: approve_bob.encode_to_vec(),
+        };
+        let ack = do_send(&server, env).await;
+        assert!(ack.ok);
+        assert_eq!(ack.session_state, PbSessionState::Open as i32);
+
+        // Commitment from coordinator (initiator)
+        let commitment = CommitmentPayload {
+            commitment_id: "c1".into(),
+            action: "quorum.approved".into(),
+            authority_scope: "commercial".into(),
+            reason: "bound".into(),
+            mode_version: "1.0.0".into(),
+            policy_version: "policy".into(),
+            configuration_version: "config".into(),
+        };
+        let env = Envelope {
+            macp_version: "1.0".into(),
+            mode: "macp.mode.quorum.v1".into(),
+            message_type: "Commitment".into(),
+            message_id: "m4".into(),
+            session_id: "s_quorum".into(),
+            sender: "coordinator".into(),
+            timestamp_unix_ms: Utc::now().timestamp_millis(),
+            payload: commitment.encode_to_vec(),
+        };
+        let ack = do_send(&server, env).await;
+        assert!(ack.ok);
+        assert_eq!(ack.session_state, PbSessionState::Resolved as i32);
+
+        // Post-resolution message should fail
+        let env = Envelope {
+            macp_version: "1.0".into(),
+            mode: "macp.mode.quorum.v1".into(),
+            message_type: "Approve".into(),
+            message_id: "m5".into(),
+            session_id: "s_quorum".into(),
+            sender: "carol".into(),
+            timestamp_unix_ms: Utc::now().timestamp_millis(),
+            payload: b"too late".to_vec(),
+        };
+        let ack = do_send(&server, env).await;
+        assert!(!ack.ok);
+        assert_eq!(ack.error.unwrap().code, "SESSION_NOT_OPEN");
     }
 }

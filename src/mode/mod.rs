@@ -1,9 +1,24 @@
 pub mod decision;
+pub mod handoff;
 pub mod multi_round;
+pub mod proposal;
+pub mod quorum;
+pub mod task;
+pub mod util;
 
 use crate::error::MacpError;
-use crate::pb::Envelope;
+use crate::pb::{Envelope, ModeDescriptor};
 use crate::session::Session;
+use std::collections::HashMap;
+
+/// The canonical standards-track modes implemented by this runtime.
+pub const STANDARD_MODE_NAMES: &[&str] = &[
+    "macp.mode.decision.v1",
+    "macp.mode.proposal.v1",
+    "macp.mode.task.v1",
+    "macp.mode.handoff.v1",
+    "macp.mode.quorum.v1",
+];
 
 /// The result of a Mode processing a message.
 /// The runtime applies this response to mutate session state.
@@ -39,4 +54,110 @@ pub trait Mode: Send + Sync {
         }
         Ok(())
     }
+}
+
+pub fn standard_mode_names() -> &'static [&'static str] {
+    STANDARD_MODE_NAMES
+}
+
+pub fn standard_mode_descriptors() -> Vec<ModeDescriptor> {
+    fn schema_map(path: &str) -> HashMap<String, String> {
+        HashMap::from([("protobuf".to_string(), path.to_string())])
+    }
+
+    vec![
+        ModeDescriptor {
+            mode: "macp.mode.decision.v1".into(),
+            mode_version: "1.0.0".into(),
+            title: "Decision Mode".into(),
+            description: "Structured decision making with proposals, evaluations, objections, votes, and a terminal Commitment.".into(),
+            determinism_class: "semantic-deterministic".into(),
+            participant_model: "declared".into(),
+            message_types: vec![
+                "SessionStart".into(),
+                "Proposal".into(),
+                "Evaluation".into(),
+                "Objection".into(),
+                "Vote".into(),
+                "Commitment".into(),
+            ],
+            terminal_message_types: vec!["Commitment".into()],
+            schema_uris: schema_map("buf.build/multiagentcoordinationprotocol/macp"),
+        },
+        ModeDescriptor {
+            mode: "macp.mode.proposal.v1".into(),
+            mode_version: "1.0.0".into(),
+            title: "Proposal Mode".into(),
+            description: "Negotiation with proposals, counterproposals, accepts, rejects, withdrawals, and a terminal Commitment.".into(),
+            determinism_class: "semantic-deterministic".into(),
+            participant_model: "peer".into(),
+            message_types: vec![
+                "SessionStart".into(),
+                "Proposal".into(),
+                "CounterProposal".into(),
+                "Accept".into(),
+                "Reject".into(),
+                "Withdraw".into(),
+                "Commitment".into(),
+            ],
+            terminal_message_types: vec!["Commitment".into()],
+            schema_uris: schema_map("buf.build/multiagentcoordinationprotocol/macp"),
+        },
+        ModeDescriptor {
+            mode: "macp.mode.task.v1".into(),
+            mode_version: "1.0.0".into(),
+            title: "Task Mode".into(),
+            description: "One bounded delegated task with assignee responses, progress, completion/failure reports, and a terminal Commitment.".into(),
+            determinism_class: "structural-only".into(),
+            participant_model: "orchestrated".into(),
+            message_types: vec![
+                "SessionStart".into(),
+                "TaskRequest".into(),
+                "TaskAccept".into(),
+                "TaskReject".into(),
+                "TaskUpdate".into(),
+                "TaskComplete".into(),
+                "TaskFail".into(),
+                "Commitment".into(),
+            ],
+            terminal_message_types: vec!["Commitment".into()],
+            schema_uris: schema_map("buf.build/multiagentcoordinationprotocol/macp"),
+        },
+        ModeDescriptor {
+            mode: "macp.mode.handoff.v1".into(),
+            mode_version: "1.0.0".into(),
+            title: "Handoff Mode".into(),
+            description: "Scoped responsibility transfer with handoff offers, context, target responses, and a terminal Commitment.".into(),
+            determinism_class: "context-frozen".into(),
+            participant_model: "delegated".into(),
+            message_types: vec![
+                "SessionStart".into(),
+                "HandoffOffer".into(),
+                "HandoffContext".into(),
+                "HandoffAccept".into(),
+                "HandoffDecline".into(),
+                "Commitment".into(),
+            ],
+            terminal_message_types: vec!["Commitment".into()],
+            schema_uris: schema_map("buf.build/multiagentcoordinationprotocol/macp"),
+        },
+        ModeDescriptor {
+            mode: "macp.mode.quorum.v1".into(),
+            mode_version: "1.0.0".into(),
+            title: "Quorum Mode".into(),
+            description: "Threshold approval with one approval request, participant ballots, and a terminal Commitment.".into(),
+            determinism_class: "semantic-deterministic".into(),
+            participant_model: "quorum".into(),
+            message_types: vec![
+                "SessionStart".into(),
+                "ApprovalRequest".into(),
+                "Approve".into(),
+                "Reject".into(),
+                "Abstain".into(),
+                "Commitment".into(),
+            ],
+            terminal_message_types: vec!["Commitment".into()],
+            schema_uris: schema_map("buf.build/multiagentcoordinationprotocol/macp"),
+        },
+    ]
 }

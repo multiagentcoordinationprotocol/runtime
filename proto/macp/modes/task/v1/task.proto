@@ -1,0 +1,49 @@
+syntax = "proto3";
+
+package macp.modes.task.v1;
+
+message TaskRequestPayload {
+  string task_id = 1;
+  string title = 2;
+  string instructions = 3;
+  string requested_assignee = 4;
+  bytes input = 5;
+  int64 deadline_unix_ms = 6;
+}
+
+message TaskAcceptPayload {
+  string task_id = 1;
+  string assignee = 2;
+  string reason = 3;
+}
+
+message TaskRejectPayload {
+  string task_id = 1;
+  string assignee = 2;
+  string reason = 3;
+}
+
+message TaskUpdatePayload {
+  string task_id = 1;
+  string status = 2;
+  double progress = 3;
+  string message = 4;
+  bytes partial_output = 5;
+}
+
+message TaskCompletePayload {
+  string task_id = 1;
+  string assignee = 2;
+  bytes output = 3;
+  string summary = 4;
+}
+
+message TaskFailPayload {
+  string task_id = 1;
+  string assignee = 2;
+  string error_code = 3;
+  string reason = 4;
+  bool retryable = 5;
+}
+
+// Task Mode terminates with macp.v1.CommitmentPayload.

@@ -31,12 +31,16 @@ This document is the authoritative specification of the Multi-Agent Coordination
 23. [Session State Machine](#session-state-machine)
 24. [Mode System](#mode-system)
 25. [Decision Mode Specification](#decision-mode-specification)
-26. [Multi-Round Mode Specification](#multi-round-mode-specification)
-27. [Validation Rules (Complete)](#validation-rules-complete)
-28. [Error Codes (Complete)](#error-codes-complete)
-29. [Transport](#transport)
-30. [Best Practices](#best-practices)
-31. [Future Extensions](#future-extensions)
+26. [Proposal Mode Specification](#proposal-mode-specification)
+27. [Task Mode Specification](#task-mode-specification)
+28. [Handoff Mode Specification](#handoff-mode-specification)
+29. [Quorum Mode Specification](#quorum-mode-specification)
+30. [Multi-Round Mode Specification](#multi-round-mode-specification)
+31. [Validation Rules (Complete)](#validation-rules-complete)
+32. [Error Codes (Complete)](#error-codes-complete)
+33. [Transport](#transport)
+34. [Best Practices](#best-practices)
+35. [Future Extensions](#future-extensions)
 
 ---
 
@@ -69,7 +73,7 @@ Without a formal protocol, different agents might format messages differently, s
 
 ## Protobuf Schema Organization
 
-The protocol is defined across three protobuf files, organized by concern:
+The protocol is defined across seven protobuf files, organized by concern:
 
 ```
 proto/
@@ -81,10 +85,22 @@ proto/
     │                                           #   capability messages, session payloads, manifests,
     │                                           #   mode descriptors, streaming types
     └── modes/
-        └── decision/
+        ├── decision/
+        │   └── v1/
+        │       └── decision.proto              # ProposalPayload, EvaluationPayload,
+        │                                       #   ObjectionPayload, VotePayload
+        ├── proposal/
+        │   └── v1/
+        │       └── proposal.proto              # Proposal mode payload types
+        ├── task/
+        │   └── v1/
+        │       └── task.proto                  # Task mode payload types
+        ├── handoff/
+        │   └── v1/
+        │       └── handoff.proto               # Handoff mode payload types
+        └── quorum/
             └── v1/
-                └── decision.proto              # ProposalPayload, EvaluationPayload,
-                                                #   ObjectionPayload, VotePayload
+                └── quorum.proto                # Quorum mode payload types
 ```
 
 **`envelope.proto`** contains the foundational types that every message touches: the `Envelope` wrapper, the `Ack` acknowledgment, the `MACPError` structured error, and the `SessionState` enum. These are imported by `core.proto`.
@@ -92,6 +108,14 @@ proto/
 **`core.proto`** contains everything else: the `MACPRuntimeService` definition with all ten RPCs, the request/response wrappers, capability negotiation messages (`ClientInfo`, `RuntimeInfo`, `Capabilities` and its sub-capabilities), session lifecycle payloads (`SessionStartPayload`, `SessionCancelPayload`, `CommitmentPayload`), introspection types (`AgentManifest`, `ModeDescriptor`), and streaming types.
 
 **`decision.proto`** contains the mode-specific payload types for the Decision Mode: `ProposalPayload`, `EvaluationPayload`, `ObjectionPayload`, and `VotePayload`. These are not referenced by the core proto — they are domain-level schemas that clients use to structure their payloads.
+
+**`proposal.proto`** contains the payload types for the Proposal Mode's peer-based propose/accept/reject lifecycle.
+
+**`task.proto`** contains the payload types for the Task Mode's orchestrated task assignment and completion tracking.
+
+**`handoff.proto`** contains the payload types for the Handoff Mode's delegated context transfer between agents.
+
+**`quorum.proto`** contains the payload types for the Quorum Mode's threshold-based voting and resolution.
 
 The `buf.yaml` file configures the Buf linter with `STANDARD` lint rules and `FILE`-level breaking-change detection, ensuring the proto schema evolves safely.
 
@@ -699,6 +723,10 @@ The runtime registers modes by name in a `HashMap`:
 | Key | Mode |
 |-----|------|
 | `"macp.mode.decision.v1"` | `DecisionMode` |
+| `"macp.mode.proposal.v1"` | `ProposalMode` |
+| `"macp.mode.task.v1"` | `TaskMode` |
+| `"macp.mode.handoff.v1"` | `HandoffMode` |
+| `"macp.mode.quorum.v1"` | `QuorumMode` |
 | `"macp.mode.multi_round.v1"` | `MultiRoundMode` |
 | `"decision"` | `DecisionMode` (alias) |
 | `"multi_round"` | `MultiRoundMode` (alias) |
@@ -878,6 +906,244 @@ Any other `Message`-type payload returns `NoOp`.
                             │ Committed │ (terminal)
                             └───────────┘
 ```
+
+---
+
+## Proposal Mode Specification
+
+The Proposal Mode (`macp.mode.proposal.v1`) implements a lightweight propose/accept/reject lifecycle for peer-to-peer coordination. Unlike the Decision Mode's formal multi-phase process, the Proposal Mode is designed for simpler scenarios where one agent proposes and peers respond with acceptance or rejection.
+
+### Participant Model: Peer
+
+All participants are equal peers. Any participant can propose, and any participant can accept or reject. There is no distinguished orchestrator role.
+
+### Determinism: Semantic-Deterministic
+
+The mode produces deterministic outcomes based on the semantic content of messages -- the same sequence of proposals and responses always produces the same resolution.
+
+### Message Types
+
+| message_type | Description | Effect |
+|-------------|-------------|--------|
+| `Propose` | Submit a proposal for peer review | Records the proposal, returns `PersistState` |
+| `Accept` | Accept the current proposal | Records acceptance; if acceptance threshold is met, returns `PersistAndResolve` |
+| `Reject` | Reject the current proposal with a reason | Records rejection, returns `PersistState` |
+
+### Lifecycle
+
+```
+Propose → Accept/Reject → ... → (all peers accept) → Resolved
+```
+
+A proposal is resolved when all declared participants have accepted it. Any rejection is recorded but does not automatically terminate the session -- a new proposal can be submitted to restart the cycle.
+
+### Payload Formats
+
+**Propose:**
+```json
+{
+  "proposal_id": "p1",
+  "content": "Suggested approach for the task",
+  "rationale": "Why this approach makes sense"
+}
+```
+
+**Accept:**
+```json
+{
+  "proposal_id": "p1",
+  "reason": "Looks good"
+}
+```
+
+**Reject:**
+```json
+{
+  "proposal_id": "p1",
+  "reason": "Does not address requirement X"
+}
+```
+
+---
+
+## Task Mode Specification
+
+The Task Mode (`macp.mode.task.v1`) implements orchestrated task assignment and completion tracking. An orchestrator assigns tasks to agents, and agents report progress and completion.
+
+### Participant Model: Orchestrated
+
+A single orchestrator creates and assigns tasks. Assigned agents execute tasks and report back. The orchestrator controls the lifecycle.
+
+### Determinism: Structural-Only
+
+The mode enforces structural invariants (task states, assignment rules) but does not interpret the semantic content of task payloads. Two different task contents that follow the same structural flow produce structurally equivalent state transitions.
+
+### Message Types
+
+| message_type | Description | Effect |
+|-------------|-------------|--------|
+| `Assign` | Orchestrator assigns a task to an agent | Records the task assignment, returns `PersistState` |
+| `Progress` | Agent reports progress on an assigned task | Updates task progress, returns `PersistState` |
+| `Complete` | Agent marks a task as complete | Records completion; if all tasks are complete, returns `PersistAndResolve` |
+| `Cancel` | Orchestrator cancels a task | Marks the task as cancelled, returns `PersistState` |
+
+### Lifecycle
+
+```
+Assign → Progress (optional, repeatable) → Complete/Cancel
+```
+
+The session resolves when all assigned tasks reach a terminal state (completed or cancelled).
+
+### Payload Formats
+
+**Assign:**
+```json
+{
+  "task_id": "t1",
+  "assignee": "agent-beta",
+  "description": "Run integration tests on staging",
+  "priority": "high"
+}
+```
+
+**Progress:**
+```json
+{
+  "task_id": "t1",
+  "status": "running",
+  "percent_complete": 60,
+  "details": "Tests 120/200 passed so far"
+}
+```
+
+**Complete:**
+```json
+{
+  "task_id": "t1",
+  "result": "All 200 tests passed",
+  "artifacts": ""
+}
+```
+
+**Cancel:**
+```json
+{
+  "task_id": "t1",
+  "reason": "Superseded by new requirements"
+}
+```
+
+---
+
+## Handoff Mode Specification
+
+The Handoff Mode (`macp.mode.handoff.v1`) implements delegated context transfer between agents. One agent hands off responsibility (and context) to another agent, with the context frozen at the point of transfer.
+
+### Participant Model: Delegated
+
+A delegating agent initiates the handoff and a receiving agent accepts it. The context is frozen at transfer time -- no further modifications to the handed-off context are permitted.
+
+### Determinism: Context-Frozen
+
+Once a handoff is initiated, the context payload is immutable. The receiving agent can acknowledge or reject the handoff, but cannot modify the transferred context.
+
+### Message Types
+
+| message_type | Description | Effect |
+|-------------|-------------|--------|
+| `Initiate` | Delegating agent initiates a handoff with context | Records the handoff context, returns `PersistState` |
+| `Acknowledge` | Receiving agent acknowledges the handoff | Records acknowledgment; resolves the session with the frozen context as resolution, returns `PersistAndResolve` |
+| `Reject` | Receiving agent rejects the handoff | Records rejection with reason, returns `PersistState` |
+
+### Lifecycle
+
+```
+Initiate → Acknowledge (resolved) or Reject
+```
+
+A handoff session resolves when the receiving agent acknowledges the transfer. If rejected, the delegating agent may initiate a new handoff (to the same or different agent) within the same session.
+
+### Payload Formats
+
+**Initiate:**
+```json
+{
+  "handoff_id": "h1",
+  "from": "agent-alpha",
+  "to": "agent-beta",
+  "context": "<serialized context data>",
+  "reason": "Transferring ownership of the deployment pipeline"
+}
+```
+
+**Acknowledge:**
+```json
+{
+  "handoff_id": "h1",
+  "accepted_by": "agent-beta",
+  "notes": "Ready to take over"
+}
+```
+
+**Reject:**
+```json
+{
+  "handoff_id": "h1",
+  "rejected_by": "agent-beta",
+  "reason": "Not authorized for this resource"
+}
+```
+
+---
+
+## Quorum Mode Specification
+
+The Quorum Mode (`macp.mode.quorum.v1`) implements threshold-based voting where resolution requires a configurable quorum of participants to agree. Unlike the Decision Mode's full lifecycle, the Quorum Mode focuses purely on reaching a voting threshold.
+
+### Participant Model: Quorum
+
+All declared participants can vote. Resolution occurs when the number of agreeing votes meets or exceeds the configured quorum threshold.
+
+### Determinism: Semantic-Deterministic
+
+The mode produces deterministic outcomes based on the votes cast -- the same set of votes always produces the same resolution.
+
+### Message Types
+
+| message_type | Description | Effect |
+|-------------|-------------|--------|
+| `Vote` | Cast a vote (approve/reject) | Records the vote; if quorum is reached, returns `PersistAndResolve` |
+| `Abstain` | Explicitly abstain from voting | Records abstention (does not count toward quorum), returns `PersistState` |
+
+### Lifecycle
+
+```
+Vote/Abstain → ... → (quorum reached) → Resolved
+```
+
+The session resolves when the number of `approve` votes meets or exceeds the quorum threshold. The quorum threshold is configured in the session start payload. If not specified, it defaults to a simple majority (more than half of declared participants).
+
+### Payload Formats
+
+**Vote:**
+```json
+{
+  "vote": "approve",
+  "reason": "Implementation meets all acceptance criteria"
+}
+```
+
+**Abstain:**
+```json
+{
+  "reason": "Conflict of interest"
+}
+```
+
+### Quorum Configuration
+
+The quorum threshold is set via the session start payload's configuration. For example, a session with 5 participants and a quorum of 3 resolves as soon as 3 participants vote `approve`.
 
 ---
 

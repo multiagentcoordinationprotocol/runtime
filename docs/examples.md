@@ -18,8 +18,12 @@ This document provides step-by-step examples of using the MACP Runtime v0.3. It 
 10. [Example 9: Signal Messages](#example-9-signal-messages)
 11. [Example 10: Session with Custom TTL](#example-10-session-with-custom-ttl)
 12. [Example 11: Multi-Agent Scenario](#example-11-multi-agent-scenario)
-13. [Common Patterns](#common-patterns)
-14. [Common Questions](#common-questions)
+13. [Example 12: Proposal Mode — Peer Coordination](#example-12-proposal-mode--peer-coordination)
+14. [Example 13: Task Mode — Orchestrated Task Tracking](#example-13-task-mode--orchestrated-task-tracking)
+15. [Example 14: Handoff Mode — Context Transfer](#example-14-handoff-mode--context-transfer)
+16. [Example 15: Quorum Mode — Threshold Voting](#example-15-quorum-mode--threshold-voting)
+17. [Common Patterns](#common-patterns)
+18. [Common Questions](#common-questions)
 
 ---
 
@@ -55,6 +59,26 @@ cargo run --bin fuzz_client
 **Terminal 2** — Multi-round convergence:
 ```bash
 cargo run --bin multi_round_client
+```
+
+**Terminal 2** — Proposal mode:
+```bash
+cargo run --bin proposal_client
+```
+
+**Terminal 2** — Task mode:
+```bash
+cargo run --bin task_client
+```
+
+**Terminal 2** — Handoff mode:
+```bash
+cargo run --bin handoff_client
+```
+
+**Terminal 2** — Quorum mode:
+```bash
+cargo run --bin quorum_client
 ```
 
 ---
@@ -962,6 +986,340 @@ The session is now `Resolved` with the commitment as the resolution.
 
 ---
 
+## Example 12: Proposal Mode — Peer Coordination
+
+The Proposal Mode (`macp.mode.proposal.v1`) provides a lightweight peer-based coordination lifecycle. Run the demo:
+
+```bash
+cargo run --bin proposal_client
+```
+
+### Step 1: Create a Proposal Session
+
+```rust
+let start = Envelope {
+    macp_version: "1.0".into(),
+    mode: "macp.mode.proposal.v1".into(),
+    message_type: "SessionStart".into(),
+    message_id: "m0".into(),
+    session_id: "proposal-001".into(),
+    sender: "coordinator".into(),
+    timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
+    payload: SessionStartPayload {
+        intent: "Peer review of API design".into(),
+        participants: vec!["alice".into(), "bob".into()],
+        ttl_ms: 60000,
+        ..Default::default()
+    }.encode_to_vec(),
+};
+```
+
+### Step 2: Alice Proposes
+
+```rust
+let propose = Envelope {
+    macp_version: "1.0".into(),
+    mode: "macp.mode.proposal.v1".into(),
+    message_type: "Propose".into(),
+    message_id: "m1".into(),
+    session_id: "proposal-001".into(),
+    sender: "alice".into(),
+    timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
+    payload: serde_json::to_vec(&serde_json::json!({
+        "proposal_id": "p1",
+        "content": "Use REST with OpenAPI 3.1",
+        "rationale": "Better tooling ecosystem"
+    })).unwrap(),
+};
+```
+
+### Step 3: Bob Accepts
+
+```rust
+let accept = Envelope {
+    // ...
+    message_type: "Accept".into(),
+    sender: "bob".into(),
+    payload: serde_json::to_vec(&serde_json::json!({
+        "proposal_id": "p1",
+        "reason": "Agreed, REST is the right choice"
+    })).unwrap(),
+    // ...
+};
+```
+
+When all declared participants have accepted, the session resolves automatically.
+
+### Step 3 (Alternative): Bob Rejects
+
+```rust
+let reject = Envelope {
+    // ...
+    message_type: "Reject".into(),
+    sender: "bob".into(),
+    payload: serde_json::to_vec(&serde_json::json!({
+        "proposal_id": "p1",
+        "reason": "Prefer gRPC for internal services"
+    })).unwrap(),
+    // ...
+};
+```
+
+A rejection is recorded but does not terminate the session. Alice can submit a new proposal to try again.
+
+---
+
+## Example 13: Task Mode — Orchestrated Task Tracking
+
+The Task Mode (`macp.mode.task.v1`) provides orchestrator-driven task assignment and tracking. Run the demo:
+
+```bash
+cargo run --bin task_client
+```
+
+### Step 1: Create a Task Session
+
+```rust
+let start = Envelope {
+    macp_version: "1.0".into(),
+    mode: "macp.mode.task.v1".into(),
+    message_type: "SessionStart".into(),
+    message_id: "m0".into(),
+    session_id: "task-001".into(),
+    sender: "orchestrator".into(),
+    timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
+    payload: SessionStartPayload {
+        intent: "Deploy v3.0 to production".into(),
+        participants: vec!["orchestrator".into(), "builder".into(), "tester".into()],
+        ttl_ms: 300000,
+        ..Default::default()
+    }.encode_to_vec(),
+};
+```
+
+### Step 2: Orchestrator Assigns Tasks
+
+```rust
+let assign = Envelope {
+    macp_version: "1.0".into(),
+    mode: "macp.mode.task.v1".into(),
+    message_type: "Assign".into(),
+    message_id: "m1".into(),
+    session_id: "task-001".into(),
+    sender: "orchestrator".into(),
+    timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
+    payload: serde_json::to_vec(&serde_json::json!({
+        "task_id": "t1",
+        "assignee": "builder",
+        "description": "Build release artifacts",
+        "priority": "high"
+    })).unwrap(),
+};
+```
+
+### Step 3: Agent Reports Progress
+
+```rust
+let progress = Envelope {
+    // ...
+    message_type: "Progress".into(),
+    sender: "builder".into(),
+    payload: serde_json::to_vec(&serde_json::json!({
+        "task_id": "t1",
+        "status": "running",
+        "percent_complete": 75,
+        "details": "Compiling release binaries"
+    })).unwrap(),
+    // ...
+};
+```
+
+### Step 4: Agent Completes Task
+
+```rust
+let complete = Envelope {
+    // ...
+    message_type: "Complete".into(),
+    sender: "builder".into(),
+    payload: serde_json::to_vec(&serde_json::json!({
+        "task_id": "t1",
+        "result": "Build artifacts uploaded to S3",
+        "artifacts": "s3://releases/v3.0/"
+    })).unwrap(),
+    // ...
+};
+```
+
+When all assigned tasks reach a terminal state (completed or cancelled), the session resolves.
+
+---
+
+## Example 14: Handoff Mode — Context Transfer
+
+The Handoff Mode (`macp.mode.handoff.v1`) enables delegated context transfer between agents. Run the demo:
+
+```bash
+cargo run --bin handoff_client
+```
+
+### Step 1: Create a Handoff Session
+
+```rust
+let start = Envelope {
+    macp_version: "1.0".into(),
+    mode: "macp.mode.handoff.v1".into(),
+    message_type: "SessionStart".into(),
+    message_id: "m0".into(),
+    session_id: "handoff-001".into(),
+    sender: "agent-alpha".into(),
+    timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
+    payload: SessionStartPayload {
+        intent: "Transfer deployment ownership".into(),
+        participants: vec!["agent-alpha".into(), "agent-beta".into()],
+        ttl_ms: 60000,
+        ..Default::default()
+    }.encode_to_vec(),
+};
+```
+
+### Step 2: Initiate the Handoff
+
+```rust
+let initiate = Envelope {
+    macp_version: "1.0".into(),
+    mode: "macp.mode.handoff.v1".into(),
+    message_type: "Initiate".into(),
+    message_id: "m1".into(),
+    session_id: "handoff-001".into(),
+    sender: "agent-alpha".into(),
+    timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
+    payload: serde_json::to_vec(&serde_json::json!({
+        "handoff_id": "h1",
+        "from": "agent-alpha",
+        "to": "agent-beta",
+        "context": "{\"pipeline_id\": \"deploy-v3\", \"environment\": \"production\"}",
+        "reason": "Shift change — transferring deployment ownership"
+    })).unwrap(),
+};
+```
+
+The context is frozen at this point and cannot be modified.
+
+### Step 3: Receiving Agent Acknowledges
+
+```rust
+let ack = Envelope {
+    // ...
+    message_type: "Acknowledge".into(),
+    sender: "agent-beta".into(),
+    payload: serde_json::to_vec(&serde_json::json!({
+        "handoff_id": "h1",
+        "accepted_by": "agent-beta",
+        "notes": "Ready to take over deployment pipeline"
+    })).unwrap(),
+    // ...
+};
+```
+
+The session resolves with the frozen context as the resolution payload.
+
+### Step 3 (Alternative): Receiving Agent Rejects
+
+```rust
+let reject = Envelope {
+    // ...
+    message_type: "Reject".into(),
+    sender: "agent-beta".into(),
+    payload: serde_json::to_vec(&serde_json::json!({
+        "handoff_id": "h1",
+        "rejected_by": "agent-beta",
+        "reason": "Not authorized for production deployments"
+    })).unwrap(),
+    // ...
+};
+```
+
+After rejection, the delegating agent may initiate a new handoff within the same session.
+
+---
+
+## Example 15: Quorum Mode — Threshold Voting
+
+The Quorum Mode (`macp.mode.quorum.v1`) implements threshold-based voting. Run the demo:
+
+```bash
+cargo run --bin quorum_client
+```
+
+### Step 1: Create a Quorum Session
+
+```rust
+let start = Envelope {
+    macp_version: "1.0".into(),
+    mode: "macp.mode.quorum.v1".into(),
+    message_type: "SessionStart".into(),
+    message_id: "m0".into(),
+    session_id: "quorum-001".into(),
+    sender: "coordinator".into(),
+    timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
+    payload: SessionStartPayload {
+        intent: "Vote on release approval".into(),
+        participants: vec![
+            "alice".into(), "bob".into(), "charlie".into(),
+            "diana".into(), "eve".into(),
+        ],
+        ttl_ms: 120000,
+        ..Default::default()
+    }.encode_to_vec(),
+};
+```
+
+With 5 participants, the default quorum threshold is a simple majority (3 approvals needed).
+
+### Step 2: Participants Vote
+
+```rust
+let vote = Envelope {
+    macp_version: "1.0".into(),
+    mode: "macp.mode.quorum.v1".into(),
+    message_type: "Vote".into(),
+    message_id: "m1".into(),
+    session_id: "quorum-001".into(),
+    sender: "alice".into(),
+    timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
+    payload: serde_json::to_vec(&serde_json::json!({
+        "vote": "approve",
+        "reason": "All acceptance criteria met"
+    })).unwrap(),
+};
+```
+
+### Step 3: A Participant Abstains
+
+```rust
+let abstain = Envelope {
+    // ...
+    message_type: "Abstain".into(),
+    sender: "charlie".into(),
+    payload: serde_json::to_vec(&serde_json::json!({
+        "reason": "Conflict of interest"
+    })).unwrap(),
+    // ...
+};
+```
+
+Abstentions are recorded but do not count toward the quorum threshold.
+
+### Step 4: Quorum Reached
+
+When enough `approve` votes are cast to meet the threshold (e.g., 3 out of 5 participants approve), the session automatically resolves with the voting results as the resolution payload.
+
+```
+alice: approve → bob: approve → diana: approve → RESOLVED (3/5 quorum met)
+```
+
+---
+
 ## Common Patterns
 
 ### Pattern 1: Structured Error Handling
@@ -1062,6 +1420,26 @@ let vote = create_envelope("decision", "Vote", "s1", "alice",
         "proposal_id": "p1", "vote": "approve", "reason": "LGTM"
     })).unwrap()
 );
+let propose = create_envelope("proposal", "Propose", "p1", "alice",
+    &serde_json::to_vec(&serde_json::json!({
+        "proposal_id": "p1", "content": "Use REST", "rationale": "Better tooling"
+    })).unwrap()
+);
+let assign = create_envelope("task", "Assign", "t1", "orchestrator",
+    &serde_json::to_vec(&serde_json::json!({
+        "task_id": "t1", "assignee": "bob", "description": "Build it", "priority": "high"
+    })).unwrap()
+);
+let initiate = create_envelope("handoff", "Initiate", "h1", "alpha",
+    &serde_json::to_vec(&serde_json::json!({
+        "handoff_id": "h1", "from": "alpha", "to": "beta", "context": "{}", "reason": "shift change"
+    })).unwrap()
+);
+let quorum_vote = create_envelope("quorum", "Vote", "q1", "alice",
+    &serde_json::to_vec(&serde_json::json!({
+        "vote": "approve", "reason": "LGTM"
+    })).unwrap()
+);
 let contribute = create_envelope("multi_round", "Contribute", "mr1", "alice",
     br#"{"value":"option_a"}"#
 );
@@ -1113,11 +1491,15 @@ let contribute = create_envelope("multi_round", "Contribute", "mr1", "alice",
 
 ### Q: What modes are available?
 
-**A:** Two modes:
-- `macp.mode.decision.v1` (alias: `decision`) — RFC lifecycle with Proposal/Evaluation/Objection/Vote/Commitment.
-- `macp.mode.multi_round.v1` (alias: `multi_round`) — Participant-based convergence.
+**A:** Five standard modes plus one experimental:
+- `macp.mode.decision.v1` (alias: `decision`) — RFC lifecycle with Proposal/Evaluation/Objection/Vote/Commitment. Declared participant model, semantic-deterministic.
+- `macp.mode.proposal.v1` (alias: `proposal`) — Lightweight peer propose/accept/reject. Peer participant model, semantic-deterministic.
+- `macp.mode.task.v1` (alias: `task`) — Orchestrated task assignment and completion. Orchestrated participant model, structural-only.
+- `macp.mode.handoff.v1` (alias: `handoff`) — Delegated context transfer between agents. Delegated participant model, context-frozen.
+- `macp.mode.quorum.v1` (alias: `quorum`) — Threshold-based voting. Quorum participant model, semantic-deterministic.
+- `macp.mode.multi_round.v1` (alias: `multi_round`) — Participant-based convergence (experimental, not on discovery surfaces).
 
-Use `ListModes` to discover them at runtime.
+Use `ListModes` to discover standard modes at runtime.
 
 ### Q: How do Signal messages work?
 
@@ -1135,9 +1517,13 @@ Now that you've seen examples, you can:
 
 1. **Build your own client** — in Python, JavaScript, Go, or any language with a gRPC client. Use the `.proto` files to generate client code.
 2. **Explore the Decision Mode lifecycle** — try building a multi-agent voting system.
-3. **Implement convergence scenarios** — use Multi-Round Mode for consensus-building.
-4. **Extend the protocol** — add new modes by implementing the `Mode` trait.
-5. **Integrate with your agent framework** — use the `Initialize` and `ListModes` RPCs for dynamic discovery.
+3. **Use Proposal Mode** — for lightweight peer-to-peer coordination.
+4. **Use Task Mode** — for orchestrator-driven workflows with task assignment and tracking.
+5. **Use Handoff Mode** — for delegating context between agents with frozen-context semantics.
+6. **Use Quorum Mode** — for threshold-based voting and approval workflows.
+7. **Implement convergence scenarios** — use Multi-Round Mode for consensus-building.
+8. **Extend the protocol** — add new modes by implementing the `Mode` trait.
+9. **Integrate with your agent framework** — use the `Initialize` and `ListModes` RPCs for dynamic discovery.
 
 For deeper understanding:
 - Read **[architecture.md](./architecture.md)** to see how it's implemented internally.
