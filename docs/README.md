@@ -70,6 +70,8 @@ By default the runtime persists snapshots under `.macp-data/`:
 - `sessions.json`
 - `logs.json`
 
+If a snapshot file contains corrupt or incompatible JSON, the runtime logs a warning to stderr and starts with empty state.
+
 Disable persistence with:
 
 ```bash

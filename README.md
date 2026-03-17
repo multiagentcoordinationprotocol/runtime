@@ -74,7 +74,7 @@ When dev header mode is enabled, clients can set `x-macp-agent-id` metadata inst
 
 ### Persistence
 
-Unless `MACP_MEMORY_ONLY=1` is set, the runtime persists session and log snapshots under `MACP_DATA_DIR` (default: `.macp-data`).
+Unless `MACP_MEMORY_ONLY=1` is set, the runtime persists session and log snapshots under `MACP_DATA_DIR` (default: `.macp-data`). If a persistence file contains corrupt or incompatible JSON on startup, the runtime logs a warning to stderr and starts with empty state rather than failing.
 
 ## Configuration
 

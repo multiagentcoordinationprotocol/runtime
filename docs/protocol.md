@@ -72,7 +72,7 @@ By default the runtime persists snapshots of:
 - session registry
 - accepted-history log store
 
-This gives restart recovery for session metadata, dedup state, and accepted-history inspection.
+This gives restart recovery for session metadata, dedup state, and accepted-history inspection. Corrupt or incompatible snapshot files produce a warning on stderr; the runtime falls back to empty state instead of refusing to start.
 
 ## Commitment validation
 

@@ -58,6 +58,8 @@ Supports:
 - in-memory mode
 - file-backed snapshot persistence
 
+Both stores log a warning and fall back to empty state if snapshot deserialization fails.
+
 ### Log store (`src/log_store.rs`)
 
 Stores:
