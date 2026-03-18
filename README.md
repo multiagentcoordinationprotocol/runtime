@@ -25,9 +25,9 @@ This runtime implements the current MACP core/service surface, the five standard
   - payload size limits
   - rate limiting
 - **Durable local persistence**
-  - session registry snapshots
-  - accepted-history log snapshots
-  - dedup state survives restart
+  - per-session append-only log files and session snapshots via `FileBackend`
+  - crash recovery with dedup state reconciliation
+  - atomic writes (tmp file + rename) prevent partial-write corruption
 - **Unary freeze profile**
   - `StreamSession` is intentionally disabled in this profile
   - `WatchModeRegistry` and `WatchRoots` remain unimplemented
@@ -192,7 +192,8 @@ runtime/
 │   ├── security.rs       # auth config, sender derivation, rate limiting
 │   ├── session.rs        # canonical SessionStart validation and session model
 │   ├── registry.rs       # session store with optional persistence
-│   ├── log_store.rs      # accepted-history log store with optional persistence
+│   ├── log_store.rs      # in-memory accepted-history log cache
+│   ├── storage.rs        # storage backend trait, FileBackend persistence, crash recovery
 │   ├── mode/             # mode implementations
 │   └── bin/              # local development example clients
 ├── docs/

@@ -81,6 +81,13 @@ impl Mode for HandoffMode {
         if session.participants.len() < 2 {
             return Err(MacpError::InvalidPayload);
         }
+        if !session
+            .participants
+            .iter()
+            .any(|p| p == &session.initiator_sender)
+        {
+            return Err(MacpError::InvalidPayload);
+        }
         Ok(ModeResponse::PersistState(Self::encode_state(
             &HandoffState::default(),
         )))
@@ -214,6 +221,7 @@ mod tests {
             session_id: "s1".into(),
             state: SessionState::Open,
             ttl_expiry: i64::MAX,
+            ttl_ms: 60_000,
             started_at_unix_ms: 0,
             resolution: None,
             mode: "macp.mode.handoff.v1".into(),
@@ -324,6 +332,17 @@ mod tests {
         let mode = HandoffMode;
         let mut session = base_session();
         session.participants = vec!["owner".into()]; // only 1
+        let err = mode
+            .on_session_start(&session, &env("owner", "SessionStart", vec![]))
+            .unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
+    }
+
+    #[test]
+    fn session_start_rejects_when_initiator_not_participant() {
+        let mode = HandoffMode;
+        let mut session = base_session();
+        session.participants = vec!["target".into(), "other".into()]; // owner not included
         let err = mode
             .on_session_start(&session, &env("owner", "SessionStart", vec![]))
             .unwrap_err();

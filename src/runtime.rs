@@ -17,6 +17,7 @@ use crate::session::{
     extract_ttl_ms, is_standard_mode, parse_session_start_payload,
     validate_standard_session_start_payload, Session, SessionState,
 };
+use crate::storage::StorageBackend;
 
 const EXPERIMENTAL_DEFAULT_TTL_MS: i64 = 60_000;
 
@@ -27,13 +28,18 @@ pub struct ProcessResult {
 }
 
 pub struct Runtime {
+    pub storage: Arc<dyn StorageBackend>,
     pub registry: Arc<SessionRegistry>,
     pub log_store: Arc<LogStore>,
     modes: HashMap<String, Box<dyn Mode>>,
 }
 
 impl Runtime {
-    pub fn new(registry: Arc<SessionRegistry>, log_store: Arc<LogStore>) -> Self {
+    pub fn new(
+        storage: Arc<dyn StorageBackend>,
+        registry: Arc<SessionRegistry>,
+        log_store: Arc<LogStore>,
+    ) -> Self {
         let mut modes: HashMap<String, Box<dyn Mode>> = HashMap::new();
         modes.insert("macp.mode.decision.v1".into(), Box::new(DecisionMode));
         modes.insert("macp.mode.proposal.v1".into(), Box::new(ProposalMode));
@@ -43,6 +49,7 @@ impl Runtime {
         modes.insert("macp.mode.multi_round.v1".into(), Box::new(MultiRoundMode));
 
         Self {
+            storage,
             registry,
             log_store,
             modes,
@@ -95,33 +102,46 @@ impl Runtime {
         }
     }
 
-    async fn persist_sessions(&self, sessions: &HashMap<String, Session>) {
-        if let Err(err) = self.registry.persist_locked(sessions).await {
-            eprintln!("warning: failed to persist session registry: {err}");
+    async fn save_session_to_storage(&self, session: &Session) {
+        if let Err(err) = self.storage.save_session(session).await {
+            eprintln!(
+                "warning: failed to persist session '{}': {err}",
+                session.session_id
+            );
         }
     }
 
     async fn maybe_expire_session(&self, session_id: &str, session: &mut Session) -> bool {
         let now = Utc::now().timestamp_millis();
         if session.state == SessionState::Open && now > session.ttl_expiry {
-            self.log_store
-                .append(session_id, Self::make_internal_entry("TtlExpired", b""))
-                .await;
+            let entry = Self::make_internal_entry("TtlExpired", b"");
+            if let Err(e) = self.storage.append_log_entry(session_id, &entry).await {
+                eprintln!("warning: failed to persist TTL expiry log for '{session_id}': {e}");
+            }
+            self.log_store.append(session_id, entry).await;
             session.state = SessionState::Expired;
             return true;
         }
         false
     }
 
-    pub async fn process(&self, env: &Envelope) -> Result<ProcessResult, MacpError> {
+    pub async fn process(
+        &self,
+        env: &Envelope,
+        max_open_sessions: Option<usize>,
+    ) -> Result<ProcessResult, MacpError> {
         match env.message_type.as_str() {
-            "SessionStart" => self.process_session_start(env).await,
+            "SessionStart" => self.process_session_start(env, max_open_sessions).await,
             "Signal" => self.process_signal(env).await,
             _ => self.process_message(env).await,
         }
     }
 
-    async fn process_session_start(&self, env: &Envelope) -> Result<ProcessResult, MacpError> {
+    async fn process_session_start(
+        &self,
+        env: &Envelope,
+        max_open_sessions: Option<usize>,
+    ) -> Result<ProcessResult, MacpError> {
         if env.mode.trim().is_empty() {
             return Err(MacpError::InvalidEnvelope);
         }
@@ -153,12 +173,31 @@ impl Runtime {
             return Err(MacpError::DuplicateSession);
         }
 
+        // Enforce max_open_sessions atomically under the write lock to
+        // prevent TOCTOU races where concurrent SessionStart requests
+        // both pass a read-lock count check before either is inserted.
+        if let Some(max_open) = max_open_sessions {
+            let now = Utc::now().timestamp_millis();
+            let count = guard
+                .values()
+                .filter(|s| {
+                    s.initiator_sender == env.sender
+                        && s.state == SessionState::Open
+                        && now <= s.ttl_expiry
+                })
+                .count();
+            if count >= max_open {
+                return Err(MacpError::RateLimited);
+            }
+        }
+
         let accepted_at = Utc::now().timestamp_millis();
         let ttl_expiry = accepted_at.saturating_add(ttl_ms);
         let session = Session {
             session_id: env.session_id.clone(),
             state: SessionState::Open,
             ttl_expiry,
+            ttl_ms,
             started_at_unix_ms: accepted_at,
             resolution: None,
             mode: mode_name.to_string(),
@@ -176,10 +215,28 @@ impl Runtime {
 
         let response = mode.on_session_start(&session, env)?;
 
+        // 1. Create storage directory and write log entry (COMMIT POINT)
+        if let Err(e) = self.storage.create_session_storage(&env.session_id).await {
+            eprintln!(
+                "warning: failed to create session storage for '{}': {e}",
+                env.session_id
+            );
+        }
+        let incoming_entry = Self::make_incoming_entry(env);
+        if let Err(e) = self
+            .storage
+            .append_log_entry(&env.session_id, &incoming_entry)
+            .await
+        {
+            eprintln!(
+                "warning: failed to persist log entry for '{}': {e}",
+                env.session_id
+            );
+        }
+
+        // 2. Update in-memory caches
         self.log_store.create_session_log(&env.session_id).await;
-        self.log_store
-            .append(&env.session_id, Self::make_incoming_entry(env))
-            .await;
+        self.log_store.append(&env.session_id, incoming_entry).await;
 
         let mut session = session;
         session.seen_message_ids.insert(env.message_id.clone());
@@ -199,8 +256,9 @@ impl Runtime {
         }
 
         let result_state = session.state.clone();
+        // 3. Best-effort session save
+        self.save_session_to_storage(&session).await;
         guard.insert(env.session_id.clone(), session);
-        self.persist_sessions(&guard).await;
 
         Ok(ProcessResult {
             session_state: result_state,
@@ -221,8 +279,15 @@ impl Runtime {
             });
         }
 
+        // Validate that the envelope mode matches the session's bound mode.
+        // This prevents a token scoped to mode X from sending messages into
+        // a session bound to mode Y (server.rs authorizes against env.mode).
+        if env.mode != session.mode {
+            return Err(MacpError::InvalidEnvelope);
+        }
+
         if self.maybe_expire_session(&env.session_id, session).await {
-            self.persist_sessions(&guard).await;
+            self.save_session_to_storage(session).await;
             return Err(MacpError::TtlExpired);
         }
 
@@ -237,13 +302,27 @@ impl Runtime {
         mode.authorize_sender(session, env)?;
         let response = mode.on_message(session, env)?;
 
+        // 1. COMMIT POINT: write log entry to disk
+        let incoming_entry = Self::make_incoming_entry(env);
+        if let Err(e) = self
+            .storage
+            .append_log_entry(&env.session_id, &incoming_entry)
+            .await
+        {
+            eprintln!(
+                "warning: failed to persist log entry for '{}': {e}",
+                env.session_id
+            );
+        }
+
+        // 2. Update in-memory state
+        self.log_store.append(&env.session_id, incoming_entry).await;
         session.seen_message_ids.insert(env.message_id.clone());
-        self.log_store
-            .append(&env.session_id, Self::make_incoming_entry(env))
-            .await;
         Self::apply_mode_response(session, response);
         let result_state = session.state.clone();
-        self.persist_sessions(&guard).await;
+
+        // 3. Best-effort session save
+        self.save_session_to_storage(session).await;
 
         Ok(ProcessResult {
             session_state: result_state,
@@ -270,7 +349,9 @@ impl Runtime {
             return None;
         };
         if changed {
-            self.persist_sessions(&guard).await;
+            if let Some(session) = guard.get(session_id) {
+                self.save_session_to_storage(session).await;
+            }
         }
         guard.get(session_id).cloned()
     }
@@ -287,21 +368,24 @@ impl Runtime {
 
         if session.state == SessionState::Resolved || session.state == SessionState::Expired {
             let result_state = session.state.clone();
-            self.persist_sessions(&guard).await;
+            self.save_session_to_storage(session).await;
             return Ok(ProcessResult {
                 session_state: result_state,
                 duplicate: false,
             });
         }
 
-        self.log_store
-            .append(
-                session_id,
-                Self::make_internal_entry("SessionCancel", reason.as_bytes()),
-            )
-            .await;
+        let cancel_entry = Self::make_internal_entry("SessionCancel", reason.as_bytes());
+        if let Err(e) = self
+            .storage
+            .append_log_entry(session_id, &cancel_entry)
+            .await
+        {
+            eprintln!("warning: failed to persist cancel log for '{session_id}': {e}");
+        }
+        self.log_store.append(session_id, cancel_entry).await;
         session.state = SessionState::Expired;
-        self.persist_sessions(&guard).await;
+        self.save_session_to_storage(session).await;
 
         Ok(ProcessResult {
             session_state: SessionState::Expired,
@@ -318,9 +402,10 @@ mod tests {
     use prost::Message;
 
     fn make_runtime() -> Runtime {
+        let storage: Arc<dyn StorageBackend> = Arc::new(crate::storage::MemoryBackend);
         let registry = Arc::new(SessionRegistry::new());
         let log_store = Arc::new(LogStore::new());
-        Runtime::new(registry, log_store)
+        Runtime::new(storage, registry, log_store)
     }
 
     fn session_start(participants: Vec<String>) -> Vec<u8> {
@@ -366,14 +451,17 @@ mod tests {
         }
         .encode_to_vec();
         let err = rt
-            .process(&env(
-                "macp.mode.decision.v1",
-                "SessionStart",
-                "m1",
-                "s1",
-                "agent://orchestrator",
-                bad,
-            ))
+            .process(
+                &env(
+                    "macp.mode.decision.v1",
+                    "SessionStart",
+                    "m1",
+                    "s1",
+                    "agent://orchestrator",
+                    bad,
+                ),
+                None,
+            )
             .await
             .unwrap_err();
         assert!(matches!(
@@ -386,14 +474,17 @@ mod tests {
     async fn empty_mode_is_rejected() {
         let rt = make_runtime();
         let err = rt
-            .process(&env(
-                "",
-                "SessionStart",
-                "m1",
-                "s1",
-                "agent://orchestrator",
-                session_start(vec!["agent://fraud".into()]),
-            ))
+            .process(
+                &env(
+                    "",
+                    "SessionStart",
+                    "m1",
+                    "s1",
+                    "agent://orchestrator",
+                    session_start(vec!["agent://fraud".into()]),
+                ),
+                None,
+            )
             .await
             .unwrap_err();
         assert_eq!(err.to_string(), "InvalidEnvelope");
@@ -402,26 +493,32 @@ mod tests {
     #[tokio::test]
     async fn rejected_messages_do_not_enter_dedup_state() {
         let rt = make_runtime();
-        rt.process(&env(
-            "macp.mode.decision.v1",
-            "SessionStart",
-            "m1",
-            "s1",
-            "agent://orchestrator",
-            session_start(vec!["agent://fraud".into()]),
-        ))
+        rt.process(
+            &env(
+                "macp.mode.decision.v1",
+                "SessionStart",
+                "m1",
+                "s1",
+                "agent://orchestrator",
+                session_start(vec!["agent://fraud".into()]),
+            ),
+            None,
+        )
         .await
         .unwrap();
 
         let bad = rt
-            .process(&env(
-                "macp.mode.decision.v1",
-                "Proposal",
-                "m2",
-                "s1",
-                "agent://fraud",
-                b"not-protobuf".to_vec(),
-            ))
+            .process(
+                &env(
+                    "macp.mode.decision.v1",
+                    "Proposal",
+                    "m2",
+                    "s1",
+                    "agent://fraud",
+                    b"not-protobuf".to_vec(),
+                ),
+                None,
+            )
             .await
             .unwrap_err();
         assert_eq!(bad.to_string(), "InvalidPayload");
@@ -434,14 +531,17 @@ mod tests {
         }
         .encode_to_vec();
         let result = rt
-            .process(&env(
-                "macp.mode.decision.v1",
-                "Proposal",
-                "m2",
-                "s1",
-                "agent://orchestrator",
-                good,
-            ))
+            .process(
+                &env(
+                    "macp.mode.decision.v1",
+                    "Proposal",
+                    "m2",
+                    "s1",
+                    "agent://orchestrator",
+                    good,
+                ),
+                None,
+            )
             .await
             .unwrap();
         assert!(!result.duplicate);
@@ -461,14 +561,17 @@ mod tests {
             roots: vec![],
         }
         .encode_to_vec();
-        rt.process(&env(
-            "macp.mode.decision.v1",
-            "SessionStart",
-            "m1",
-            "s1",
-            "agent://orchestrator",
-            payload,
-        ))
+        rt.process(
+            &env(
+                "macp.mode.decision.v1",
+                "SessionStart",
+                "m1",
+                "s1",
+                "agent://orchestrator",
+                payload,
+            ),
+            None,
+        )
         .await
         .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -484,14 +587,17 @@ mod tests {
             ..Default::default()
         }
         .encode_to_vec();
-        rt.process(&env(
-            "macp.mode.multi_round.v1",
-            "SessionStart",
-            "m1",
-            "s1",
-            "creator",
-            payload,
-        ))
+        rt.process(
+            &env(
+                "macp.mode.multi_round.v1",
+                "SessionStart",
+                "m1",
+                "s1",
+                "creator",
+                payload,
+            ),
+            None,
+        )
         .await
         .unwrap();
         let session = rt.get_session_checked("s1").await.unwrap();
@@ -502,29 +608,78 @@ mod tests {
     async fn duplicate_session_start_message_id_returns_duplicate() {
         let rt = make_runtime();
         let payload = session_start(vec!["agent://fraud".into()]);
-        rt.process(&env(
-            "macp.mode.decision.v1",
-            "SessionStart",
-            "m1",
-            "s1",
-            "agent://orchestrator",
-            payload.clone(),
-        ))
-        .await
-        .unwrap();
-
-        let result = rt
-            .process(&env(
+        rt.process(
+            &env(
                 "macp.mode.decision.v1",
                 "SessionStart",
                 "m1",
                 "s1",
                 "agent://orchestrator",
-                payload,
-            ))
+                payload.clone(),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let result = rt
+            .process(
+                &env(
+                    "macp.mode.decision.v1",
+                    "SessionStart",
+                    "m1",
+                    "s1",
+                    "agent://orchestrator",
+                    payload,
+                ),
+                None,
+            )
             .await
             .unwrap();
         assert!(result.duplicate);
+    }
+
+    #[tokio::test]
+    async fn non_start_mode_mismatch_rejected() {
+        let rt = make_runtime();
+        // Start a decision session
+        rt.process(
+            &env(
+                "macp.mode.decision.v1",
+                "SessionStart",
+                "m1",
+                "s1",
+                "agent://orchestrator",
+                session_start(vec!["agent://fraud".into()]),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Send a message with a different mode to the same session
+        let proposal = ProposalPayload {
+            proposal_id: "p1".into(),
+            option: "step-up".into(),
+            rationale: "risk".into(),
+            supporting_data: vec![],
+        }
+        .encode_to_vec();
+        let err = rt
+            .process(
+                &env(
+                    "macp.mode.task.v1", // wrong mode
+                    "Proposal",
+                    "m2",
+                    "s1",
+                    "agent://orchestrator",
+                    proposal,
+                ),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "InvalidEnvelope");
     }
 
     #[tokio::test]
@@ -541,14 +696,17 @@ mod tests {
             roots: vec![],
         }
         .encode_to_vec();
-        rt.process(&env(
-            "macp.mode.decision.v1",
-            "SessionStart",
-            "m1",
-            "s1",
-            "agent://orchestrator",
-            payload,
-        ))
+        rt.process(
+            &env(
+                "macp.mode.decision.v1",
+                "SessionStart",
+                "m1",
+                "s1",
+                "agent://orchestrator",
+                payload,
+            ),
+            None,
+        )
         .await
         .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -559,14 +717,17 @@ mod tests {
     #[tokio::test]
     async fn commitment_versions_are_carried_into_resolution() {
         let rt = make_runtime();
-        rt.process(&env(
-            "macp.mode.proposal.v1",
-            "SessionStart",
-            "m1",
-            "s1",
-            "agent://buyer",
-            session_start(vec!["agent://buyer".into(), "agent://seller".into()]),
-        ))
+        rt.process(
+            &env(
+                "macp.mode.proposal.v1",
+                "SessionStart",
+                "m1",
+                "s1",
+                "agent://buyer",
+                session_start(vec!["agent://buyer".into(), "agent://seller".into()]),
+            ),
+            None,
+        )
         .await
         .unwrap();
 
@@ -578,14 +739,17 @@ mod tests {
             tags: vec![],
         }
         .encode_to_vec();
-        rt.process(&env(
-            "macp.mode.proposal.v1",
-            "Proposal",
-            "m2",
-            "s1",
-            "agent://seller",
-            proposal,
-        ))
+        rt.process(
+            &env(
+                "macp.mode.proposal.v1",
+                "Proposal",
+                "m2",
+                "s1",
+                "agent://seller",
+                proposal,
+            ),
+            None,
+        )
         .await
         .unwrap();
         let accept = crate::proposal_pb::AcceptPayload {
@@ -593,24 +757,30 @@ mod tests {
             reason: String::new(),
         }
         .encode_to_vec();
-        rt.process(&env(
-            "macp.mode.proposal.v1",
-            "Accept",
-            "m3",
-            "s1",
-            "agent://seller",
-            accept.clone(),
-        ))
+        rt.process(
+            &env(
+                "macp.mode.proposal.v1",
+                "Accept",
+                "m3",
+                "s1",
+                "agent://seller",
+                accept.clone(),
+            ),
+            None,
+        )
         .await
         .unwrap();
-        rt.process(&env(
-            "macp.mode.proposal.v1",
-            "Accept",
-            "m4",
-            "s1",
-            "agent://buyer",
-            accept,
-        ))
+        rt.process(
+            &env(
+                "macp.mode.proposal.v1",
+                "Accept",
+                "m4",
+                "s1",
+                "agent://buyer",
+                accept,
+            ),
+            None,
+        )
         .await
         .unwrap();
         let commitment = CommitmentPayload {
@@ -624,16 +794,70 @@ mod tests {
         }
         .encode_to_vec();
         let result = rt
-            .process(&env(
-                "macp.mode.proposal.v1",
-                "Commitment",
-                "m5",
-                "s1",
-                "agent://buyer",
-                commitment,
-            ))
+            .process(
+                &env(
+                    "macp.mode.proposal.v1",
+                    "Commitment",
+                    "m5",
+                    "s1",
+                    "agent://buyer",
+                    commitment,
+                ),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(result.session_state, SessionState::Resolved);
+    }
+
+    #[tokio::test]
+    async fn max_open_sessions_enforced_under_write_lock() {
+        let rt = make_runtime();
+        // First session succeeds with limit=1
+        rt.process(
+            &env(
+                "macp.mode.decision.v1",
+                "SessionStart",
+                "m1",
+                "s1",
+                "agent://orchestrator",
+                session_start(vec!["agent://fraud".into()]),
+            ),
+            Some(1),
+        )
+        .await
+        .unwrap();
+
+        // Second session from the same sender should fail with RateLimited
+        let err = rt
+            .process(
+                &env(
+                    "macp.mode.decision.v1",
+                    "SessionStart",
+                    "m2",
+                    "s2",
+                    "agent://orchestrator",
+                    session_start(vec!["agent://fraud".into()]),
+                ),
+                Some(1),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MacpError::RateLimited));
+
+        // A different sender should still succeed
+        rt.process(
+            &env(
+                "macp.mode.decision.v1",
+                "SessionStart",
+                "m3",
+                "s3",
+                "agent://other",
+                session_start(vec!["agent://fraud".into()]),
+            ),
+            Some(1),
+        )
+        .await
+        .unwrap();
     }
 }

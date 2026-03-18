@@ -67,12 +67,13 @@ Local development profile:
 
 ## Persistence profile
 
-By default the runtime persists snapshots of:
+By default the runtime persists state via `FileBackend` under `MACP_DATA_DIR`:
 
-- session registry
-- accepted-history log store
+- per-session `session.json` and append-only `log.jsonl` files
+- crash recovery reconciles dedup state from the log on startup
+- atomic writes (tmp file + rename) prevent partial-write corruption
 
-This gives restart recovery for session metadata, dedup state, and accepted-history inspection. Corrupt or incompatible snapshot files produce a warning on stderr; the runtime falls back to empty state instead of refusing to start.
+This gives restart recovery for session metadata, dedup state, and accepted-history inspection. Corrupt or incompatible files produce a warning on stderr; the runtime falls back to empty state instead of refusing to start.
 
 ## Commitment validation
 

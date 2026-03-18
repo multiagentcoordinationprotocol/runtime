@@ -223,6 +223,7 @@ mod tests {
             session_id: "s1".into(),
             state: SessionState::Open,
             ttl_expiry: i64::MAX,
+            ttl_ms: 60_000,
             started_at_unix_ms: 0,
             resolution: None,
             mode: "macp.mode.decision.v1".into(),

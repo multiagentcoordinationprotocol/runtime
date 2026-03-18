@@ -43,9 +43,16 @@ Implemented modes:
 
 ## 4. Storage layer
 
+### Storage backend (`src/storage.rs`)
+
+Provides the `StorageBackend` trait with two implementations:
+
+- `FileBackend` — per-session directories containing `session.json` and append-only `log.jsonl`, with crash recovery and atomic writes
+- `MemoryBackend` — no-op backend for `MACP_MEMORY_ONLY=1`
+
 ### Session registry (`src/registry.rs`)
 
-Stores:
+In-memory cache of all sessions, loaded from `FileBackend` on startup. Stores:
 
 - session metadata
 - bound versions
@@ -53,24 +60,16 @@ Stores:
 - dedup state
 - current session state
 
-Supports:
-
-- in-memory mode
-- file-backed snapshot persistence
-
-Both stores log a warning and fall back to empty state if snapshot deserialization fails.
+Supports optional file-backed snapshot persistence for backward compatibility.
 
 ### Log store (`src/log_store.rs`)
 
-Stores:
+In-memory cache of accepted-history logs. Stores:
 
 - accepted incoming envelopes
 - runtime-generated internal events such as TTL expiry and session cancellation
 
-Supports:
-
-- in-memory mode
-- file-backed snapshot persistence
+On-disk persistence is handled by `FileBackend`, not by LogStore.
 
 ## 5. Security layer (`src/security.rs`)
 
