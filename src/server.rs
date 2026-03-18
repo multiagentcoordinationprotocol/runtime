@@ -88,7 +88,7 @@ impl MacpServer {
         &self,
         request: &Request<SendRequest>,
         env: Envelope,
-    ) -> Result<Envelope, MacpError> {
+    ) -> Result<(Envelope, Option<usize>), MacpError> {
         let identity = self.security.authenticate_metadata(request.metadata())?;
         let env = Self::apply_authenticated_sender(&identity, env)?;
         let is_session_start = env.message_type == "SessionStart";
@@ -97,20 +97,15 @@ impl MacpServer {
         self.security
             .enforce_rate_limit(&identity.sender, is_session_start)
             .await?;
-        if is_session_start {
-            if let Some(max_open) = identity.max_open_sessions {
-                if self
-                    .runtime
-                    .registry
-                    .count_open_sessions_for_initiator(&identity.sender)
-                    .await
-                    >= max_open
-                {
-                    return Err(MacpError::RateLimited);
-                }
-            }
-        }
-        Ok(env)
+        // max_open_sessions is passed to runtime.process() where it is
+        // enforced atomically under the session write lock, avoiding a
+        // TOCTOU race between the count check and session insertion.
+        let max_open = if is_session_start {
+            identity.max_open_sessions
+        } else {
+            None
+        };
+        Ok((env, max_open))
     }
 
     async fn authenticate_session_access<T>(
@@ -202,9 +197,9 @@ impl MacpRuntimeService for MacpServer {
 
         let result = async {
             self.validate_envelope_shape(&env)?;
-            let env = self.authenticate_send_request(&request, env).await?;
+            let (env, max_open) = self.authenticate_send_request(&request, env).await?;
             self.runtime
-                .process(&env)
+                .process(&env, max_open)
                 .await
                 .map(|process_result| (env, process_result))
         }
@@ -262,9 +257,20 @@ impl MacpRuntimeService for MacpServer {
         request: Request<CancelSessionRequest>,
     ) -> Result<Response<CancelSessionResponse>, Status> {
         let session_id = request.get_ref().session_id.clone();
-        let _identity = self
-            .authenticate_session_access(&request, &session_id)
-            .await?;
+        let identity = self
+            .security
+            .authenticate_metadata(request.metadata())
+            .map_err(Self::status_from_error)?;
+        let session = self
+            .runtime
+            .get_session_checked(&session_id)
+            .await
+            .ok_or_else(|| Status::not_found(format!("Session '{}' not found", session_id)))?;
+        if identity.sender != session.initiator_sender {
+            return Err(Status::permission_denied(
+                "FORBIDDEN: only the session initiator can cancel",
+            ));
+        }
         let req = request.into_inner();
         match self
             .runtime
@@ -392,9 +398,11 @@ mod tests {
     use prost::Message;
 
     fn make_server() -> (MacpServer, Arc<Runtime>) {
+        let storage: Arc<dyn macp_runtime::storage::StorageBackend> =
+            Arc::new(macp_runtime::storage::MemoryBackend);
         let registry = Arc::new(SessionRegistry::new());
         let log_store = Arc::new(LogStore::new());
-        let runtime = Arc::new(Runtime::new(registry, log_store));
+        let runtime = Arc::new(Runtime::new(storage, registry, log_store));
         let server = MacpServer::new(runtime.clone(), SecurityLayer::dev_mode());
         (server, runtime)
     }
@@ -589,6 +597,37 @@ mod tests {
         let ack = resp.into_inner().ack.unwrap();
         assert!(ack.ok);
         assert_eq!(ack.session_state, PbSessionState::Expired as i32);
+    }
+
+    #[tokio::test]
+    async fn participant_cannot_cancel_session() {
+        let (server, _) = make_server();
+        let ack = do_send(
+            &server,
+            "agent://orchestrator",
+            Envelope {
+                macp_version: "1.0".into(),
+                mode: "macp.mode.decision.v1".into(),
+                message_type: "SessionStart".into(),
+                message_id: "m1".into(),
+                session_id: "s1".into(),
+                sender: String::new(),
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                payload: start_payload(),
+            },
+        )
+        .await;
+        assert!(ack.ok);
+
+        // Participant (not initiator) tries to cancel
+        let mut req = Request::new(CancelSessionRequest {
+            session_id: "s1".into(),
+            reason: "I want to cancel".into(),
+        });
+        req.metadata_mut()
+            .insert("x-macp-agent-id", "agent://fraud".parse().unwrap());
+        let err = server.cancel_session(req).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 
     #[tokio::test]

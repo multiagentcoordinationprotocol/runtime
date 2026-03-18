@@ -17,6 +17,7 @@ pub struct Session {
     pub session_id: String,
     pub state: SessionState,
     pub ttl_expiry: i64,
+    pub ttl_ms: i64,
     pub started_at_unix_ms: i64,
     pub resolution: Option<Vec<u8>>,
     pub mode: String,

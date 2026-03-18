@@ -53,7 +53,6 @@ struct RateBucket {
 pub struct SecurityLayer {
     identities: Arc<HashMap<String, AuthIdentity>>,
     rate_bucket: Arc<RateBucket>,
-    auth_required: bool,
     allow_dev_sender_header: bool,
     pub max_payload_bytes: usize,
     session_start_rate: RateLimitConfig,
@@ -65,7 +64,6 @@ impl SecurityLayer {
         Self {
             identities: Arc::new(HashMap::new()),
             rate_bucket: Arc::new(RateBucket::default()),
-            auth_required: false,
             allow_dev_sender_header: true,
             max_payload_bytes: 1_048_576,
             session_start_rate: RateLimitConfig {
@@ -113,7 +111,6 @@ impl SecurityLayer {
             None
         };
 
-        let auth_required = raw.is_some() || !allow_dev_sender_header;
         let identities = raw
             .map(|json| Self::parse_identities(&json))
             .transpose()?
@@ -122,7 +119,6 @@ impl SecurityLayer {
         Ok(Self {
             identities: Arc::new(identities),
             rate_bucket: Arc::new(RateBucket::default()),
-            auth_required,
             allow_dev_sender_header,
             max_payload_bytes,
             session_start_rate,
@@ -194,16 +190,7 @@ impl SecurityLayer {
             }
         }
 
-        if self.auth_required {
-            Err(MacpError::Unauthenticated)
-        } else {
-            Ok(AuthIdentity {
-                sender: "agent://anonymous".into(),
-                allowed_modes: None,
-                can_start_sessions: true,
-                max_open_sessions: None,
-            })
-        }
+        Err(MacpError::Unauthenticated)
     }
 
     pub fn authorize_mode(
@@ -277,7 +264,6 @@ mod tests {
         SecurityLayer {
             identities: Arc::new(identities),
             rate_bucket: Arc::new(RateBucket::default()),
-            auth_required: true,
             allow_dev_sender_header: false,
             max_payload_bytes: 1_048_576,
             session_start_rate: RateLimitConfig {
@@ -296,7 +282,6 @@ mod tests {
         SecurityLayer {
             identities: Arc::new(HashMap::new()),
             rate_bucket: Arc::new(RateBucket::default()),
-            auth_required: false,
             allow_dev_sender_header: false,
             max_payload_bytes: 1_048_576,
             session_start_rate: RateLimitConfig {
@@ -315,15 +300,11 @@ mod tests {
     // ---------------------------------------------------------------
 
     #[test]
-    fn dev_mode_does_not_require_auth() {
+    fn dev_mode_requires_dev_header() {
         let layer = SecurityLayer::dev_mode();
         let meta = MetadataMap::new();
-        let id = layer
-            .authenticate_metadata(&meta)
-            .expect("should succeed without auth");
-        assert_eq!(id.sender, "agent://anonymous");
-        assert!(id.allowed_modes.is_none());
-        assert!(id.can_start_sessions);
+        let err = layer.authenticate_metadata(&meta).unwrap_err();
+        assert!(matches!(err, MacpError::Unauthenticated));
     }
 
     #[test]
@@ -348,16 +329,8 @@ mod tests {
 
     #[test]
     fn from_env_defaults_without_env_vars() {
-        // from_env reads live env vars, so we verify the code path indirectly:
-        // When no token JSON/file is set AND allow_dev_sender_header is false,
-        // auth_required = (!allow_dev_sender_header) = true.
-        // But if no tokens AND no dev header => auth_required = true.
-        //
-        // We can verify that default max_payload, rate limits, etc. are sane
-        // by constructing through from_env in a controlled subprocess, but that
-        // is fragile. Instead we test the exact same logic through direct construction.
+        // Verify default configuration via direct construction.
         let layer = insecure_layer();
-        assert!(!layer.auth_required);
         assert_eq!(layer.max_payload_bytes, 1_048_576);
     }
 
@@ -481,7 +454,6 @@ mod tests {
         let layer = SecurityLayer {
             identities: Arc::new(HashMap::new()),
             rate_bucket: Arc::new(RateBucket::default()),
-            auth_required: false,
             allow_dev_sender_header: true,
             max_payload_bytes: 1_048_576,
             session_start_rate: RateLimitConfig {
@@ -506,11 +478,10 @@ mod tests {
 
     #[test]
     fn dev_sender_header_ignored_when_not_allowed() {
-        // auth_required=true, allow_dev_sender_header=false, no tokens
+        // allow_dev_sender_header=false, no tokens
         let layer = SecurityLayer {
             identities: Arc::new(HashMap::new()),
             rate_bucket: Arc::new(RateBucket::default()),
-            auth_required: true,
             allow_dev_sender_header: false,
             max_payload_bytes: 1_048_576,
             session_start_rate: RateLimitConfig {
@@ -538,7 +509,6 @@ mod tests {
         let layer = SecurityLayer {
             identities: Arc::new(identities),
             rate_bucket: Arc::new(RateBucket::default()),
-            auth_required: true,
             allow_dev_sender_header: true,
             max_payload_bytes: 1_048_576,
             session_start_rate: RateLimitConfig {
@@ -672,7 +642,6 @@ mod tests {
         let layer = SecurityLayer {
             identities: Arc::new(HashMap::new()),
             rate_bucket: Arc::new(RateBucket::default()),
-            auth_required: false,
             allow_dev_sender_header: false,
             max_payload_bytes: 1_048_576,
             session_start_rate: RateLimitConfig {
@@ -703,7 +672,6 @@ mod tests {
         let layer = SecurityLayer {
             identities: Arc::new(HashMap::new()),
             rate_bucket: Arc::new(RateBucket::default()),
-            auth_required: false,
             allow_dev_sender_header: false,
             max_payload_bytes: 1_048_576,
             session_start_rate: RateLimitConfig {
@@ -731,7 +699,6 @@ mod tests {
         let layer = SecurityLayer {
             identities: Arc::new(HashMap::new()),
             rate_bucket: Arc::new(RateBucket::default()),
-            auth_required: false,
             allow_dev_sender_header: false,
             max_payload_bytes: 1_048_576,
             session_start_rate: RateLimitConfig {
@@ -757,7 +724,6 @@ mod tests {
         let layer = SecurityLayer {
             identities: Arc::new(HashMap::new()),
             rate_bucket: Arc::new(RateBucket::default()),
-            auth_required: false,
             allow_dev_sender_header: false,
             max_payload_bytes: 1_048_576,
             session_start_rate: RateLimitConfig {
@@ -785,22 +751,17 @@ mod tests {
     // ---------------------------------------------------------------
 
     #[test]
-    fn anonymous_fallback_when_no_auth_required() {
+    fn no_anonymous_fallback_even_when_auth_not_required() {
         let layer = insecure_layer();
         let meta = MetadataMap::new();
-        let id = layer
-            .authenticate_metadata(&meta)
-            .expect("should return anonymous");
-        assert_eq!(id.sender, "agent://anonymous");
-        assert!(id.allowed_modes.is_none());
-        assert!(id.can_start_sessions);
-        assert!(id.max_open_sessions.is_none());
+        let err = layer.authenticate_metadata(&meta).unwrap_err();
+        assert!(matches!(err, MacpError::Unauthenticated));
     }
 
     #[test]
     fn no_anonymous_fallback_when_auth_required() {
         let json = r#"[{"token":"t","sender":"agent://real"}]"#;
-        let layer = layer_with_tokens(json); // auth_required = true
+        let layer = layer_with_tokens(json);
 
         let meta = MetadataMap::new();
         let err = layer.authenticate_metadata(&meta).unwrap_err();
@@ -808,13 +769,13 @@ mod tests {
     }
 
     #[test]
-    fn dev_mode_anonymous_fallback_with_empty_metadata() {
-        // dev_mode: auth_required=false, allow_dev_sender_header=true
-        // With no headers at all, falls through to anonymous
+    fn dev_mode_no_fallback_with_empty_metadata() {
+        // dev_mode: allow_dev_sender_header=true
+        // With no headers at all, returns Unauthenticated (no anonymous fallback)
         let layer = SecurityLayer::dev_mode();
         let meta = MetadataMap::new();
-        let id = layer.authenticate_metadata(&meta).expect("should succeed");
-        assert_eq!(id.sender, "agent://anonymous");
+        let err = layer.authenticate_metadata(&meta).unwrap_err();
+        assert!(matches!(err, MacpError::Unauthenticated));
     }
 
     // ---------------------------------------------------------------

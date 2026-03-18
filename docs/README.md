@@ -65,10 +65,11 @@ In dev mode, example clients attach `x-macp-agent-id` metadata and may use plain
 
 ## Persistence model
 
-By default the runtime persists snapshots under `.macp-data/`:
+By default the runtime persists state under `.macp-data/` via `FileBackend`:
 
-- `sessions.json`
-- `logs.json`
+- per-session directories containing `session.json` and append-only `log.jsonl`
+- crash recovery reconciles dedup state from the log on startup
+- atomic writes (tmp file + rename) prevent partial-write corruption
 
 If a snapshot file contains corrupt or incompatible JSON, the runtime logs a warning to stderr and starts with empty state.
 

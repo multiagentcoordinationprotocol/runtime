@@ -5,6 +5,10 @@ use macp_runtime::pb;
 use macp_runtime::registry::SessionRegistry;
 use macp_runtime::runtime::Runtime;
 use macp_runtime::security::SecurityLayer;
+use macp_runtime::storage::{
+    cleanup_temp_files, migrate_if_needed, recover_session, FileBackend, MemoryBackend,
+    StorageBackend,
+};
 use server::MacpServer;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -20,21 +24,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data_dir =
         PathBuf::from(std::env::var("MACP_DATA_DIR").unwrap_or_else(|_| ".macp-data".into()));
 
-    let registry = Arc::new(if memory_only {
-        SessionRegistry::new()
+    let storage: Arc<dyn StorageBackend> = if memory_only {
+        Arc::new(MemoryBackend)
     } else {
-        SessionRegistry::with_persistence(&data_dir)?
-    });
-    let log_store = Arc::new(if memory_only {
-        LogStore::new()
-    } else {
-        LogStore::with_persistence(&data_dir)?
-    });
+        std::fs::create_dir_all(&data_dir)?;
+        migrate_if_needed(&data_dir)?;
+        cleanup_temp_files(&data_dir);
+        Arc::new(FileBackend::new(data_dir.clone())?)
+    };
 
-    let registry_ref = Arc::clone(&registry);
-    let log_store_ref = Arc::clone(&log_store);
+    // Load persisted state into in-memory caches
+    let registry = Arc::new(SessionRegistry::new());
+    let log_store = Arc::new(LogStore::new());
 
-    let runtime = Arc::new(Runtime::new(registry, log_store));
+    if !memory_only {
+        let mut sessions = storage.load_all_sessions().await?;
+        for session in &mut sessions {
+            let log_entries = storage.load_log(&session.session_id).await?;
+
+            // Crash recovery: reconcile dedup state from log
+            recover_session(session, &log_entries);
+
+            // Populate in-memory log store
+            log_store.create_session_log(&session.session_id).await;
+            for entry in &log_entries {
+                log_store.append(&session.session_id, entry.clone()).await;
+            }
+
+            // Persist recovered session state if it changed
+            if let Err(e) = storage.save_session(session).await {
+                eprintln!(
+                    "warning: failed to persist recovered session '{}': {e}",
+                    session.session_id
+                );
+            }
+
+            registry
+                .insert_session_for_test(session.session_id.clone(), session.clone())
+                .await;
+        }
+        if !sessions.is_empty() {
+            println!("Loaded {} sessions from storage.", sessions.len());
+        }
+    }
+
+    let runtime = Arc::new(Runtime::new(
+        Arc::clone(&storage),
+        Arc::clone(&registry),
+        Arc::clone(&log_store),
+    ));
     let security = SecurityLayer::from_env()?;
     let svc = MacpServer::new(runtime, security);
 
@@ -78,12 +116,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Persist final state on shutdown
-    if let Err(e) = registry_ref.persist_snapshot().await {
-        eprintln!("warning: failed to persist session registry: {}", e);
-    }
-    if let Err(e) = log_store_ref.persist_snapshot().await {
-        eprintln!("warning: failed to persist log store: {}", e);
+    // Final snapshot: persist all sessions to storage
+    if !memory_only {
+        for session in registry.get_all_sessions().await {
+            if let Err(e) = storage.save_session(&session).await {
+                eprintln!(
+                    "warning: failed to persist session '{}' on shutdown: {e}",
+                    session.session_id
+                );
+            }
+        }
     }
     println!("State persisted. Goodbye.");
 

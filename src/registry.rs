@@ -5,37 +5,47 @@ use std::path::{Path, PathBuf};
 use tokio::sync::RwLock;
 
 #[derive(serde::Serialize, serde::Deserialize)]
-struct PersistedRoot {
-    uri: String,
-    name: String,
+pub(crate) struct PersistedRoot {
+    pub uri: String,
+    pub name: String,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
-struct PersistedSession {
-    session_id: String,
-    state: crate::session::SessionState,
-    ttl_expiry: i64,
-    started_at_unix_ms: i64,
-    resolution: Option<Vec<u8>>,
-    mode: String,
-    mode_state: Vec<u8>,
-    participants: Vec<String>,
-    seen_message_ids: Vec<String>,
-    intent: String,
-    mode_version: String,
-    configuration_version: String,
-    policy_version: String,
-    context: Vec<u8>,
-    roots: Vec<PersistedRoot>,
-    initiator_sender: String,
+pub(crate) struct PersistedSession {
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+    pub session_id: String,
+    pub state: crate::session::SessionState,
+    pub ttl_expiry: i64,
+    #[serde(default)]
+    pub ttl_ms: i64,
+    pub started_at_unix_ms: i64,
+    pub resolution: Option<Vec<u8>>,
+    pub mode: String,
+    pub mode_state: Vec<u8>,
+    pub participants: Vec<String>,
+    pub seen_message_ids: Vec<String>,
+    pub intent: String,
+    pub mode_version: String,
+    pub configuration_version: String,
+    pub policy_version: String,
+    pub context: Vec<u8>,
+    pub roots: Vec<PersistedRoot>,
+    pub initiator_sender: String,
+}
+
+fn default_schema_version() -> u32 {
+    2
 }
 
 impl From<&Session> for PersistedSession {
     fn from(session: &Session) -> Self {
         Self {
+            schema_version: 2,
             session_id: session.session_id.clone(),
             state: session.state.clone(),
             ttl_expiry: session.ttl_expiry,
+            ttl_ms: session.ttl_ms,
             started_at_unix_ms: session.started_at_unix_ms,
             resolution: session.resolution.clone(),
             mode: session.mode.clone(),
@@ -62,10 +72,19 @@ impl From<&Session> for PersistedSession {
 
 impl From<PersistedSession> for Session {
     fn from(session: PersistedSession) -> Self {
+        let ttl_ms = if session.ttl_ms > 0 {
+            session.ttl_ms
+        } else {
+            // Backward compatibility: compute from absolute timestamps
+            session
+                .ttl_expiry
+                .saturating_sub(session.started_at_unix_ms)
+        };
         Self {
             session_id: session.session_id,
             state: session.state,
             ttl_expiry: session.ttl_expiry,
+            ttl_ms,
             started_at_unix_ms: session.started_at_unix_ms,
             resolution: session.resolution,
             mode: session.mode,
@@ -169,6 +188,11 @@ impl SessionRegistry {
         guard.get(session_id).cloned()
     }
 
+    pub async fn get_all_sessions(&self) -> Vec<Session> {
+        let guard = self.sessions.read().await;
+        guard.values().cloned().collect()
+    }
+
     pub async fn insert_session_for_test(&self, session_id: String, session: Session) {
         let mut guard = self.sessions.write().await;
         guard.insert(session_id, session);
@@ -176,12 +200,14 @@ impl SessionRegistry {
     }
 
     pub async fn count_open_sessions_for_initiator(&self, sender: &str) -> usize {
+        let now = chrono::Utc::now().timestamp_millis();
         let guard = self.sessions.read().await;
         guard
             .values()
             .filter(|session| {
                 session.initiator_sender == sender
                     && session.state == crate::session::SessionState::Open
+                    && now <= session.ttl_expiry
             })
             .count()
     }
@@ -199,6 +225,7 @@ mod tests {
             session_id: id.into(),
             state: SessionState::Open,
             ttl_expiry: 10,
+            ttl_ms: 9,
             started_at_unix_ms: 1,
             resolution: None,
             mode: "macp.mode.decision.v1".into(),
@@ -216,6 +243,40 @@ mod tests {
             }],
             initiator_sender: "alice".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn expired_sessions_not_counted_against_limit() {
+        let registry = SessionRegistry::new();
+        let now = chrono::Utc::now().timestamp_millis();
+        // Insert a session with TTL already expired
+        let mut expired = sample_session("expired-s1");
+        expired.initiator_sender = "agent://alice".into();
+        expired.ttl_expiry = now - 1000; // expired 1 second ago
+        expired.state = SessionState::Open; // still Open but TTL is past
+        registry
+            .insert_session_for_test("expired-s1".into(), expired)
+            .await;
+
+        // Should not count the expired-but-open session
+        let count = registry
+            .count_open_sessions_for_initiator("agent://alice")
+            .await;
+        assert_eq!(count, 0);
+
+        // Insert a session that is still valid
+        let mut active = sample_session("active-s1");
+        active.initiator_sender = "agent://alice".into();
+        active.ttl_expiry = now + 60_000; // expires in 60s
+        active.state = SessionState::Open;
+        registry
+            .insert_session_for_test("active-s1".into(), active)
+            .await;
+
+        let count = registry
+            .count_open_sessions_for_initiator("agent://alice")
+            .await;
+        assert_eq!(count, 1);
     }
 
     #[tokio::test]
