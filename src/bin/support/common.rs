@@ -11,6 +11,10 @@ use prost::Message;
 use tonic::transport::Channel;
 use tonic::Request;
 
+pub fn new_session_id() -> String {
+    uuid::Uuid::new_v4().as_hyphenated().to_string()
+}
+
 pub const DEV_ENDPOINT: &str = "http://127.0.0.1:50051";
 pub const MODE_VERSION: &str = "1.0.0";
 pub const CONFIG_VERSION: &str = "config.default";

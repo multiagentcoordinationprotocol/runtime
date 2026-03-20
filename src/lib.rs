@@ -26,6 +26,7 @@ pub mod error;
 pub mod log_store;
 pub mod mode;
 pub mod registry;
+pub mod replay;
 pub mod runtime;
 pub mod session;
 pub mod storage;

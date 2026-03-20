@@ -6,7 +6,7 @@ use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
-const STORAGE_VERSION: u32 = 2;
+const STORAGE_VERSION: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // StorageBackend trait
@@ -222,8 +222,24 @@ pub fn migrate_if_needed(base_dir: &Path) -> io::Result<()> {
     let legacy_sessions = base_dir.join("sessions.json");
     let legacy_logs = base_dir.join("logs.json");
 
-    // Already migrated or fresh install
-    if sessions_dir.exists() || (!legacy_sessions.exists() && !legacy_logs.exists()) {
+    // Already at current version or fresh install (no legacy files, sessions dir exists)
+    let current_version = read_storage_version(base_dir)?;
+    if sessions_dir.exists() && !legacy_sessions.exists() && !legacy_logs.exists() {
+        // v2 → v3: no-op data migration, just bump version.  New LogEntry fields
+        // use #[serde(default)] so existing v2 JSONL lines deserialize fine.
+        if current_version.unwrap_or(0) < STORAGE_VERSION {
+            write_storage_version(base_dir)?;
+        }
+        return Ok(());
+    }
+
+    if !legacy_sessions.exists() && !legacy_logs.exists() && !sessions_dir.exists() {
+        write_storage_version(base_dir)?;
+        return Ok(());
+    }
+
+    // Already migrated from v1
+    if sessions_dir.exists() && !legacy_sessions.exists() && !legacy_logs.exists() {
         write_storage_version(base_dir)?;
         return Ok(());
     }
@@ -407,6 +423,9 @@ mod tests {
             message_type: "Message".into(),
             raw_payload: vec![],
             entry_kind: EntryKind::Incoming,
+            session_id: String::new(),
+            mode: String::new(),
+            macp_version: String::new(),
         }
     }
 
@@ -564,7 +583,7 @@ mod tests {
         assert!(!base.join("logs.json").exists());
 
         // Verify storage version
-        assert_eq!(read_storage_version(base).unwrap(), Some(2));
+        assert_eq!(read_storage_version(base).unwrap(), Some(STORAGE_VERSION));
 
         // Verify data is loadable via FileBackend
         let backend = FileBackend::new(base.to_path_buf()).unwrap();

@@ -11,6 +11,7 @@ use prost::Message;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut client = common::connect_client().await?;
+    let session_id = common::new_session_id();
 
     let init = initialize(&mut client).await?;
     println!(
@@ -36,7 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "macp.mode.decision.v1",
         "SessionStart",
         "m1",
-        "decision-demo-1",
+        &session_id,
         "coordinator",
         canonical_start_payload("select the deployment plan", &["alice", "bob"], 60_000),
     );
@@ -56,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "macp.mode.decision.v1",
             "Proposal",
             "m2",
-            "decision-demo-1",
+            &session_id,
             "coordinator",
             proposal.encode_to_vec(),
         ),
@@ -77,7 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "macp.mode.decision.v1",
             "Evaluation",
             "m3",
-            "decision-demo-1",
+            &session_id,
             "alice",
             evaluation.encode_to_vec(),
         ),
@@ -97,7 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "macp.mode.decision.v1",
             "Vote",
             "m4",
-            "decision-demo-1",
+            &session_id,
             "bob",
             vote.encode_to_vec(),
         ),
@@ -112,7 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "macp.mode.decision.v1",
             "Commitment",
             "m5",
-            "decision-demo-1",
+            &session_id,
             "coordinator",
             canonical_commitment_payload(
                 "c1",
@@ -125,7 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     print_ack("commitment", &ack);
 
-    let session = get_session_as(&mut client, "alice", "decision-demo-1").await?;
+    let session = get_session_as(&mut client, "alice", &session_id).await?;
     let meta = session.metadata.expect("metadata");
     println!("GetSession: state={} mode={}", meta.state, meta.mode);
 

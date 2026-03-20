@@ -8,6 +8,7 @@ use prost::Message;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut client = common::connect_client().await?;
+    let session_id = common::new_session_id();
 
     println!("=== Multi-Round Convergence Demo ===\n");
 
@@ -28,7 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "macp.mode.multi_round.v1",
             "SessionStart",
             "m0",
-            "multi-round-demo-1",
+            &session_id,
             "coordinator",
             start_payload.encode_to_vec(),
         ),
@@ -43,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "macp.mode.multi_round.v1",
             "Contribute",
             "m1",
-            "multi-round-demo-1",
+            &session_id,
             "alice",
             br#"{"value":"option_a"}"#.to_vec(),
         ),
@@ -58,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "macp.mode.multi_round.v1",
             "Contribute",
             "m2",
-            "multi-round-demo-1",
+            &session_id,
             "bob",
             br#"{"value":"option_b"}"#.to_vec(),
         ),
@@ -66,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     print_ack("bob_contributes_b", &ack);
 
-    let session = get_session_as(&mut client, "alice", "multi-round-demo-1").await?;
+    let session = get_session_as(&mut client, "alice", &session_id).await?;
     let meta = session.metadata.expect("metadata");
     println!("[get_session] state={} mode={}", meta.state, meta.mode);
 
@@ -77,7 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "macp.mode.multi_round.v1",
             "Contribute",
             "m3",
-            "multi-round-demo-1",
+            &session_id,
             "bob",
             br#"{"value":"option_a"}"#.to_vec(),
         ),
@@ -85,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     print_ack("bob_revises", &ack);
 
-    let session = get_session_as(&mut client, "alice", "multi-round-demo-1").await?;
+    let session = get_session_as(&mut client, "alice", &session_id).await?;
     let meta = session.metadata.expect("metadata");
     println!("[get_session] state={} mode={}", meta.state, meta.mode);
 

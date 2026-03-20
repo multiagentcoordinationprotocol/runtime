@@ -13,6 +13,7 @@ use prost::Message;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut client = common::connect_client().await?;
+    let session_id = common::new_session_id();
 
     println!("=== Task Mode Demo ===\n");
 
@@ -23,7 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "macp.mode.task.v1",
             "SessionStart",
             "m0",
-            "task-demo-1",
+            &session_id,
             "planner",
             canonical_start_payload("summarize quarterly report", &["planner", "worker"], 60_000),
         ),
@@ -46,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "macp.mode.task.v1",
             "TaskRequest",
             "m1",
-            "task-demo-1",
+            &session_id,
             "planner",
             task_request.encode_to_vec(),
         ),
@@ -66,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "macp.mode.task.v1",
             "TaskAccept",
             "m2",
-            "task-demo-1",
+            &session_id,
             "worker",
             accept.encode_to_vec(),
         ),
@@ -88,7 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "macp.mode.task.v1",
             "TaskUpdate",
             "m3",
-            "task-demo-1",
+            &session_id,
             "worker",
             update.encode_to_vec(),
         ),
@@ -109,7 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "macp.mode.task.v1",
             "TaskComplete",
             "m4",
-            "task-demo-1",
+            &session_id,
             "worker",
             complete.encode_to_vec(),
         ),
@@ -124,7 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "macp.mode.task.v1",
             "Commitment",
             "m5",
-            "task-demo-1",
+            &session_id,
             "planner",
             canonical_commitment_payload(
                 "c1",
@@ -137,7 +138,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     print_ack("commitment", &ack);
 
-    let session = get_session_as(&mut client, "worker", "task-demo-1").await?;
+    let session = get_session_as(&mut client, "worker", &session_id).await?;
     let meta = session.metadata.expect("metadata");
     println!("[get_session] state={} mode={}", meta.state, meta.mode);
 

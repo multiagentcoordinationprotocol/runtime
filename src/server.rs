@@ -40,6 +40,14 @@ impl MacpServer {
         if env.message_type.is_empty() || env.message_id.is_empty() {
             return Err(MacpError::InvalidEnvelope);
         }
+        if env.message_type == "Signal" {
+            if !env.session_id.is_empty() {
+                return Err(MacpError::InvalidEnvelope);
+            }
+            if !env.mode.trim().is_empty() {
+                return Err(MacpError::InvalidEnvelope);
+            }
+        }
         if env.message_type != "Signal" && env.session_id.is_empty() {
             return Err(MacpError::InvalidEnvelope);
         }
@@ -134,7 +142,7 @@ impl MacpServer {
         Ok(identity)
     }
 
-    #[allow(clippy::result_large_err)]
+    #[allow(dead_code, clippy::result_large_err)]
     fn try_next_stream_event(
         receiver: &mut Option<tokio::sync::broadcast::Receiver<Envelope>>,
     ) -> Result<Option<Envelope>, Status> {
@@ -158,6 +166,7 @@ impl MacpServer {
         }
     }
 
+    #[allow(dead_code)]
     async fn process_stream_request(
         &self,
         identity: &AuthIdentity,
@@ -236,6 +245,7 @@ impl MacpServer {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn build_stream_session_stream<S>(
         &self,
         identity: AuthIdentity,
@@ -360,6 +370,8 @@ impl MacpServer {
             MacpError::Forbidden => Status::permission_denied(err.to_string()),
             MacpError::PayloadTooLarge => Status::resource_exhausted(err.to_string()),
             MacpError::RateLimited => Status::resource_exhausted(err.to_string()),
+            MacpError::StorageFailed => Status::internal(err.to_string()),
+            MacpError::InvalidSessionId => Status::invalid_argument(err.to_string()),
             _ => Status::failed_precondition(err.to_string()),
         }
     }
@@ -389,7 +401,7 @@ impl MacpRuntimeService for MacpServer {
                 website_url: String::new(),
             }),
             capabilities: Some(Capabilities {
-                sessions: Some(SessionsCapability { stream: true }),
+                sessions: Some(SessionsCapability { stream: false }),
                 cancellation: Some(CancellationCapability {
                     cancel_session: true,
                 }),
@@ -576,16 +588,11 @@ impl MacpRuntimeService for MacpServer {
 
     async fn stream_session(
         &self,
-        request: Request<tonic::Streaming<StreamSessionRequest>>,
+        _request: Request<tonic::Streaming<StreamSessionRequest>>,
     ) -> Result<Response<Self::StreamSessionStream>, Status> {
-        let identity = self
-            .security
-            .authenticate_metadata(request.metadata())
-            .map_err(Self::status_from_error)?;
-        Ok(Response::new(self.build_stream_session_stream(
-            identity,
-            request.into_inner(),
-        )))
+        Err(Status::unimplemented(
+            "StreamSession is disabled in the unary-first freeze profile",
+        ))
     }
 
     type WatchModeRegistryStream = std::pin::Pin<
@@ -621,6 +628,10 @@ mod tests {
     use macp_runtime::pb::SessionStartPayload;
     use macp_runtime::registry::SessionRegistry;
     use prost::Message;
+
+    fn new_sid() -> String {
+        uuid::Uuid::new_v4().as_hyphenated().to_string()
+    }
 
     fn make_server() -> (MacpServer, Arc<Runtime>) {
         let storage: Arc<dyn macp_runtime::storage::StorageBackend> =
@@ -663,6 +674,7 @@ mod tests {
     #[tokio::test]
     async fn sender_is_derived_from_authenticated_metadata() {
         let (server, runtime) = make_server();
+        let sid = new_sid();
         let ack = do_send(
             &server,
             "agent://orchestrator",
@@ -671,7 +683,7 @@ mod tests {
                 mode: "macp.mode.decision.v1".into(),
                 message_type: "SessionStart".into(),
                 message_id: "m1".into(),
-                session_id: "s1".into(),
+                session_id: sid.clone(),
                 sender: String::new(),
                 timestamp_unix_ms: Utc::now().timestamp_millis(),
                 payload: start_payload(),
@@ -679,13 +691,14 @@ mod tests {
         )
         .await;
         assert!(ack.ok);
-        let session = runtime.get_session_checked("s1").await.unwrap();
+        let session = runtime.get_session_checked(&sid).await.unwrap();
         assert_eq!(session.initiator_sender, "agent://orchestrator");
     }
 
     #[tokio::test]
     async fn spoofed_sender_is_rejected() {
         let (server, _) = make_server();
+        let sid = new_sid();
         let ack = do_send(
             &server,
             "agent://orchestrator",
@@ -694,7 +707,7 @@ mod tests {
                 mode: "macp.mode.decision.v1".into(),
                 message_type: "SessionStart".into(),
                 message_id: "m1".into(),
-                session_id: "s1".into(),
+                session_id: sid,
                 sender: "agent://spoof".into(),
                 timestamp_unix_ms: Utc::now().timestamp_millis(),
                 payload: start_payload(),
@@ -708,6 +721,7 @@ mod tests {
     #[tokio::test]
     async fn get_session_requires_session_membership() {
         let (server, _) = make_server();
+        let sid = new_sid();
         let ack = do_send(
             &server,
             "agent://orchestrator",
@@ -716,7 +730,7 @@ mod tests {
                 mode: "macp.mode.decision.v1".into(),
                 message_type: "SessionStart".into(),
                 message_id: "m1".into(),
-                session_id: "s1".into(),
+                session_id: sid.clone(),
                 sender: String::new(),
                 timestamp_unix_ms: Utc::now().timestamp_millis(),
                 payload: start_payload(),
@@ -725,9 +739,7 @@ mod tests {
         .await;
         assert!(ack.ok);
 
-        let mut req = Request::new(GetSessionRequest {
-            session_id: "s1".into(),
-        });
+        let mut req = Request::new(GetSessionRequest { session_id: sid });
         req.metadata_mut()
             .insert("x-macp-agent-id", "agent://outsider".parse().unwrap());
         let err = server.get_session(req).await.unwrap_err();
@@ -748,13 +760,14 @@ mod tests {
         use tokio_stream::{iter, StreamExt};
 
         let (server, _) = make_server();
+        let sid = new_sid();
         let requests = iter(vec![Ok(StreamSessionRequest {
             envelope: Some(Envelope {
                 macp_version: "1.0".into(),
                 mode: "macp.mode.decision.v1".into(),
                 message_type: "SessionStart".into(),
                 message_id: "m1".into(),
-                session_id: "s1".into(),
+                session_id: sid.clone(),
                 sender: String::new(),
                 timestamp_unix_ms: Utc::now().timestamp_millis(),
                 payload: start_payload(),
@@ -776,6 +789,8 @@ mod tests {
         use tokio_stream::{iter, StreamExt};
 
         let (server, _) = make_server();
+        let sid1 = new_sid();
+        let sid2 = new_sid();
         let requests = iter(vec![
             Ok(StreamSessionRequest {
                 envelope: Some(Envelope {
@@ -783,7 +798,7 @@ mod tests {
                     mode: "macp.mode.decision.v1".into(),
                     message_type: "SessionStart".into(),
                     message_id: "m1".into(),
-                    session_id: "s1".into(),
+                    session_id: sid1.clone(),
                     sender: String::new(),
                     timestamp_unix_ms: Utc::now().timestamp_millis(),
                     payload: start_payload(),
@@ -795,7 +810,7 @@ mod tests {
                     mode: "macp.mode.decision.v1".into(),
                     message_type: "SessionStart".into(),
                     message_id: "m2".into(),
-                    session_id: "s2".into(),
+                    session_id: sid2,
                     sender: String::new(),
                     timestamp_unix_ms: Utc::now().timestamp_millis(),
                     payload: start_payload(),
@@ -807,7 +822,7 @@ mod tests {
             server.build_stream_session_stream(stream_identity("agent://orchestrator"), requests);
 
         let first = stream.next().await.unwrap().unwrap();
-        assert_eq!(first.envelope.unwrap().session_id, "s1");
+        assert_eq!(first.envelope.unwrap().session_id, sid1);
         let err = stream.next().await.unwrap().unwrap_err();
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     }
@@ -836,6 +851,7 @@ mod tests {
     #[tokio::test]
     async fn get_session_returns_metadata() {
         let (server, _) = make_server();
+        let sid = new_sid();
         let ack = do_send(
             &server,
             "agent://orchestrator",
@@ -844,7 +860,7 @@ mod tests {
                 mode: "macp.mode.decision.v1".into(),
                 message_type: "SessionStart".into(),
                 message_id: "m1".into(),
-                session_id: "s1".into(),
+                session_id: sid.clone(),
                 sender: String::new(),
                 timestamp_unix_ms: Utc::now().timestamp_millis(),
                 payload: start_payload(),
@@ -854,13 +870,13 @@ mod tests {
         assert!(ack.ok);
 
         let mut req = Request::new(GetSessionRequest {
-            session_id: "s1".into(),
+            session_id: sid.clone(),
         });
         req.metadata_mut()
             .insert("x-macp-agent-id", "agent://orchestrator".parse().unwrap());
         let resp = server.get_session(req).await.unwrap();
         let meta = resp.into_inner().metadata.unwrap();
-        assert_eq!(meta.session_id, "s1");
+        assert_eq!(meta.session_id, sid);
         assert_eq!(meta.mode, "macp.mode.decision.v1");
         assert_eq!(meta.mode_version, "1.0.0");
         assert_eq!(meta.configuration_version, "cfg-1");
@@ -869,6 +885,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_session_transitions_to_expired() {
         let (server, _) = make_server();
+        let sid = new_sid();
         let ack = do_send(
             &server,
             "agent://orchestrator",
@@ -877,7 +894,7 @@ mod tests {
                 mode: "macp.mode.decision.v1".into(),
                 message_type: "SessionStart".into(),
                 message_id: "m1".into(),
-                session_id: "s1".into(),
+                session_id: sid.clone(),
                 sender: String::new(),
                 timestamp_unix_ms: Utc::now().timestamp_millis(),
                 payload: start_payload(),
@@ -887,7 +904,7 @@ mod tests {
         assert!(ack.ok);
 
         let mut req = Request::new(CancelSessionRequest {
-            session_id: "s1".into(),
+            session_id: sid,
             reason: "no longer needed".into(),
         });
         req.metadata_mut()
@@ -901,6 +918,7 @@ mod tests {
     #[tokio::test]
     async fn participant_cannot_cancel_session() {
         let (server, _) = make_server();
+        let sid = new_sid();
         let ack = do_send(
             &server,
             "agent://orchestrator",
@@ -909,7 +927,7 @@ mod tests {
                 mode: "macp.mode.decision.v1".into(),
                 message_type: "SessionStart".into(),
                 message_id: "m1".into(),
-                session_id: "s1".into(),
+                session_id: sid.clone(),
                 sender: String::new(),
                 timestamp_unix_ms: Utc::now().timestamp_millis(),
                 payload: start_payload(),
@@ -918,9 +936,8 @@ mod tests {
         .await;
         assert!(ack.ok);
 
-        // Participant (not initiator) tries to cancel
         let mut req = Request::new(CancelSessionRequest {
-            session_id: "s1".into(),
+            session_id: sid,
             reason: "I want to cancel".into(),
         });
         req.metadata_mut()
@@ -932,7 +949,6 @@ mod tests {
     #[tokio::test]
     async fn cancel_session_unknown_session_returns_error() {
         let (server, _) = make_server();
-        // authenticate_session_access will fail with NotFound for unknown session
         let mut req = Request::new(CancelSessionRequest {
             session_id: "nonexistent".into(),
             reason: "test".into(),
@@ -941,5 +957,89 @@ mod tests {
             .insert("x-macp-agent-id", "agent://orchestrator".parse().unwrap());
         let err = server.cancel_session(req).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn ambient_signal_accepted() {
+        let (server, _) = make_server();
+        let ack = do_send(
+            &server,
+            "agent://orchestrator",
+            Envelope {
+                macp_version: "1.0".into(),
+                mode: String::new(),
+                message_type: "Signal".into(),
+                message_id: "sig-1".into(),
+                session_id: String::new(),
+                sender: String::new(),
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                payload: vec![],
+            },
+        )
+        .await;
+        assert!(ack.ok);
+    }
+
+    #[tokio::test]
+    async fn signal_with_session_id_rejected() {
+        let (server, _) = make_server();
+        let ack = do_send(
+            &server,
+            "agent://orchestrator",
+            Envelope {
+                macp_version: "1.0".into(),
+                mode: String::new(),
+                message_type: "Signal".into(),
+                message_id: "sig-2".into(),
+                session_id: "some-session".into(),
+                sender: String::new(),
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                payload: vec![],
+            },
+        )
+        .await;
+        assert!(!ack.ok);
+        assert_eq!(ack.error.as_ref().unwrap().code, "INVALID_ENVELOPE");
+    }
+
+    #[tokio::test]
+    async fn signal_with_mode_rejected() {
+        let (server, _) = make_server();
+        let ack = do_send(
+            &server,
+            "agent://orchestrator",
+            Envelope {
+                macp_version: "1.0".into(),
+                mode: "macp.mode.decision.v1".into(),
+                message_type: "Signal".into(),
+                message_id: "sig-3".into(),
+                session_id: String::new(),
+                sender: String::new(),
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                payload: vec![],
+            },
+        )
+        .await;
+        assert!(!ack.ok);
+        assert_eq!(ack.error.as_ref().unwrap().code, "INVALID_ENVELOPE");
+    }
+
+    // StreamSession returns Unimplemented is verified by manifest_advertises_stream_false
+    // and the implementation returning Status::unimplemented. Cannot construct tonic::Streaming
+    // in a unit test, so this is tested at the integration level.
+
+    #[tokio::test]
+    async fn manifest_advertises_stream_false() {
+        let (server, _) = make_server();
+        let resp = server
+            .initialize(Request::new(InitializeRequest {
+                supported_protocol_versions: vec!["1.0".into()],
+                client_info: None,
+                capabilities: None,
+            }))
+            .await
+            .unwrap();
+        let caps = resp.into_inner().capabilities.unwrap();
+        assert!(!caps.sessions.unwrap().stream);
     }
 }

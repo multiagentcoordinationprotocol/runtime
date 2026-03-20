@@ -1,4 +1,5 @@
 use crate::error::MacpError;
+use crate::mode::ModeResponse;
 use crate::pb::SessionStartPayload;
 use prost::Message;
 use std::collections::HashSet;
@@ -31,6 +32,24 @@ pub struct Session {
     pub context: Vec<u8>,
     pub roots: Vec<crate::pb::Root>,
     pub initiator_sender: String,
+}
+
+impl Session {
+    pub fn apply_mode_response(&mut self, response: ModeResponse) {
+        match response {
+            ModeResponse::NoOp => {}
+            ModeResponse::PersistState(state) => self.mode_state = state,
+            ModeResponse::Resolve(resolution) => {
+                self.state = SessionState::Resolved;
+                self.resolution = Some(resolution);
+            }
+            ModeResponse::PersistAndResolve { state, resolution } => {
+                self.mode_state = state;
+                self.state = SessionState::Resolved;
+                self.resolution = Some(resolution);
+            }
+        }
+    }
 }
 
 pub fn is_standard_mode(mode: &str) -> bool {
@@ -88,6 +107,41 @@ pub fn validate_standard_session_start_payload(
     }
 
     Ok(())
+}
+
+/// Validate that a session ID meets the acceptance policy.
+///
+/// Accepts:
+/// - UUID v4/v7 in hyphenated lowercase canonical form (36 chars)
+/// - base64url tokens of 22+ chars (`[A-Za-z0-9_-]`)
+///
+/// Rejects everything else (empty, short human-readable, uppercase UUID, etc.).
+pub fn validate_session_id_for_acceptance(session_id: &str) -> Result<(), MacpError> {
+    if session_id.is_empty() {
+        return Err(MacpError::InvalidSessionId);
+    }
+
+    // Try UUID parse: must be valid UUID and canonical lowercase hyphenated form
+    if session_id.len() == 36 && session_id.contains('-') {
+        if let Ok(parsed) = uuid::Uuid::parse_str(session_id) {
+            // Verify it's the canonical lowercase hyphenated representation
+            if parsed.as_hyphenated().to_string() == session_id {
+                return Ok(());
+            }
+        }
+        return Err(MacpError::InvalidSessionId);
+    }
+
+    // Try base64url: at least 22 chars, only [A-Za-z0-9_-]
+    if session_id.len() >= 22
+        && session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Ok(());
+    }
+
+    Err(MacpError::InvalidSessionId)
 }
 
 #[cfg(test)]
@@ -190,5 +244,69 @@ mod tests {
     fn experimental_modes_keep_legacy_flexibility() {
         let payload = SessionStartPayload::default();
         validate_standard_session_start_payload("macp.mode.multi_round.v1", &payload).unwrap();
+    }
+
+    #[test]
+    fn valid_uuid_v4_accepted() {
+        let id = uuid::Uuid::new_v4().as_hyphenated().to_string();
+        validate_session_id_for_acceptance(&id).unwrap();
+    }
+
+    #[test]
+    fn valid_base64url_accepted() {
+        // 22-char base64url token
+        validate_session_id_for_acceptance("abcdefghijklmnopqrstuv").unwrap();
+        // longer base64url with underscore and hyphen
+        validate_session_id_for_acceptance("abc-def_ghi-jkl_mno-pqr").unwrap();
+    }
+
+    #[test]
+    fn empty_id_rejected() {
+        assert_eq!(
+            validate_session_id_for_acceptance("")
+                .unwrap_err()
+                .to_string(),
+            "InvalidSessionId"
+        );
+    }
+
+    #[test]
+    fn short_weak_id_rejected() {
+        assert_eq!(
+            validate_session_id_for_acceptance("s1")
+                .unwrap_err()
+                .to_string(),
+            "InvalidSessionId"
+        );
+        assert_eq!(
+            validate_session_id_for_acceptance("decision-demo-1")
+                .unwrap_err()
+                .to_string(),
+            "InvalidSessionId"
+        );
+    }
+
+    #[test]
+    fn uppercase_uuid_rejected() {
+        let id = uuid::Uuid::new_v4()
+            .as_hyphenated()
+            .to_string()
+            .to_uppercase();
+        assert_eq!(
+            validate_session_id_for_acceptance(&id)
+                .unwrap_err()
+                .to_string(),
+            "InvalidSessionId"
+        );
+    }
+
+    #[test]
+    fn base64url_too_short_rejected() {
+        assert_eq!(
+            validate_session_id_for_acceptance("abcdefghij")
+                .unwrap_err()
+                .to_string(),
+            "InvalidSessionId"
+        );
     }
 }

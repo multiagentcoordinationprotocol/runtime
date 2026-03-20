@@ -3,11 +3,11 @@ mod server;
 use macp_runtime::log_store::LogStore;
 use macp_runtime::pb;
 use macp_runtime::registry::SessionRegistry;
+use macp_runtime::replay::replay_session;
 use macp_runtime::runtime::Runtime;
 use macp_runtime::security::SecurityLayer;
 use macp_runtime::storage::{
-    cleanup_temp_files, migrate_if_needed, recover_session, FileBackend, MemoryBackend,
-    StorageBackend,
+    cleanup_temp_files, migrate_if_needed, FileBackend, MemoryBackend, StorageBackend,
 };
 use server::MacpServer;
 use std::path::PathBuf;
@@ -38,33 +38,80 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let log_store = Arc::new(LogStore::new());
 
     if !memory_only {
-        let mut sessions = storage.load_all_sessions().await?;
-        for session in &mut sessions {
-            let log_entries = storage.load_log(&session.session_id).await?;
+        // Build mode map for replay
+        use macp_runtime::mode::Mode;
+        use std::collections::HashMap;
+        let mut modes: HashMap<String, Box<dyn Mode>> = HashMap::new();
+        modes.insert(
+            "macp.mode.decision.v1".into(),
+            Box::new(macp_runtime::mode::decision::DecisionMode),
+        );
+        modes.insert(
+            "macp.mode.proposal.v1".into(),
+            Box::new(macp_runtime::mode::proposal::ProposalMode),
+        );
+        modes.insert(
+            "macp.mode.task.v1".into(),
+            Box::new(macp_runtime::mode::task::TaskMode),
+        );
+        modes.insert(
+            "macp.mode.handoff.v1".into(),
+            Box::new(macp_runtime::mode::handoff::HandoffMode),
+        );
+        modes.insert(
+            "macp.mode.quorum.v1".into(),
+            Box::new(macp_runtime::mode::quorum::QuorumMode),
+        );
+        modes.insert(
+            "macp.mode.multi_round.v1".into(),
+            Box::new(macp_runtime::mode::multi_round::MultiRoundMode),
+        );
 
-            // Crash recovery: reconcile dedup state from log
-            recover_session(session, &log_entries);
+        // Enumerate session directories and replay from logs
+        let sessions_dir = data_dir.join("sessions");
+        let mut recovered = 0usize;
+        if sessions_dir.exists() {
+            for entry in std::fs::read_dir(&sessions_dir)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let session_id = entry.file_name().to_string_lossy().to_string();
+                let log_entries = storage.load_log(&session_id).await?;
+                if log_entries.is_empty() {
+                    continue;
+                }
 
-            // Populate in-memory log store
-            log_store.create_session_log(&session.session_id).await;
-            for entry in &log_entries {
-                log_store.append(&session.session_id, entry.clone()).await;
+                match replay_session(&session_id, &log_entries, &modes) {
+                    Ok(session) => {
+                        // Best-effort snapshot update
+                        if let Err(e) = storage.save_session(&session).await {
+                            eprintln!(
+                                "warning: failed to persist recovered session '{}': {e}",
+                                session_id
+                            );
+                        }
+
+                        // Populate in-memory log store
+                        log_store.create_session_log(&session_id).await;
+                        for log_entry in &log_entries {
+                            log_store.append(&session_id, log_entry.clone()).await;
+                        }
+
+                        registry.insert_session_for_test(session_id, session).await;
+                        recovered += 1;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "warning: failed to replay session '{}': {e}; skipping",
+                            session_id
+                        );
+                    }
+                }
             }
-
-            // Persist recovered session state if it changed
-            if let Err(e) = storage.save_session(session).await {
-                eprintln!(
-                    "warning: failed to persist recovered session '{}': {e}",
-                    session.session_id
-                );
-            }
-
-            registry
-                .insert_session_for_test(session.session_id.clone(), session.clone())
-                .await;
         }
-        if !sessions.is_empty() {
-            println!("Loaded {} sessions from storage.", sessions.len());
+        if recovered > 0 {
+            println!("Replayed {} sessions from log.", recovered);
         }
     }
 
