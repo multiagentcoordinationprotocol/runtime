@@ -18,6 +18,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
+type SessionResponseStream = std::pin::Pin<
+    Box<dyn futures_core::Stream<Item = Result<StreamSessionResponse, Status>> + Send>,
+>;
+
+#[derive(Clone)]
 pub struct MacpServer {
     runtime: Arc<Runtime>,
     security: SecurityLayer,
@@ -97,9 +102,6 @@ impl MacpServer {
         self.security
             .enforce_rate_limit(&identity.sender, is_session_start)
             .await?;
-        // max_open_sessions is passed to runtime.process() where it is
-        // enforced atomically under the session write lock, avoiding a
-        // TOCTOU race between the count check and session insertion.
         let max_open = if is_session_start {
             identity.max_open_sessions
         } else {
@@ -130,6 +132,226 @@ impl MacpServer {
             ));
         }
         Ok(identity)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn try_next_stream_event(
+        receiver: &mut Option<tokio::sync::broadcast::Receiver<Envelope>>,
+    ) -> Result<Option<Envelope>, Status> {
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let rx = match receiver.as_mut() {
+            Some(rx) => rx,
+            None => return Ok(None),
+        };
+
+        match rx.try_recv() {
+            Ok(envelope) => Ok(Some(envelope)),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Closed) => {
+                *receiver = None;
+                Ok(None)
+            }
+            Err(TryRecvError::Lagged(skipped)) => Err(Status::resource_exhausted(format!(
+                "StreamSession receiver fell behind by {skipped} envelopes"
+            ))),
+        }
+    }
+
+    async fn process_stream_request(
+        &self,
+        identity: &AuthIdentity,
+        req: StreamSessionRequest,
+        bound_session_id: &mut Option<String>,
+        session_events: &mut Option<tokio::sync::broadcast::Receiver<Envelope>>,
+    ) -> Result<(), Status> {
+        let envelope = req.envelope.ok_or_else(|| {
+            Status::invalid_argument("StreamSessionRequest must contain an envelope")
+        })?;
+
+        self.validate_envelope_shape(&envelope)
+            .map_err(Self::status_from_error)?;
+        if envelope.session_id.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "StreamSession requires a non-empty session_id",
+            ));
+        }
+        if envelope.mode.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "StreamSession requires a non-empty mode",
+            ));
+        }
+        if let Some(bound) = bound_session_id.as_ref() {
+            if bound != &envelope.session_id {
+                return Err(Status::failed_precondition(
+                    "StreamSession may only carry envelopes for one session_id",
+                ));
+            }
+        }
+
+        let envelope = Self::apply_authenticated_sender(identity, envelope)
+            .map_err(Self::status_from_error)?;
+        let is_session_start = envelope.message_type == "SessionStart";
+
+        if !is_session_start {
+            if let Some(session) = self.runtime.get_session_checked(&envelope.session_id).await {
+                if envelope.mode != session.mode {
+                    return Err(Status::failed_precondition(
+                        "INVALID_ENVELOPE: envelope mode does not match the bound session mode",
+                    ));
+                }
+                if session.state != SessionState::Open {
+                    return Err(Status::failed_precondition("SESSION_NOT_OPEN"));
+                }
+            } else if envelope.message_type == "Signal" {
+                return Err(Status::not_found(format!(
+                    "Session '{}' not found",
+                    envelope.session_id
+                )));
+            }
+        }
+
+        self.security
+            .authorize_mode(identity, &envelope.mode, is_session_start)
+            .map_err(Self::status_from_error)?;
+        self.security
+            .enforce_rate_limit(&identity.sender, is_session_start)
+            .await
+            .map_err(Self::status_from_error)?;
+
+        if session_events.is_none() {
+            *bound_session_id = Some(envelope.session_id.clone());
+            *session_events = Some(self.runtime.subscribe_session_stream(&envelope.session_id));
+        }
+
+        let max_open = if is_session_start {
+            identity.max_open_sessions
+        } else {
+            None
+        };
+        self.runtime
+            .process(&envelope, max_open)
+            .await
+            .map_err(Self::status_from_error)?;
+        Ok(())
+    }
+
+    fn build_stream_session_stream<S>(
+        &self,
+        identity: AuthIdentity,
+        inbound: S,
+    ) -> SessionResponseStream
+    where
+        S: futures_core::Stream<Item = Result<StreamSessionRequest, Status>> + Send + 'static,
+    {
+        use tokio::sync::broadcast;
+        use tokio_stream::StreamExt;
+
+        // Actions collected from tokio::select! arms to process outside the
+        // select scope, avoiding borrow and macro-expansion issues with `?`
+        // and `yield` inside select branches within try_stream!.
+        enum StreamAction {
+            ProcessRequest(StreamSessionRequest),
+            EmitEnvelope(Envelope),
+            ClientError(Status),
+            ClientDone,
+            EventsClosed,
+            Lagged(u64),
+        }
+
+        let server = self.clone();
+        let output = async_stream::try_stream! {
+            let mut inbound = Box::pin(inbound);
+            let mut bound_session_id: Option<String> = None;
+            let mut session_events: Option<broadcast::Receiver<Envelope>> = None;
+
+            loop {
+                if session_events.is_some() {
+                    let action = {
+                        let events = session_events.as_mut().unwrap();
+                        tokio::select! {
+                            maybe_req = inbound.next() => {
+                                match maybe_req {
+                                    Some(Ok(req)) => StreamAction::ProcessRequest(req),
+                                    Some(Err(status)) => StreamAction::ClientError(status),
+                                    None => StreamAction::ClientDone,
+                                }
+                            }
+                            recv_result = events.recv() => {
+                                match recv_result {
+                                    Ok(envelope) => StreamAction::EmitEnvelope(envelope),
+                                    Err(broadcast::error::RecvError::Closed) => StreamAction::EventsClosed,
+                                    Err(broadcast::error::RecvError::Lagged(n)) => StreamAction::Lagged(n),
+                                }
+                            }
+                        }
+                    };
+
+                    match action {
+                        StreamAction::ProcessRequest(req) => {
+                            server
+                                .process_stream_request(
+                                    &identity,
+                                    req,
+                                    &mut bound_session_id,
+                                    &mut session_events,
+                                )
+                                .await?;
+                            while let Some(envelope) = Self::try_next_stream_event(&mut session_events)? {
+                                yield StreamSessionResponse {
+                                    envelope: Some(envelope),
+                                };
+                            }
+                        }
+                        StreamAction::EmitEnvelope(envelope) => {
+                            yield StreamSessionResponse {
+                                envelope: Some(envelope),
+                            };
+                        }
+                        StreamAction::ClientError(status) => {
+                            Err(status)?;
+                        }
+                        StreamAction::ClientDone => {
+                            while let Some(envelope) = Self::try_next_stream_event(&mut session_events)? {
+                                yield StreamSessionResponse {
+                                    envelope: Some(envelope),
+                                };
+                            }
+                            break;
+                        }
+                        StreamAction::EventsClosed => {
+                            session_events = None;
+                        }
+                        StreamAction::Lagged(skipped) => {
+                            Err(Status::resource_exhausted(format!(
+                                "StreamSession receiver fell behind by {skipped} envelopes"
+                            )))?;
+                        }
+                    }
+                } else {
+                    match inbound.next().await {
+                        Some(Ok(req)) => {
+                            server
+                                .process_stream_request(
+                                    &identity,
+                                    req,
+                                    &mut bound_session_id,
+                                    &mut session_events,
+                                )
+                                .await?;
+                            while let Some(envelope) = Self::try_next_stream_event(&mut session_events)? {
+                                yield StreamSessionResponse {
+                                    envelope: Some(envelope),
+                                };
+                            }
+                        }
+                        Some(Err(status)) => Err(status)?,
+                        None => break,
+                    }
+                }
+            }
+        };
+        Box::pin(output)
     }
 
     fn status_from_error(err: MacpError) -> Status {
@@ -167,7 +389,7 @@ impl MacpRuntimeService for MacpServer {
                 website_url: String::new(),
             }),
             capabilities: Some(Capabilities {
-                sessions: Some(SessionsCapability { stream: false }),
+                sessions: Some(SessionsCapability { stream: true }),
                 cancellation: Some(CancellationCapability {
                     cancel_session: true,
                 }),
@@ -184,7 +406,7 @@ impl MacpRuntimeService for MacpServer {
                 experimental: None,
             }),
             supported_modes: self.runtime.registered_mode_names(),
-            instructions: "Authenticate requests with Authorization: Bearer <token>. For local development only, x-macp-agent-id may be enabled by configuration.".into(),
+            instructions: "Authenticate requests with Authorization: Bearer <token>. Use StreamSession for session-scoped bidirectional streaming of accepted envelopes. For local development only, x-macp-agent-id may be enabled by configuration.".into(),
         }))
     }
 
@@ -350,17 +572,20 @@ impl MacpRuntimeService for MacpServer {
         Ok(Response::new(ListRootsResponse { roots: vec![] }))
     }
 
-    type StreamSessionStream = std::pin::Pin<
-        Box<dyn futures_core::Stream<Item = Result<StreamSessionResponse, Status>> + Send>,
-    >;
+    type StreamSessionStream = SessionResponseStream;
 
     async fn stream_session(
         &self,
-        _request: Request<tonic::Streaming<StreamSessionRequest>>,
+        request: Request<tonic::Streaming<StreamSessionRequest>>,
     ) -> Result<Response<Self::StreamSessionStream>, Status> {
-        Err(Status::unimplemented(
-            "StreamSession is intentionally disabled in the unary freeze profile",
-        ))
+        let identity = self
+            .security
+            .authenticate_metadata(request.metadata())
+            .map_err(Self::status_from_error)?;
+        Ok(Response::new(self.build_stream_session_stream(
+            identity,
+            request.into_inner(),
+        )))
     }
 
     type WatchModeRegistryStream = std::pin::Pin<
@@ -509,9 +734,83 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 
-    // Note: stream_session cannot be unit-tested directly because
-    // tonic::Streaming requires an HTTP/2 body. The endpoint returns
-    // Status::unimplemented, verified via integration testing.
+    fn stream_identity(sender: &str) -> AuthIdentity {
+        AuthIdentity {
+            sender: sender.into(),
+            allowed_modes: None,
+            can_start_sessions: true,
+            max_open_sessions: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_session_emits_accepted_envelopes_only() {
+        use tokio_stream::{iter, StreamExt};
+
+        let (server, _) = make_server();
+        let requests = iter(vec![Ok(StreamSessionRequest {
+            envelope: Some(Envelope {
+                macp_version: "1.0".into(),
+                mode: "macp.mode.decision.v1".into(),
+                message_type: "SessionStart".into(),
+                message_id: "m1".into(),
+                session_id: "s1".into(),
+                sender: String::new(),
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                payload: start_payload(),
+            }),
+        })]);
+
+        let mut stream =
+            server.build_stream_session_stream(stream_identity("agent://orchestrator"), requests);
+
+        let response = stream.next().await.unwrap().unwrap();
+        let envelope = response.envelope.unwrap();
+        assert_eq!(envelope.message_type, "SessionStart");
+        assert_eq!(envelope.message_id, "m1");
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_session_rejects_mixed_session_ids() {
+        use tokio_stream::{iter, StreamExt};
+
+        let (server, _) = make_server();
+        let requests = iter(vec![
+            Ok(StreamSessionRequest {
+                envelope: Some(Envelope {
+                    macp_version: "1.0".into(),
+                    mode: "macp.mode.decision.v1".into(),
+                    message_type: "SessionStart".into(),
+                    message_id: "m1".into(),
+                    session_id: "s1".into(),
+                    sender: String::new(),
+                    timestamp_unix_ms: Utc::now().timestamp_millis(),
+                    payload: start_payload(),
+                }),
+            }),
+            Ok(StreamSessionRequest {
+                envelope: Some(Envelope {
+                    macp_version: "1.0".into(),
+                    mode: "macp.mode.decision.v1".into(),
+                    message_type: "SessionStart".into(),
+                    message_id: "m2".into(),
+                    session_id: "s2".into(),
+                    sender: String::new(),
+                    timestamp_unix_ms: Utc::now().timestamp_millis(),
+                    payload: start_payload(),
+                }),
+            }),
+        ]);
+
+        let mut stream =
+            server.build_stream_session_stream(stream_identity("agent://orchestrator"), requests);
+
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first.envelope.unwrap().session_id, "s1");
+        let err = stream.next().await.unwrap().unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    }
 
     #[tokio::test]
     async fn list_modes_returns_standard_modes() {

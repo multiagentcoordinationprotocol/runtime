@@ -6,7 +6,7 @@ The RFC/spec repository is still the normative source for MACP semantics. These 
 
 ## What is in this runtime profile
 
-- unary-first MACP server over gRPC
+- MACP server over gRPC with unary RPCs and per-session bidirectional streaming
 - five standards-track modes from the main RFC repository
 - one experimental `macp.mode.multi_round.v1` mode kept off discovery surfaces
 - strict canonical `SessionStart` for standards-track modes
@@ -24,21 +24,21 @@ The RFC/spec repository is still the normative source for MACP semantics. These 
 
 ## Freeze profile
 
-The current runtime is intended to be the freeze candidate for unary SDKs and reference examples.
+The current runtime is intended to be the freeze candidate for unary and streaming SDKs and reference examples.
 
 Implemented and supported:
 
 - `Initialize`
 - `Send`
+- `StreamSession`
 - `GetSession`
 - `CancelSession`
 - `GetManifest`
 - `ListModes`
 - `ListRoots`
 
-Not part of the freeze surface:
+Not yet implemented:
 
-- `StreamSession` is intentionally disabled in this profile
 - `WatchModeRegistry` is unimplemented
 - `WatchRoots` is unimplemented
 

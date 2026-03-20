@@ -18,6 +18,7 @@ use crate::session::{
     validate_standard_session_start_payload, Session, SessionState,
 };
 use crate::storage::StorageBackend;
+use crate::stream_bus::SessionStreamBus;
 
 const EXPERIMENTAL_DEFAULT_TTL_MS: i64 = 60_000;
 
@@ -31,6 +32,7 @@ pub struct Runtime {
     pub storage: Arc<dyn StorageBackend>,
     pub registry: Arc<SessionRegistry>,
     pub log_store: Arc<LogStore>,
+    stream_bus: Arc<SessionStreamBus>,
     modes: HashMap<String, Box<dyn Mode>>,
 }
 
@@ -52,6 +54,7 @@ impl Runtime {
             storage,
             registry,
             log_store,
+            stream_bus: Arc::new(SessionStreamBus::default()),
             modes,
         }
     }
@@ -62,6 +65,19 @@ impl Runtime {
             .filter(|mode_name| self.modes.contains_key(**mode_name))
             .map(|mode_name| (*mode_name).to_string())
             .collect()
+    }
+
+    pub fn subscribe_session_stream(
+        &self,
+        session_id: &str,
+    ) -> tokio::sync::broadcast::Receiver<Envelope> {
+        self.stream_bus.subscribe(session_id)
+    }
+
+    fn publish_accepted_envelope(&self, env: &Envelope) {
+        if !env.session_id.is_empty() {
+            self.stream_bus.publish(&env.session_id, env.clone());
+        }
     }
 
     fn make_incoming_entry(env: &Envelope) -> LogEntry {
@@ -259,6 +275,7 @@ impl Runtime {
         // 3. Best-effort session save
         self.save_session_to_storage(&session).await;
         guard.insert(env.session_id.clone(), session);
+        self.publish_accepted_envelope(env);
 
         Ok(ProcessResult {
             session_state: result_state,
@@ -323,6 +340,7 @@ impl Runtime {
 
         // 3. Best-effort session save
         self.save_session_to_storage(session).await;
+        self.publish_accepted_envelope(env);
 
         Ok(ProcessResult {
             session_state: result_state,
@@ -712,6 +730,45 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         let result = rt.cancel_session("s1", "cleanup").await.unwrap();
         assert_eq!(result.session_state, SessionState::Expired);
+    }
+
+    #[tokio::test]
+    async fn accepted_envelopes_are_published_in_order() {
+        let rt = make_runtime();
+        let mut events = rt.subscribe_session_stream("s1");
+
+        let start = env(
+            "macp.mode.decision.v1",
+            "SessionStart",
+            "m1",
+            "s1",
+            "agent://orchestrator",
+            session_start(vec!["agent://fraud".into()]),
+        );
+        rt.process(&start, None).await.unwrap();
+        let first = events.recv().await.unwrap();
+        assert_eq!(first.message_id, "m1");
+        assert_eq!(first.message_type, "SessionStart");
+
+        let proposal = ProposalPayload {
+            proposal_id: "p1".into(),
+            option: "step-up".into(),
+            rationale: "risk".into(),
+            supporting_data: vec![],
+        }
+        .encode_to_vec();
+        let proposal_env = env(
+            "macp.mode.decision.v1",
+            "Proposal",
+            "m2",
+            "s1",
+            "agent://orchestrator",
+            proposal,
+        );
+        rt.process(&proposal_env, None).await.unwrap();
+        let second = events.recv().await.unwrap();
+        assert_eq!(second.message_id, "m2");
+        assert_eq!(second.message_type, "Proposal");
     }
 
     #[tokio::test]

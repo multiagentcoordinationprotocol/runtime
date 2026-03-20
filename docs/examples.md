@@ -1,6 +1,6 @@
 # Examples and local development guide
 
-These examples target `macp-runtime v0.4.0` and the unary freeze profile.
+These examples target `macp-runtime v0.4.0` and the stream-capable freeze profile.
 
 They intentionally use the local-development security shortcut:
 
@@ -141,7 +141,19 @@ cargo run --bin multi_round_client
 
 This mode is still experimental. It remains callable by the explicit canonical name `macp.mode.multi_round.v1`, but it is not advertised by discovery RPCs and it does not use the strict standards-track `SessionStart` contract.
 
-## Example 7: Freeze-check / error-path client
+## Example 7: StreamSession
+
+`StreamSession` emits only accepted canonical MACP envelopes. A single gRPC stream binds to one session. If a client needs negative per-message acknowledgements, it should continue to use `Send`.
+
+Practical notes:
+
+- bind a stream by sending a session-scoped envelope for the target session
+- use `SessionStart` to create a new session over the stream
+- stream attachment starts observing future accepted envelopes from the bind point; it does not replay earlier history
+- use a session-scoped `Signal` envelope with the correct `session_id` and `mode` to attach to an existing session without mutating it
+- mixed-session streams are rejected with `FAILED_PRECONDITION`
+
+## Example 8: Freeze-check / error-path client
 
 Run:
 
