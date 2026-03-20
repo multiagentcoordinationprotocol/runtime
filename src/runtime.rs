@@ -958,7 +958,7 @@ mod tests {
                 Ok(vec![])
             }
             async fn append_log_entry(&self, _: &str, _: &LogEntry) -> io::Result<()> {
-                Err(io::Error::new(io::ErrorKind::Other, "disk full"))
+                Err(io::Error::other("disk full"))
             }
             async fn load_log(&self, _: &str) -> io::Result<Vec<LogEntry>> {
                 Ok(vec![])
@@ -1013,7 +1013,7 @@ mod tests {
             async fn append_log_entry(&self, _: &str, _: &LogEntry) -> io::Result<()> {
                 let n = self.count.fetch_add(1, Ordering::SeqCst);
                 if n >= 1 {
-                    Err(io::Error::new(io::ErrorKind::Other, "disk full"))
+                    Err(io::Error::other("disk full"))
                 } else {
                     Ok(())
                 }
@@ -1100,7 +1100,7 @@ mod tests {
             async fn append_log_entry(&self, _: &str, _: &LogEntry) -> io::Result<()> {
                 let n = self.count.fetch_add(1, Ordering::SeqCst);
                 if n >= 1 {
-                    Err(io::Error::new(io::ErrorKind::Other, "disk full"))
+                    Err(io::Error::other("disk full"))
                 } else {
                     Ok(())
                 }
