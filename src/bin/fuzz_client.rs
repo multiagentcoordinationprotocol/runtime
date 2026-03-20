@@ -11,6 +11,7 @@ use prost::Message;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut client = common::connect_client().await?;
+    let session_id = common::new_session_id();
 
     println!("=== Freeze-Profile Error Path Demo ===\n");
 
@@ -72,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "macp.mode.task.v1",
         "SessionStart",
         "m0",
-        "freeze-task-1",
+        &session_id,
         "planner",
         canonical_start_payload("freeze checks", &["planner", "worker"], 60_000),
     );
@@ -91,7 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "macp.mode.task.v1",
         "TaskRequest",
         "dup-1",
-        "freeze-task-1",
+        &session_id,
         "planner",
         duplicate_request.encode_to_vec(),
     );
@@ -104,7 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "macp.mode.task.v1",
         "TaskRequest",
         "spoof-1",
-        "freeze-task-1",
+        &session_id,
         "mallory",
         vec![1, 2, 3],
     );
@@ -115,14 +116,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "macp.mode.task.v1",
         "TaskUpdate",
         "big-1",
-        "freeze-task-1",
+        &session_id,
         "worker",
         vec![b'x'; 2_000_000],
     );
     let ack = send_as(&mut client, "worker", oversized).await?;
     print_ack("payload_too_large", &ack);
 
-    match get_session_as(&mut client, "outsider", "freeze-task-1").await {
+    match get_session_as(&mut client, "outsider", &session_id).await {
         Ok(resp) => println!(
             "[forbidden_get_session] unexpected success: {:?}",
             resp.metadata
@@ -130,7 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(status) => println!("[forbidden_get_session] grpc error: {status}"),
     }
 
-    let cancelled = cancel_session_as(&mut client, "planner", "freeze-task-1", "end demo").await?;
+    let cancelled = cancel_session_as(&mut client, "planner", &session_id, "end demo").await?;
     if let Some(ack) = cancelled.ack.as_ref() {
         print_ack("cancel_session", ack);
     }

@@ -35,6 +35,10 @@ pub enum MacpError {
     PayloadTooLarge,
     #[error("RateLimited")]
     RateLimited,
+    #[error("StorageFailed")]
+    StorageFailed,
+    #[error("InvalidSessionId")]
+    InvalidSessionId,
 }
 
 impl MacpError {
@@ -56,6 +60,8 @@ impl MacpError {
             MacpError::DuplicateMessage => "DUPLICATE_MESSAGE",
             MacpError::PayloadTooLarge => "PAYLOAD_TOO_LARGE",
             MacpError::RateLimited => "RATE_LIMITED",
+            MacpError::StorageFailed => "INTERNAL_ERROR",
+            MacpError::InvalidSessionId => "INVALID_SESSION_ID",
         }
     }
 }
@@ -85,6 +91,8 @@ mod tests {
             (MacpError::DuplicateMessage, "DUPLICATE_MESSAGE"),
             (MacpError::PayloadTooLarge, "PAYLOAD_TOO_LARGE"),
             (MacpError::RateLimited, "RATE_LIMITED"),
+            (MacpError::StorageFailed, "INTERNAL_ERROR"),
+            (MacpError::InvalidSessionId, "INVALID_SESSION_ID"),
         ];
 
         for (error, expected_code) in cases {
@@ -110,5 +118,7 @@ mod tests {
         assert_eq!(MacpError::DuplicateMessage.to_string(), "DuplicateMessage");
         assert_eq!(MacpError::PayloadTooLarge.to_string(), "PayloadTooLarge");
         assert_eq!(MacpError::RateLimited.to_string(), "RateLimited");
+        assert_eq!(MacpError::StorageFailed.to_string(), "StorageFailed");
+        assert_eq!(MacpError::InvalidSessionId.to_string(), "InvalidSessionId");
     }
 }

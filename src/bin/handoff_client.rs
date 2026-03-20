@@ -11,6 +11,7 @@ use prost::Message;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut client = common::connect_client().await?;
+    let session_id = common::new_session_id();
 
     println!("=== Handoff Mode Demo ===\n");
 
@@ -21,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "macp.mode.handoff.v1",
             "SessionStart",
             "m0",
-            "handoff-demo-1",
+            &session_id,
             "owner",
             canonical_start_payload("escalate support ticket", &["owner", "target"], 60_000),
         ),
@@ -42,7 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "macp.mode.handoff.v1",
             "HandoffOffer",
             "m1",
-            "handoff-demo-1",
+            &session_id,
             "owner",
             offer.encode_to_vec(),
         ),
@@ -62,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "macp.mode.handoff.v1",
             "HandoffContext",
             "m2",
-            "handoff-demo-1",
+            &session_id,
             "owner",
             context.encode_to_vec(),
         ),
@@ -82,7 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "macp.mode.handoff.v1",
             "HandoffAccept",
             "m3",
-            "handoff-demo-1",
+            &session_id,
             "target",
             accept.encode_to_vec(),
         ),
@@ -97,7 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "macp.mode.handoff.v1",
             "Commitment",
             "m4",
-            "handoff-demo-1",
+            &session_id,
             "owner",
             canonical_commitment_payload(
                 "c1",
@@ -110,7 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     print_ack("commitment", &ack);
 
-    let session = get_session_as(&mut client, "target", "handoff-demo-1").await?;
+    let session = get_session_as(&mut client, "target", &session_id).await?;
     let meta = session.metadata.expect("metadata");
     println!("[get_session] state={} mode={}", meta.state, meta.mode);
 

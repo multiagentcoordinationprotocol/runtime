@@ -11,6 +11,7 @@ use prost::Message;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut client = common::connect_client().await?;
+    let session_id = common::new_session_id();
 
     println!("=== Proposal Mode Demo ===\n");
 
@@ -21,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "macp.mode.proposal.v1",
             "SessionStart",
             "m0",
-            "proposal-demo-1",
+            &session_id,
             "buyer",
             canonical_start_payload("negotiate price", &["buyer", "seller"], 60_000),
         ),
@@ -43,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "macp.mode.proposal.v1",
             "Proposal",
             "m1",
-            "proposal-demo-1",
+            &session_id,
             "seller",
             proposal.encode_to_vec(),
         ),
@@ -65,7 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "macp.mode.proposal.v1",
             "CounterProposal",
             "m2",
-            "proposal-demo-1",
+            &session_id,
             "buyer",
             counter.encode_to_vec(),
         ),
@@ -84,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "macp.mode.proposal.v1",
             "Accept",
             "m3",
-            "proposal-demo-1",
+            &session_id,
             "buyer",
             accept.encode_to_vec(),
         ),
@@ -103,7 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "macp.mode.proposal.v1",
             "Accept",
             "m4",
-            "proposal-demo-1",
+            &session_id,
             "seller",
             accept.encode_to_vec(),
         ),
@@ -118,7 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "macp.mode.proposal.v1",
             "Commitment",
             "m5",
-            "proposal-demo-1",
+            &session_id,
             "buyer",
             canonical_commitment_payload(
                 "c1",
@@ -131,7 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     print_ack("commitment", &ack);
 
-    let session = get_session_as(&mut client, "seller", "proposal-demo-1").await?;
+    let session = get_session_as(&mut client, "seller", &session_id).await?;
     let meta = session.metadata.expect("metadata");
     println!("[get_session] state={} mode={}", meta.state, meta.mode);
 

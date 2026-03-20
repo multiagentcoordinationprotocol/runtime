@@ -28,9 +28,18 @@ This runtime implements the current MACP core/service surface, the five standard
   - per-session append-only log files and session snapshots via `FileBackend`
   - crash recovery with dedup state reconciliation
   - atomic writes (tmp file + rename) prevent partial-write corruption
-- **Authoritative session streaming**
-  - `StreamSession` now emits accepted MACP envelopes for one bound session per stream
-  - mixed-session streams are rejected
+- **Authoritative accepted history**
+  - log append failures are now fatal — messages are not acknowledged without a durable record
+  - session state is rebuilt from append-only logs on startup via replay (no snapshot dependency)
+  - `LogEntry` enriched with `session_id`, `mode`, `macp_version` for self-describing replay
+- **Session ID security policy**
+  - session IDs must be UUID v4/v7 (hyphenated lowercase) or base64url tokens (22+ chars)
+  - weak/human-readable IDs are rejected with `INVALID_SESSION_ID`
+- **Signal enforcement**
+  - Signals are strictly ambient — non-empty `session_id` or `mode` is rejected
+- **StreamSession disabled in freeze profile**
+  - `Initialize` advertises `stream: false`
+  - `StreamSession` RPC returns `UNIMPLEMENTED` (implementation retained for future activation)
   - `WatchModeRegistry` and `WatchRoots` remain unimplemented
 
 ## Implemented modes
@@ -177,7 +186,7 @@ cargo run --bin fuzz_client
 | `GetManifest` | implemented |
 | `ListModes` | implemented |
 | `ListRoots` | implemented |
-| `StreamSession` | implemented (accepted-envelope session stream) |
+| `StreamSession` | disabled (unary-first freeze profile) |
 | `WatchModeRegistry` | unimplemented |
 | `WatchRoots` | unimplemented |
 
@@ -195,6 +204,7 @@ runtime/
 │   ├── registry.rs       # session store with optional persistence
 │   ├── log_store.rs      # in-memory accepted-history log cache
 │   ├── storage.rs        # storage backend trait, FileBackend persistence, crash recovery
+│   ├── replay.rs         # session rebuild from append-only log
 │   ├── mode/             # mode implementations
 │   └── bin/              # local development example clients
 ├── docs/
@@ -206,6 +216,6 @@ runtime/
 - The RFC/spec repository remains the normative source for protocol semantics.
 - This runtime only accepts the canonical standards-track mode identifiers for the five main modes.
 - `multi_round` remains experimental and is not advertised by discovery RPCs.
-- `StreamSession` is available for bidirectional session-scoped coordination. Use `Send` when you need per-message negative acknowledgements. The current implementation streams future accepted envelopes from the time the stream binds; it does not backfill earlier accepted history.
+- `StreamSession` is disabled in the freeze profile. The implementation is retained for future activation.
 
 See `docs/README.md` and `docs/examples.md` for the updated local development and usage guidance.

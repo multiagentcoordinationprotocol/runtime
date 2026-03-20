@@ -15,6 +15,12 @@ pub struct LogEntry {
     pub message_type: String,
     pub raw_payload: Vec<u8>,
     pub entry_kind: EntryKind,
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub macp_version: String,
 }
 
 pub struct LogStore {
@@ -62,6 +68,9 @@ mod tests {
             message_type: "Message".into(),
             raw_payload: vec![],
             entry_kind: kind,
+            session_id: String::new(),
+            mode: String::new(),
+            macp_version: String::new(),
         }
     }
 

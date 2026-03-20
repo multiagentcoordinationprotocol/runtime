@@ -11,6 +11,7 @@ use prost::Message;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut client = common::connect_client().await?;
+    let session_id = common::new_session_id();
 
     println!("=== Quorum Mode Demo ===\n");
 
@@ -21,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "macp.mode.quorum.v1",
             "SessionStart",
             "m0",
-            "quorum-demo-1",
+            &session_id,
             "coordinator",
             canonical_start_payload(
                 "approve production deploy",
@@ -47,7 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "macp.mode.quorum.v1",
             "ApprovalRequest",
             "m1",
-            "quorum-demo-1",
+            &session_id,
             "coordinator",
             request.encode_to_vec(),
         ),
@@ -66,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "macp.mode.quorum.v1",
             "Approve",
             "m2",
-            "quorum-demo-1",
+            &session_id,
             "alice",
             approve.encode_to_vec(),
         ),
@@ -85,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "macp.mode.quorum.v1",
             "Approve",
             "m3",
-            "quorum-demo-1",
+            &session_id,
             "bob",
             approve.encode_to_vec(),
         ),
@@ -100,7 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "macp.mode.quorum.v1",
             "Commitment",
             "m4",
-            "quorum-demo-1",
+            &session_id,
             "coordinator",
             canonical_commitment_payload(
                 "c1",
@@ -113,7 +114,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     print_ack("commitment", &ack);
 
-    let session = get_session_as(&mut client, "carol", "quorum-demo-1").await?;
+    let session = get_session_as(&mut client, "carol", &session_id).await?;
     let meta = session.metadata.expect("metadata");
     println!("[get_session] state={} mode={}", meta.state, meta.mode);
 

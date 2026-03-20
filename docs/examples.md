@@ -57,7 +57,7 @@ Flow:
 Important runtime behavior:
 
 - initiator/coordinator may emit `Proposal` and `Commitment`
-- participants emit `Evaluation`, `Objection`, and `Vote`
+- declared participants may also emit `Proposal`, `Evaluation`, `Objection`, and `Vote`
 - duplicate proposal IDs are rejected
 - votes are tracked per proposal, per sender
 - `CommitmentPayload` version fields must match the bound session versions
@@ -141,9 +141,11 @@ cargo run --bin multi_round_client
 
 This mode is still experimental. It remains callable by the explicit canonical name `macp.mode.multi_round.v1`, but it is not advertised by discovery RPCs and it does not use the strict standards-track `SessionStart` contract.
 
-## Example 7: StreamSession
+## Example 7: StreamSession (disabled in freeze profile)
 
-`StreamSession` emits only accepted canonical MACP envelopes. A single gRPC stream binds to one session. If a client needs negative per-message acknowledgements, it should continue to use `Send`.
+`StreamSession` is disabled in the unary-first freeze profile. The `Initialize` response advertises `stream: false` and the RPC returns `UNIMPLEMENTED`. The implementation is retained for future activation.
+
+When enabled, `StreamSession` emits only accepted canonical MACP envelopes. A single gRPC stream binds to one session. If a client needs negative per-message acknowledgements, it should continue to use `Send`.
 
 Practical notes:
 
@@ -170,6 +172,15 @@ This client exercises common failure paths for the freeze profile, including:
 - unauthorized sender spoofing
 - payload too large
 - session access without membership
+
+## Session ID policy
+
+Session IDs must be either:
+
+- **UUID v4/v7** in hyphenated lowercase canonical form (36 characters, e.g. `550e8400-e29b-41d4-a716-446655440000`)
+- **Base64url token** of at least 22 characters using only `[A-Za-z0-9_-]`
+
+Human-readable or short IDs (e.g. `"my-session"`, `"s1"`) are rejected with `INVALID_SESSION_ID`. The example clients generate UUID v4 session IDs automatically.
 
 ## Common troubleshooting
 
