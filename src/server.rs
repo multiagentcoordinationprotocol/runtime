@@ -134,6 +134,7 @@ impl MacpServer {
         Ok(identity)
     }
 
+    #[allow(clippy::result_large_err)]
     fn try_next_stream_event(
         receiver: &mut Option<tokio::sync::broadcast::Receiver<Envelope>>,
     ) -> Result<Option<Envelope>, Status> {
