@@ -2,7 +2,7 @@
 
 Reference runtime for the Multi-Agent Coordination Protocol (MACP).
 
-This runtime implements the current MACP core/service surface, the five standards-track modes in the main RFC repository, and one experimental `multi_round` mode that remains available only by explicit canonical name. The focus of this release is freeze-readiness for SDKs and real-world unary integrations: strict `SessionStart`, mode-semantic correctness, authenticated senders, bounded resources, and durable restart recovery.
+This runtime implements the current MACP core/service surface, the five standards-track modes in the main RFC repository, and one experimental `multi_round` mode that remains available only by explicit canonical name. The focus of this release is freeze-readiness for SDKs and real-world unary and streaming integrations: strict `SessionStart`, mode-semantic correctness, authenticated senders, bounded resources, and durable restart recovery.
 
 ## What changed in v0.4.0
 
@@ -28,8 +28,9 @@ This runtime implements the current MACP core/service surface, the five standard
   - per-session append-only log files and session snapshots via `FileBackend`
   - crash recovery with dedup state reconciliation
   - atomic writes (tmp file + rename) prevent partial-write corruption
-- **Unary freeze profile**
-  - `StreamSession` is intentionally disabled in this profile
+- **Authoritative session streaming**
+  - `StreamSession` now emits accepted MACP envelopes for one bound session per stream
+  - mixed-session streams are rejected
   - `WatchModeRegistry` and `WatchRoots` remain unimplemented
 
 ## Implemented modes
@@ -176,7 +177,7 @@ cargo run --bin fuzz_client
 | `GetManifest` | implemented |
 | `ListModes` | implemented |
 | `ListRoots` | implemented |
-| `StreamSession` | intentionally disabled in freeze profile |
+| `StreamSession` | implemented (accepted-envelope session stream) |
 | `WatchModeRegistry` | unimplemented |
 | `WatchRoots` | unimplemented |
 
@@ -205,6 +206,6 @@ runtime/
 - The RFC/spec repository remains the normative source for protocol semantics.
 - This runtime only accepts the canonical standards-track mode identifiers for the five main modes.
 - `multi_round` remains experimental and is not advertised by discovery RPCs.
-- `StreamSession` is intentionally not part of the freeze surface for the first SDKs.
+- `StreamSession` is available for bidirectional session-scoped coordination. Use `Send` when you need per-message negative acknowledgements. The current implementation streams future accepted envelopes from the time the stream binds; it does not backfill earlier accepted history.
 
 See `docs/README.md` and `docs/examples.md` for the updated local development and usage guidance.

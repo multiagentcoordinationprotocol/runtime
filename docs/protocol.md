@@ -10,21 +10,33 @@ The RFC/spec repository is the normative source for protocol semantics. This fil
 
 Clients should call `Initialize` before using the runtime.
 
-## Implemented unary RPCs
+## Implemented RPCs
 
 - `Initialize`
 - `Send`
+- `StreamSession`
 - `GetSession`
 - `CancelSession`
 - `GetManifest`
 - `ListModes`
 - `ListRoots`
 
-## Not in the freeze surface
+## Still unimplemented
 
-- `StreamSession` exists in the protobuf surface but is intentionally disabled in this runtime profile
 - `WatchModeRegistry` is unimplemented
 - `WatchRoots` is unimplemented
+
+## StreamSession profile
+
+`StreamSession` is session-scoped and authoritative for accepted envelopes:
+
+- one gRPC stream binds to one non-empty `session_id`
+- the server emits only accepted canonical MACP envelopes
+- stream attachment observes future accepted envelopes from the bind point; it does not backfill earlier history
+- accepted envelope order matches runtime admission order for that session
+- mixed-session streams are rejected with `FAILED_PRECONDITION`
+- stream-level validation failures terminate the stream with a gRPC status; use `Send` if you need explicit per-message negative acknowledgements
+- to attach to an existing session without mutating it, send a session-scoped `Signal` envelope with the correct `session_id` and `mode`
 
 ## Standards-track mode rules
 
@@ -81,4 +93,4 @@ For standards-track modes, `CommitmentPayload` must carry version fields that ma
 
 ## Discovery notes
 
-`ListModes` returns the five standards-track modes. `GetManifest` exposes a freeze-profile manifest that matches the implemented unary capabilities.
+`ListModes` returns the five standards-track modes. `GetManifest` exposes a manifest that matches the implemented unary and streaming capabilities.

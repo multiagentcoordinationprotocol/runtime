@@ -29,5 +29,6 @@ pub mod registry;
 pub mod runtime;
 pub mod session;
 pub mod storage;
+pub mod stream_bus;
 
 pub mod security;
