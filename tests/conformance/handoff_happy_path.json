@@ -1,0 +1,41 @@
+{
+  "mode": "macp.mode.handoff.v1",
+  "initiator": "agent://owner",
+  "participants": ["agent://owner", "agent://target"],
+  "mode_version": "1.0.0",
+  "configuration_version": "cfg-1",
+  "policy_version": "policy-1",
+  "ttl_ms": 60000,
+  "messages": [
+    {
+      "sender": "agent://owner",
+      "message_type": "HandoffOffer",
+      "payload_type": "handoff.HandoffOffer",
+      "payload": { "handoff_id": "h1", "target_participant": "agent://target", "scope": "support", "reason": "escalate" },
+      "expect": "accept"
+    },
+    {
+      "sender": "agent://target",
+      "message_type": "HandoffAccept",
+      "payload_type": "handoff.HandoffAccept",
+      "payload": { "handoff_id": "h1", "accepted_by": "agent://target", "reason": "ready" },
+      "expect": "accept"
+    },
+    {
+      "sender": "agent://owner",
+      "message_type": "Commitment",
+      "payload_type": "Commitment",
+      "payload": {
+        "commitment_id": "c1",
+        "action": "handoff.accepted",
+        "authority_scope": "test",
+        "reason": "done",
+        "mode_version": "1.0.0",
+        "policy_version": "policy-1",
+        "configuration_version": "cfg-1"
+      },
+      "expect": "accept"
+    }
+  ],
+  "expected_final_state": "Resolved"
+}

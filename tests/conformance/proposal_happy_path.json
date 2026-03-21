@@ -1,0 +1,48 @@
+{
+  "mode": "macp.mode.proposal.v1",
+  "initiator": "agent://buyer",
+  "participants": ["agent://buyer", "agent://seller"],
+  "mode_version": "1.0.0",
+  "configuration_version": "cfg-1",
+  "policy_version": "policy-1",
+  "ttl_ms": 60000,
+  "messages": [
+    {
+      "sender": "agent://seller",
+      "message_type": "Proposal",
+      "payload_type": "proposal.Proposal",
+      "payload": { "proposal_id": "p1", "title": "offer", "summary": "terms", "details": [], "tags": [] },
+      "expect": "accept"
+    },
+    {
+      "sender": "agent://buyer",
+      "message_type": "Accept",
+      "payload_type": "proposal.Accept",
+      "payload": { "proposal_id": "p1", "reason": "" },
+      "expect": "accept"
+    },
+    {
+      "sender": "agent://seller",
+      "message_type": "Accept",
+      "payload_type": "proposal.Accept",
+      "payload": { "proposal_id": "p1", "reason": "" },
+      "expect": "accept"
+    },
+    {
+      "sender": "agent://buyer",
+      "message_type": "Commitment",
+      "payload_type": "Commitment",
+      "payload": {
+        "commitment_id": "c1",
+        "action": "proposal.accepted",
+        "authority_scope": "test",
+        "reason": "done",
+        "mode_version": "1.0.0",
+        "policy_version": "policy-1",
+        "configuration_version": "cfg-1"
+      },
+      "expect": "accept"
+    }
+  ],
+  "expected_final_state": "Resolved"
+}

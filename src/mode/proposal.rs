@@ -480,6 +480,249 @@ mod tests {
         assert_eq!(err.to_string(), "InvalidPayload");
     }
 
+    fn make_counter_proposal(id: &str, supersedes: &str) -> Vec<u8> {
+        CounterProposalPayload {
+            proposal_id: id.into(),
+            supersedes_proposal_id: supersedes.into(),
+            title: format!("counter-{id}"),
+            summary: "counter".into(),
+            details: vec![],
+        }
+        .encode_to_vec()
+    }
+
+    #[test]
+    fn empty_proposal_id_rejected() {
+        let mode = ProposalMode;
+        let mut session = base_session();
+        let resp = mode
+            .on_session_start(&session, &env("agent://buyer", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, resp);
+        let empty = ProposalPayload {
+            proposal_id: "".into(),
+            title: "title".into(),
+            summary: "summary".into(),
+            details: vec![],
+            tags: vec![],
+        }
+        .encode_to_vec();
+        assert_eq!(
+            mode.on_message(&session, &env("agent://seller", "Proposal", empty))
+                .unwrap_err()
+                .to_string(),
+            "InvalidPayload"
+        );
+    }
+
+    #[test]
+    fn counterproposal_requires_valid_supersedes() {
+        let mode = ProposalMode;
+        let mut session = base_session();
+        let resp = mode
+            .on_session_start(&session, &env("agent://buyer", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, resp);
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://seller", "Proposal", make_proposal("p1")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        // Supersedes non-existent proposal
+        let bad_counter = make_counter_proposal("p2", "nonexistent");
+        assert_eq!(
+            mode.on_message(
+                &session,
+                &env("agent://buyer", "CounterProposal", bad_counter)
+            )
+            .unwrap_err()
+            .to_string(),
+            "InvalidPayload"
+        );
+    }
+
+    #[test]
+    fn counterproposal_chain_works() {
+        let mode = ProposalMode;
+        let mut session = base_session();
+        let resp = mode
+            .on_session_start(&session, &env("agent://buyer", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, resp);
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://seller", "Proposal", make_proposal("p1")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        let resp = mode
+            .on_message(
+                &session,
+                &env(
+                    "agent://buyer",
+                    "CounterProposal",
+                    make_counter_proposal("p2", "p1"),
+                ),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        // Chain: p3 supersedes p2
+        mode.on_message(
+            &session,
+            &env(
+                "agent://seller",
+                "CounterProposal",
+                make_counter_proposal("p3", "p2"),
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn non_terminal_reject_does_not_enable_commitment() {
+        let mode = ProposalMode;
+        let mut session = base_session();
+        let resp = mode
+            .on_session_start(&session, &env("agent://buyer", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, resp);
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://seller", "Proposal", make_proposal("p1")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        // Non-terminal reject
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://buyer", "Reject", make_reject("p1", false)),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        assert_eq!(
+            mode.on_message(
+                &session,
+                &env(
+                    "agent://buyer",
+                    "Commitment",
+                    commitment(&session, "proposal.rejected"),
+                ),
+            )
+            .unwrap_err()
+            .to_string(),
+            "InvalidPayload"
+        );
+    }
+
+    #[test]
+    fn non_participant_cannot_propose() {
+        let mode = ProposalMode;
+        let session = base_session();
+        let err = mode
+            .authorize_sender(
+                &session,
+                &env("agent://outsider", "Proposal", make_proposal("p1")),
+            )
+            .unwrap_err();
+        assert_eq!(err.to_string(), "Forbidden");
+    }
+
+    #[test]
+    fn commitment_version_mismatch_rejected() {
+        let mode = ProposalMode;
+        let mut session = base_session();
+        let resp = mode
+            .on_session_start(&session, &env("agent://buyer", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, resp);
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://seller", "Proposal", make_proposal("p1")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        let resp = mode
+            .on_message(&session, &env("agent://buyer", "Accept", make_accept("p1")))
+            .unwrap();
+        apply(&mut session, resp);
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://seller", "Accept", make_accept("p1")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        let bad = CommitmentPayload {
+            commitment_id: "c1".into(),
+            action: "proposal.accepted".into(),
+            authority_scope: "commercial".into(),
+            reason: "bound".into(),
+            mode_version: "wrong".into(),
+            policy_version: session.policy_version.clone(),
+            configuration_version: session.configuration_version.clone(),
+        }
+        .encode_to_vec();
+        assert_eq!(
+            mode.on_message(&session, &env("agent://buyer", "Commitment", bad))
+                .unwrap_err()
+                .to_string(),
+            "InvalidPayload"
+        );
+    }
+
+    #[test]
+    fn accept_on_withdrawn_proposal_rejected() {
+        let mode = ProposalMode;
+        let mut session = base_session();
+        let resp = mode
+            .on_session_start(&session, &env("agent://buyer", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, resp);
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://seller", "Proposal", make_proposal("p1")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://seller", "Withdraw", make_withdraw("p1")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        assert_eq!(
+            mode.on_message(&session, &env("agent://buyer", "Accept", make_accept("p1")))
+                .unwrap_err()
+                .to_string(),
+            "InvalidPayload"
+        );
+    }
+
+    #[test]
+    fn commitment_from_non_initiator_rejected() {
+        let mode = ProposalMode;
+        let session = base_session();
+        let err = mode
+            .authorize_sender(
+                &session,
+                &env(
+                    "agent://seller",
+                    "Commitment",
+                    commitment(&session, "proposal.accepted"),
+                ),
+            )
+            .unwrap_err();
+        assert_eq!(err.to_string(), "Forbidden");
+    }
+
     #[test]
     fn terminal_rejection_on_different_proposal_survives_withdraw() {
         let mode = ProposalMode;

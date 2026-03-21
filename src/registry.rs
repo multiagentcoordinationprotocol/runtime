@@ -193,7 +193,7 @@ impl SessionRegistry {
         guard.values().cloned().collect()
     }
 
-    pub async fn insert_session_for_test(&self, session_id: String, session: Session) {
+    pub async fn insert_recovered_session(&self, session_id: String, session: Session) {
         let mut guard = self.sessions.write().await;
         guard.insert(session_id, session);
         let _ = self.persist_locked(&guard).await;
@@ -255,7 +255,7 @@ mod tests {
         expired.ttl_expiry = now - 1000; // expired 1 second ago
         expired.state = SessionState::Open; // still Open but TTL is past
         registry
-            .insert_session_for_test("expired-s1".into(), expired)
+            .insert_recovered_session("expired-s1".into(), expired)
             .await;
 
         // Should not count the expired-but-open session
@@ -270,7 +270,7 @@ mod tests {
         active.ttl_expiry = now + 60_000; // expires in 60s
         active.state = SessionState::Open;
         registry
-            .insert_session_for_test("active-s1".into(), active)
+            .insert_recovered_session("active-s1".into(), active)
             .await;
 
         let count = registry
@@ -291,7 +291,7 @@ mod tests {
 
         let registry = SessionRegistry::with_persistence(&base).unwrap();
         registry
-            .insert_session_for_test("s1".into(), sample_session("s1"))
+            .insert_recovered_session("s1".into(), sample_session("s1"))
             .await;
 
         let reopened = SessionRegistry::with_persistence(&base).unwrap();

@@ -109,6 +109,10 @@ impl Mode for HandoffMode {
                     || state.offers.contains_key(&payload.handoff_id)
                     || !is_declared_participant(&session.participants, &payload.target_participant)
                     || payload.target_participant == env.sender
+                    || state
+                        .offers
+                        .values()
+                        .any(|o| o.disposition == HandoffDisposition::Offered)
                 {
                     return Err(MacpError::InvalidPayload);
                 }
@@ -734,6 +738,133 @@ mod tests {
             .on_message(&session, &env("owner", "Commitment", commitment_payload()))
             .unwrap();
         assert!(matches!(result, ModeResponse::PersistAndResolve { .. }));
+    }
+
+    // --- Serial offer enforcement ---
+
+    #[test]
+    fn second_offer_while_first_pending_rejected() {
+        let mode = HandoffMode;
+        let mut session = base_session();
+        session.participants = vec!["owner".into(), "target".into(), "other".into()];
+        let result = mode
+            .on_session_start(&session, &env("owner", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("owner", "HandoffOffer", make_offer("h1", "target")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let err = mode
+            .on_message(
+                &session,
+                &env("owner", "HandoffOffer", make_offer("h2", "other")),
+            )
+            .unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
+    }
+
+    #[test]
+    fn second_offer_after_first_accepted_succeeds() {
+        let mode = HandoffMode;
+        let mut session = base_session();
+        session.participants = vec!["owner".into(), "target".into(), "other".into()];
+        let result = mode
+            .on_session_start(&session, &env("owner", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("owner", "HandoffOffer", make_offer("h1", "target")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("target", "HandoffAccept", make_accept("h1", "target")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        mode.on_message(
+            &session,
+            &env("owner", "HandoffOffer", make_offer("h2", "other")),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn second_offer_after_first_declined_succeeds() {
+        let mode = HandoffMode;
+        let mut session = base_session();
+        session.participants = vec!["owner".into(), "target".into(), "other".into()];
+        let result = mode
+            .on_session_start(&session, &env("owner", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("owner", "HandoffOffer", make_offer("h1", "target")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("target", "HandoffDecline", make_decline("h1", "target")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        mode.on_message(
+            &session,
+            &env("owner", "HandoffOffer", make_offer("h2", "other")),
+        )
+        .unwrap();
+    }
+
+    // --- Commitment version mismatch ---
+
+    #[test]
+    fn commitment_version_mismatch_rejected() {
+        let mode = HandoffMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("owner", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("owner", "HandoffOffer", make_offer("h1", "target")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("target", "HandoffAccept", make_accept("h1", "target")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let bad_commitment = CommitmentPayload {
+            commitment_id: "c1".into(),
+            action: "handoff.accepted".into(),
+            authority_scope: "support".into(),
+            reason: "accepted".into(),
+            mode_version: "wrong".into(),
+            policy_version: "policy".into(),
+            configuration_version: "config".into(),
+        }
+        .encode_to_vec();
+        let err = mode
+            .on_message(&session, &env("owner", "Commitment", bad_commitment))
+            .unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
     }
 
     // --- Unknown message type ---

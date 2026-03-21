@@ -121,12 +121,17 @@ pub fn validate_session_id_for_acceptance(session_id: &str) -> Result<(), MacpEr
         return Err(MacpError::InvalidSessionId);
     }
 
-    // Try UUID parse: must be valid UUID and canonical lowercase hyphenated form
+    // Try UUID parse: must be valid UUID v4 or v7, canonical lowercase hyphenated form
     if session_id.len() == 36 && session_id.contains('-') {
         if let Ok(parsed) = uuid::Uuid::parse_str(session_id) {
             // Verify it's the canonical lowercase hyphenated representation
             if parsed.as_hyphenated().to_string() == session_id {
-                return Ok(());
+                match parsed.get_version() {
+                    Some(uuid::Version::Random) | Some(uuid::Version::SortRand) => {
+                        return Ok(());
+                    }
+                    _ => {}
+                }
             }
         }
         return Err(MacpError::InvalidSessionId);
@@ -304,6 +309,37 @@ mod tests {
     fn base64url_too_short_rejected() {
         assert_eq!(
             validate_session_id_for_acceptance("abcdefghij")
+                .unwrap_err()
+                .to_string(),
+            "InvalidSessionId"
+        );
+    }
+
+    #[test]
+    fn valid_uuid_v7_accepted() {
+        // Construct a v7 UUID by patching the version nibble of a v4 UUID
+        let v4 = uuid::Uuid::new_v4();
+        let mut bytes = *v4.as_bytes();
+        // Set version nibble (bits 48-51) to 0b0111 (v7)
+        bytes[6] = (bytes[6] & 0x0F) | 0x70;
+        // Keep variant bits valid (RFC 4122: 0b10xx)
+        bytes[8] = (bytes[8] & 0x3F) | 0x80;
+        let v7_id = uuid::Uuid::from_bytes(bytes).as_hyphenated().to_string();
+        assert!(validate_session_id_for_acceptance(&v7_id).is_ok());
+    }
+
+    #[test]
+    fn uuid_v1_rejected() {
+        // Construct a v1 UUID by patching the version nibble of a v4 UUID
+        let v4 = uuid::Uuid::new_v4();
+        let mut bytes = *v4.as_bytes();
+        // Set version nibble (bits 48-51) to 0b0001 (v1)
+        bytes[6] = (bytes[6] & 0x0F) | 0x10;
+        // Keep variant bits valid (RFC 4122: 0b10xx)
+        bytes[8] = (bytes[8] & 0x3F) | 0x80;
+        let v1_id = uuid::Uuid::from_bytes(bytes).as_hyphenated().to_string();
+        assert_eq!(
+            validate_session_id_for_acceptance(&v1_id)
                 .unwrap_err()
                 .to_string(),
             "InvalidSessionId"

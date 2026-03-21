@@ -862,6 +862,54 @@ mod tests {
         assert!(matches!(result, ModeResponse::PersistAndResolve { .. }));
     }
 
+    // --- Commitment version mismatch ---
+
+    #[test]
+    fn commitment_version_mismatch_rejected() {
+        let mode = QuorumMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("coordinator", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env(
+                    "coordinator",
+                    "ApprovalRequest",
+                    make_approval_request("r1", 2),
+                ),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("alice", "Approve", make_approve("r1", "yes")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(&session, &env("bob", "Approve", make_approve("r1", "yes")))
+            .unwrap();
+        apply(&mut session, result);
+        let bad_commitment = CommitmentPayload {
+            commitment_id: "c1".into(),
+            action: "quorum.approved".into(),
+            authority_scope: "deploy".into(),
+            reason: "threshold met".into(),
+            mode_version: "wrong".into(),
+            policy_version: "policy".into(),
+            configuration_version: "config".into(),
+        }
+        .encode_to_vec();
+        let err = mode
+            .on_message(&session, &env("coordinator", "Commitment", bad_commitment))
+            .unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
+    }
+
     // --- Unknown message type ---
 
     #[test]

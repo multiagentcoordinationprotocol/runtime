@@ -25,6 +25,7 @@ pub mod quorum_pb {
 pub mod error;
 pub mod log_store;
 pub mod mode;
+pub mod mode_registry;
 pub mod registry;
 pub mod replay;
 pub mod runtime;

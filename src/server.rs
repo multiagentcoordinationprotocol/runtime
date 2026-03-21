@@ -1,5 +1,4 @@
 use macp_runtime::error::MacpError;
-use macp_runtime::mode::standard_mode_descriptors;
 use macp_runtime::pb::macp_runtime_service_server::MacpRuntimeService;
 use macp_runtime::pb::{
     Ack, CancelSessionRequest, CancelSessionResponse, CancellationCapability, Capabilities,
@@ -142,7 +141,6 @@ impl MacpServer {
         Ok(identity)
     }
 
-    #[allow(dead_code, clippy::result_large_err)]
     fn try_next_stream_event(
         receiver: &mut Option<tokio::sync::broadcast::Receiver<Envelope>>,
     ) -> Result<Option<Envelope>, Status> {
@@ -166,7 +164,6 @@ impl MacpServer {
         }
     }
 
-    #[allow(dead_code)]
     async fn process_stream_request(
         &self,
         identity: &AuthIdentity,
@@ -245,7 +242,6 @@ impl MacpServer {
         Ok(())
     }
 
-    #[allow(dead_code)]
     fn build_stream_session_stream<S>(
         &self,
         identity: AuthIdentity,
@@ -401,7 +397,7 @@ impl MacpRuntimeService for MacpServer {
                 website_url: String::new(),
             }),
             capabilities: Some(Capabilities {
-                sessions: Some(SessionsCapability { stream: false }),
+                sessions: Some(SessionsCapability { stream: true }),
                 cancellation: Some(CancellationCapability {
                     cancel_session: true,
                 }),
@@ -418,7 +414,7 @@ impl MacpRuntimeService for MacpServer {
                 experimental: None,
             }),
             supported_modes: self.runtime.registered_mode_names(),
-            instructions: "Authenticate requests with Authorization: Bearer <token>. Use StreamSession for session-scoped bidirectional streaming of accepted envelopes. For local development only, x-macp-agent-id may be enabled by configuration.".into(),
+            instructions: "Authenticate requests with Authorization: Bearer <token>. Use the unary Send RPC for all session messaging. For local development only, x-macp-agent-id may be enabled by configuration.".into(),
         }))
     }
 
@@ -563,6 +559,7 @@ impl MacpRuntimeService for MacpServer {
                 input_content_types: vec!["application/macp-envelope+proto".into()],
                 output_content_types: vec!["application/macp-envelope+proto".into()],
                 metadata: HashMap::new(),
+                // Empty: unary-first profile has no dedicated transport endpoints.
                 transport_endpoints: vec![],
             }),
         }))
@@ -573,7 +570,7 @@ impl MacpRuntimeService for MacpServer {
         _request: Request<ListModesRequest>,
     ) -> Result<Response<ListModesResponse>, Status> {
         Ok(Response::new(ListModesResponse {
-            modes: standard_mode_descriptors(),
+            modes: self.runtime.standard_mode_descriptors(),
         }))
     }
 
@@ -588,10 +585,15 @@ impl MacpRuntimeService for MacpServer {
 
     async fn stream_session(
         &self,
-        _request: Request<tonic::Streaming<StreamSessionRequest>>,
+        request: Request<tonic::Streaming<StreamSessionRequest>>,
     ) -> Result<Response<Self::StreamSessionStream>, Status> {
-        Err(Status::unimplemented(
-            "StreamSession is disabled in the unary-first freeze profile",
+        let identity = self
+            .security
+            .authenticate_metadata(request.metadata())
+            .map_err(Self::status_from_error)?;
+        let inbound = request.into_inner();
+        Ok(Response::new(
+            self.build_stream_session_stream(identity, inbound),
         ))
     }
 
@@ -1024,12 +1026,8 @@ mod tests {
         assert_eq!(ack.error.as_ref().unwrap().code, "INVALID_ENVELOPE");
     }
 
-    // StreamSession returns Unimplemented is verified by manifest_advertises_stream_false
-    // and the implementation returning Status::unimplemented. Cannot construct tonic::Streaming
-    // in a unit test, so this is tested at the integration level.
-
     #[tokio::test]
-    async fn manifest_advertises_stream_false() {
+    async fn manifest_advertises_stream_enabled() {
         let (server, _) = make_server();
         let resp = server
             .initialize(Request::new(InitializeRequest {
@@ -1040,6 +1038,6 @@ mod tests {
             .await
             .unwrap();
         let caps = resp.into_inner().capabilities.unwrap();
-        assert!(!caps.sessions.unwrap().stream);
+        assert!(caps.sessions.unwrap().stream);
     }
 }
