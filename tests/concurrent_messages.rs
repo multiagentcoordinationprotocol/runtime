@@ -169,15 +169,12 @@ async fn concurrent_duplicate_messages_handled() {
     let mut accepted = 0;
     let mut duplicates = 0;
     for handle in handles {
-        match handle.await.unwrap() {
-            Ok(result) => {
-                if result.duplicate {
-                    duplicates += 1;
-                } else {
-                    accepted += 1;
-                }
+        if let Ok(result) = handle.await.unwrap() {
+            if result.duplicate {
+                duplicates += 1;
+            } else {
+                accepted += 1;
             }
-            Err(_) => {}
         }
     }
 
