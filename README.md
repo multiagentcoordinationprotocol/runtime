@@ -2,7 +2,7 @@
 
 Reference runtime for the Multi-Agent Coordination Protocol (MACP).
 
-This runtime implements the current MACP core/service surface, the five standards-track modes in the main RFC repository, and one experimental `multi_round` mode that remains available only by explicit canonical name. The focus of this release is freeze-readiness for SDKs and real-world unary and streaming integrations: strict `SessionStart`, mode-semantic correctness, authenticated senders, bounded resources, and durable restart recovery.
+This runtime implements the current MACP core/service surface and all six standards-track modes in the main RFC repository. The focus of this release is freeze-readiness for SDKs and real-world unary and streaming integrations: strict `SessionStart`, mode-semantic correctness, authenticated senders, bounded resources, and durable restart recovery.
 
 ## What changed in v0.4.0
 
@@ -40,7 +40,11 @@ This runtime implements the current MACP core/service surface, the five standard
 - **StreamSession enabled**
   - `Initialize` advertises `stream: true`
   - `StreamSession` provides per-session bidirectional streaming of accepted envelopes
-  - `WatchModeRegistry` and `WatchRoots` remain unimplemented
+  - `WatchModeRegistry` and `WatchRoots` implemented (basic: send initial state, hold stream open)
+- **Structured logging via `tracing`**
+  - use `RUST_LOG` env var to control log level (e.g. `RUST_LOG=info`)
+- **Per-mode metrics**
+  - tracked via `src/metrics.rs`
 
 ## Implemented modes
 
@@ -51,16 +55,13 @@ Standards-track modes:
 - `macp.mode.task.v1`
 - `macp.mode.handoff.v1`
 - `macp.mode.quorum.v1`
-
-Experimental mode:
-
 - `macp.mode.multi_round.v1`
 
 ## Runtime behavior that SDKs should assume
 
 ### Session bootstrap
 
-For the five standards-track modes, `SessionStartPayload` must include:
+For all six standards-track modes, `SessionStartPayload` must include:
 
 - `participants`
 - `mode_version`
@@ -95,6 +96,7 @@ Unless `MACP_MEMORY_ONLY=1` is set, the runtime persists session and log snapsho
 | `MACP_BIND_ADDR` | bind address | `127.0.0.1:50051` |
 | `MACP_DATA_DIR` | persistence directory | `.macp-data` |
 | `MACP_MEMORY_ONLY` | disable persistence when set to `1` | unset |
+| `RUST_LOG` | `tracing` log level filter (e.g. `info`, `debug`) | unset |
 | `MACP_ALLOW_INSECURE` | allow plaintext transport when set to `1` | unset |
 | `MACP_TLS_CERT_PATH` | PEM certificate for TLS | unset |
 | `MACP_TLS_KEY_PATH` | PEM private key for TLS | unset |
@@ -187,8 +189,8 @@ cargo run --bin fuzz_client
 | `ListModes` | implemented |
 | `ListRoots` | implemented |
 | `StreamSession` | implemented |
-| `WatchModeRegistry` | unimplemented |
-| `WatchRoots` | unimplemented |
+| `WatchModeRegistry` | implemented |
+| `WatchRoots` | implemented |
 
 ## Architecture
 
@@ -227,11 +229,12 @@ runtime/
 │   ├── log_store.rs        # in-memory accepted-history log cache
 │   ├── storage.rs          # storage backend trait, FileBackend, crash recovery
 │   ├── replay.rs           # session rebuild from append-only log
+│   ├── metrics.rs          # per-mode metrics counters
 │   ├── mode/               # mode implementations
 │   └── bin/                # local development example clients
 ├── tests/
 │   ├── integration_mode_lifecycle.rs  # full-stack integration tests
-│   ├── replay_round_trip.rs           # replay tests for all 5 modes
+│   ├── replay_round_trip.rs           # replay tests for all 6 modes
 │   ├── conformance_loader.rs          # JSON fixture runner
 │   └── conformance/                   # per-mode conformance fixtures
 ├── docs/
@@ -261,8 +264,8 @@ Run `make sync-protos` to update local proto files from BSR.
 ## Development notes
 
 - The RFC/spec repository remains the normative source for protocol semantics.
-- This runtime only accepts the canonical standards-track mode identifiers for the five main modes.
-- `multi_round` remains experimental and is not advertised by discovery RPCs.
+- This runtime only accepts the canonical standards-track mode identifiers for all six modes.
+- `multi_round` is now standards-track and is advertised by discovery RPCs.
 - `StreamSession` is enabled and binds one gRPC stream to one session, emitting accepted envelopes in order.
 
 See `docs/README.md` and `docs/examples.md` for the updated local development and usage guidance.

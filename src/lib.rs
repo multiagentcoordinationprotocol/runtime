@@ -24,6 +24,7 @@ pub mod quorum_pb {
 
 pub mod error;
 pub mod log_store;
+pub mod metrics;
 pub mod mode;
 pub mod mode_registry;
 pub mod registry;

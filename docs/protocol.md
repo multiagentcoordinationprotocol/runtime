@@ -20,11 +20,13 @@ Clients should call `Initialize` before using the runtime.
 - `GetManifest`
 - `ListModes`
 - `ListRoots`
+- `WatchModeRegistry`
+- `WatchRoots`
 
-## Still unimplemented
+## Streaming watch RPCs
 
-- `WatchModeRegistry` is unimplemented
-- `WatchRoots` is unimplemented
+- `WatchModeRegistry` — sends the current registry state, then holds the stream open
+- `WatchRoots` — sends the current roots state, then holds the stream open
 
 ## StreamSession profile
 
@@ -47,6 +49,7 @@ For these modes:
 - `macp.mode.task.v1`
 - `macp.mode.handoff.v1`
 - `macp.mode.quorum.v1`
+- `macp.mode.multi_round.v1`
 
 `SessionStartPayload` must bind:
 
@@ -57,9 +60,9 @@ For these modes:
 
 Empty payloads are rejected. Empty `mode` values are rejected. Duplicate participant IDs are rejected.
 
-## Experimental mode rule
+## Multi-round mode
 
-`macp.mode.multi_round.v1` remains available as an explicit experimental mode. It is not advertised by discovery RPCs and retains a more permissive bootstrap path for backward compatibility.
+`macp.mode.multi_round.v1` is a standards-track mode. It uses the same strict `SessionStart` contract as all other standards-track modes. Convergence is tracked but does not auto-resolve the session — an explicit `Commitment` is required after convergence.
 
 ## Security profile
 
@@ -93,4 +96,4 @@ For standards-track modes, `CommitmentPayload` must carry version fields that ma
 
 ## Discovery notes
 
-`ListModes` returns the five standards-track modes. `GetManifest` exposes a manifest that matches the implemented unary and streaming capabilities.
+`ListModes` returns all six standards-track modes. `GetManifest` exposes a manifest that matches the implemented unary and streaming capabilities.

@@ -60,6 +60,7 @@ pub fn is_standard_mode(mode: &str) -> bool {
             | "macp.mode.task.v1"
             | "macp.mode.handoff.v1"
             | "macp.mode.quorum.v1"
+            | "macp.mode.multi_round.v1"
     )
 }
 
@@ -246,9 +247,11 @@ mod tests {
     }
 
     #[test]
-    fn experimental_modes_keep_legacy_flexibility() {
+    fn multi_round_now_requires_standard_validation() {
         let payload = SessionStartPayload::default();
-        validate_standard_session_start_payload("macp.mode.multi_round.v1", &payload).unwrap();
+        assert!(
+            validate_standard_session_start_payload("macp.mode.multi_round.v1", &payload).is_err()
+        );
     }
 
     #[test]

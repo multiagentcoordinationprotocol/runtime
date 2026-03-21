@@ -330,3 +330,49 @@ fn replay_quorum_session() {
     assert!(session.resolution.is_some());
     assert_eq!(session.seen_message_ids.len(), 5);
 }
+
+#[test]
+fn replay_multi_round_session() {
+    let registry = make_registry();
+    let mode = "macp.mode.multi_round.v1";
+
+    let entries = vec![
+        incoming(
+            "m1",
+            "SessionStart",
+            "agent://coordinator",
+            start_payload(vec!["agent://alice", "agent://bob"]),
+            mode,
+            1000,
+        ),
+        incoming(
+            "m2",
+            "Contribute",
+            "agent://alice",
+            br#"{"value":"option_a"}"#.to_vec(),
+            mode,
+            2000,
+        ),
+        incoming(
+            "m3",
+            "Contribute",
+            "agent://bob",
+            br#"{"value":"option_a"}"#.to_vec(),
+            mode,
+            3000,
+        ),
+        incoming(
+            "m4",
+            "Commitment",
+            "agent://coordinator",
+            commitment("multi_round.converged"),
+            mode,
+            4000,
+        ),
+    ];
+
+    let session = replay_session("s1", &entries, &registry).unwrap();
+    assert_eq!(session.state, SessionState::Resolved);
+    assert!(session.resolution.is_some());
+    assert_eq!(session.seen_message_ids.len(), 4);
+}

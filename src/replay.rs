@@ -7,8 +7,6 @@ use crate::session::{
     validate_standard_session_start_payload, Session, SessionState,
 };
 
-const EXPERIMENTAL_DEFAULT_TTL_MS: i64 = 60_000;
-
 /// Rebuild a `Session` from its append-only log.
 ///
 /// This replays the same mode callbacks (`on_session_start`, `on_message`) in
@@ -44,10 +42,9 @@ pub fn replay_session(
     };
     validate_standard_session_start_payload(mode_name, &start_payload)?;
 
-    let ttl_ms = if is_standard_mode(mode_name) {
-        extract_ttl_ms(&start_payload)?
-    } else if start_payload.ttl_ms == 0 {
-        EXPERIMENTAL_DEFAULT_TTL_MS
+    let ttl_ms = if !is_standard_mode(mode_name) && start_payload.ttl_ms == 0 {
+        // Legacy experimental modes may have 0 ttl_ms
+        60_000i64
     } else {
         extract_ttl_ms(&start_payload)?
     };
@@ -96,16 +93,7 @@ pub fn replay_session(
     session.seen_message_ids.insert(env.message_id.clone());
     session.apply_mode_response(response);
 
-    // 5. Multi-round participant back-fill
-    if session.participants.is_empty() && !session.mode_state.is_empty() {
-        if let Ok(state) =
-            serde_json::from_slice::<crate::mode::multi_round::MultiRoundState>(&session.mode_state)
-        {
-            session.participants = state.participants.clone();
-        }
-    }
-
-    // 6. Replay subsequent entries
+    // 5. Replay subsequent entries
     for entry in log_entries.iter().skip(1) {
         match entry.entry_kind {
             EntryKind::Incoming => {

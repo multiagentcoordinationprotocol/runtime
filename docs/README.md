@@ -7,8 +7,7 @@ The RFC/spec repository is still the normative source for MACP semantics. These 
 ## What is in this runtime profile
 
 - MACP server over gRPC with unary RPCs and per-session bidirectional streaming
-- five standards-track modes from the main RFC repository
-- one experimental `macp.mode.multi_round.v1` mode kept off discovery surfaces
+- six standards-track modes from the main RFC repository
 - strict canonical `SessionStart` for standards-track modes
 - authenticated sender derivation
 - payload limits and rate limiting
@@ -21,6 +20,7 @@ The RFC/spec repository is still the normative source for MACP semantics. These 
 - `macp.mode.task.v1`
 - `macp.mode.handoff.v1`
 - `macp.mode.quorum.v1`
+- `macp.mode.multi_round.v1`
 
 ## Freeze profile
 
@@ -37,10 +37,10 @@ Implemented and supported:
 - `ListModes`
 - `ListRoots`
 
-Not yet implemented:
+Streaming watch RPCs (basic — send initial state, hold stream open):
 
-- `WatchModeRegistry` is unimplemented
-- `WatchRoots` is unimplemented
+- `WatchModeRegistry`
+- `WatchRoots`
 
 ## Security model
 

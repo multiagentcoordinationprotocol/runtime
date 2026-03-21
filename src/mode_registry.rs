@@ -21,7 +21,7 @@ pub struct ModeRegistry {
 }
 
 impl ModeRegistry {
-    /// Build the default registry with all 5 standard + 1 experimental modes.
+    /// Build the default registry with all 6 standards-track modes.
     pub fn build_default() -> Self {
         let descriptors = standard_mode_descriptors();
         let descriptor_map: HashMap<String, ModeDescriptor> = descriptors
@@ -37,6 +37,7 @@ impl ModeRegistry {
             ("macp.mode.task.v1", Box::new(TaskMode)),
             ("macp.mode.handoff.v1", Box::new(HandoffMode)),
             ("macp.mode.quorum.v1", Box::new(QuorumMode)),
+            ("macp.mode.multi_round.v1", Box::new(MultiRoundMode)),
         ];
 
         for (name, mode) in standard_modes {
@@ -50,17 +51,6 @@ impl ModeRegistry {
                 },
             );
         }
-
-        // Experimental mode
-        entries.insert(
-            "macp.mode.multi_round.v1".to_string(),
-            ModeRegistration {
-                mode_name: "macp.mode.multi_round.v1".to_string(),
-                mode: Box::new(MultiRoundMode),
-                descriptor: None,
-                standards_track: false,
-            },
-        );
 
         Self { entries }
     }
@@ -106,22 +96,22 @@ mod tests {
     }
 
     #[test]
-    fn build_default_contains_experimental_mode() {
+    fn build_default_contains_multi_round_as_standard() {
         let registry = ModeRegistry::build_default();
         assert!(registry.get_mode("macp.mode.multi_round.v1").is_some());
-        assert!(!registry.is_standard_mode("macp.mode.multi_round.v1"));
+        assert!(registry.is_standard_mode("macp.mode.multi_round.v1"));
     }
 
     #[test]
-    fn standard_mode_names_returns_five() {
+    fn standard_mode_names_returns_six() {
         let registry = ModeRegistry::build_default();
-        assert_eq!(registry.standard_mode_names().len(), 5);
+        assert_eq!(registry.standard_mode_names().len(), 6);
     }
 
     #[test]
-    fn standard_mode_descriptors_returns_five() {
+    fn standard_mode_descriptors_returns_six() {
         let registry = ModeRegistry::build_default();
-        assert_eq!(registry.standard_mode_descriptors().len(), 5);
+        assert_eq!(registry.standard_mode_descriptors().len(), 6);
     }
 
     #[test]

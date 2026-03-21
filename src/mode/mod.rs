@@ -18,6 +18,7 @@ pub const STANDARD_MODE_NAMES: &[&str] = &[
     "macp.mode.task.v1",
     "macp.mode.handoff.v1",
     "macp.mode.quorum.v1",
+    "macp.mode.multi_round.v1",
 ];
 
 /// The result of a Mode processing a message.
@@ -154,6 +155,21 @@ pub fn standard_mode_descriptors() -> Vec<ModeDescriptor> {
                 "Approve".into(),
                 "Reject".into(),
                 "Abstain".into(),
+                "Commitment".into(),
+            ],
+            terminal_message_types: vec!["Commitment".into()],
+            schema_uris: schema_map("buf.build/multiagentcoordinationprotocol/macp"),
+        },
+        ModeDescriptor {
+            mode: "macp.mode.multi_round.v1".into(),
+            mode_version: "1.0.0".into(),
+            title: "Multi-Round Mode".into(),
+            description: "Iterative convergence through multiple contribution rounds until all participants agree, with a terminal Commitment.".into(),
+            determinism_class: "semantic-deterministic".into(),
+            participant_model: "peer".into(),
+            message_types: vec![
+                "SessionStart".into(),
+                "Contribute".into(),
                 "Commitment".into(),
             ],
             terminal_message_types: vec!["Commitment".into()],
