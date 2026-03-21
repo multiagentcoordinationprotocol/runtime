@@ -21,6 +21,7 @@ For these modes:
 - `macp.mode.task.v1`
 - `macp.mode.handoff.v1`
 - `macp.mode.quorum.v1`
+- `macp.mode.multi_round.v1`
 
 `SessionStartPayload` must include all of the following:
 
@@ -131,7 +132,7 @@ Flow:
 3. participants send ballots
 4. coordinator emits `Commitment` after threshold is satisfied
 
-## Example 6: Experimental multi-round mode
+## Example 6: Multi-round mode
 
 Run:
 
@@ -139,7 +140,18 @@ Run:
 cargo run --bin multi_round_client
 ```
 
-This mode is still experimental. It remains callable by the explicit canonical name `macp.mode.multi_round.v1`, but it is not advertised by discovery RPCs and it does not use the strict standards-track `SessionStart` contract.
+Flow:
+
+1. coordinator starts the session with strict `SessionStart` (participants, mode_version, configuration_version, ttl_ms)
+2. participants exchange proposals across multiple rounds
+3. convergence is tracked by the runtime
+4. coordinator emits `Commitment` after convergence
+
+Important runtime behavior:
+
+- `macp.mode.multi_round.v1` is a standards-track mode and is advertised by discovery RPCs
+- convergence is tracked but does not auto-resolve the session — an explicit `Commitment` is required
+- uses the same strict `SessionStart` contract as all other standards-track modes
 
 ## Example 7: StreamSession
 

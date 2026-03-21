@@ -444,3 +444,86 @@ async fn quorum_full_lifecycle_through_runtime() {
         .unwrap();
     assert_eq!(result.session_state, SessionState::Resolved);
 }
+
+#[tokio::test]
+async fn multi_round_full_lifecycle_through_runtime() {
+    let rt = make_runtime();
+    let sid = new_sid();
+    let mode = "macp.mode.multi_round.v1";
+
+    rt.process(
+        &envelope(
+            mode,
+            "SessionStart",
+            "m1",
+            &sid,
+            "agent://coordinator",
+            session_start(vec!["agent://alice".into(), "agent://bob".into()]),
+        ),
+        None,
+    )
+    .await
+    .unwrap();
+
+    rt.process(
+        &envelope(
+            mode,
+            "Contribute",
+            "m2",
+            &sid,
+            "agent://alice",
+            br#"{"value":"option_a"}"#.to_vec(),
+        ),
+        None,
+    )
+    .await
+    .unwrap();
+
+    rt.process(
+        &envelope(
+            mode,
+            "Contribute",
+            "m3",
+            &sid,
+            "agent://bob",
+            br#"{"value":"option_b"}"#.to_vec(),
+        ),
+        None,
+    )
+    .await
+    .unwrap();
+
+    rt.process(
+        &envelope(
+            mode,
+            "Contribute",
+            "m4",
+            &sid,
+            "agent://bob",
+            br#"{"value":"option_a"}"#.to_vec(),
+        ),
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Session still Open — convergence tracked, requires Commitment
+    let session = rt.get_session_checked(&sid).await.unwrap();
+    assert_eq!(session.state, SessionState::Open);
+
+    let result = rt
+        .process(
+            &envelope(
+                mode,
+                "Commitment",
+                "m5",
+                &sid,
+                "agent://coordinator",
+                commitment("multi_round.converged"),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.session_state, SessionState::Resolved);
+}

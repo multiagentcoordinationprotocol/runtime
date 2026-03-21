@@ -17,6 +17,13 @@ use tonic::transport::{Identity, Server, ServerTlsConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
     let addr = std::env::var("MACP_BIND_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:50051".into())
         .parse()?;
@@ -59,9 +66,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(session) => {
                         // Best-effort snapshot update
                         if let Err(e) = storage.save_session(&session).await {
-                            eprintln!(
-                                "warning: failed to persist recovered session '{}': {e}",
-                                session_id
+                            tracing::warn!(
+                                session_id = %session_id,
+                                error = %e,
+                                "failed to persist recovered session"
                             );
                         }
 
@@ -75,16 +83,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         recovered += 1;
                     }
                     Err(e) => {
-                        eprintln!(
-                            "warning: failed to replay session '{}': {e}; skipping",
-                            session_id
+                        tracing::warn!(
+                            session_id = %session_id,
+                            error = %e,
+                            "failed to replay session; skipping"
                         );
                     }
                 }
             }
         }
         if recovered > 0 {
-            println!("Replayed {} sessions from log.", recovered);
+            tracing::info!(count = recovered, "replayed sessions from log");
         }
     }
 
@@ -101,7 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tls_cert = std::env::var("MACP_TLS_CERT_PATH").ok();
     let tls_key = std::env::var("MACP_TLS_KEY_PATH").ok();
 
-    println!("macp-runtime v0.4.0 listening on {}", addr);
+    tracing::info!(%addr, "macp-runtime v0.4.0 listening");
 
     let builder = Server::builder();
     let mut builder = match (tls_cert, tls_key) {
@@ -111,8 +120,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             builder.tls_config(ServerTlsConfig::new().identity(Identity::from_pem(cert, key)))?
         }
         _ if allow_insecure => {
-            eprintln!(
-                "warning: starting without TLS because MACP_ALLOW_INSECURE=1; this is not RFC-compliant"
+            tracing::warn!(
+                "starting without TLS because MACP_ALLOW_INSECURE=1; this is not RFC-compliant"
             );
             builder
         }
@@ -133,7 +142,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             result?;
         }
         _ = tokio::signal::ctrl_c() => {
-            println!("\nShutting down gracefully...");
+            tracing::info!("shutting down gracefully...");
         }
     }
 
@@ -141,14 +150,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !memory_only {
         for session in registry.get_all_sessions().await {
             if let Err(e) = storage.save_session(&session).await {
-                eprintln!(
-                    "warning: failed to persist session '{}' on shutdown: {e}",
-                    session.session_id
+                tracing::warn!(
+                    session_id = %session.session_id,
+                    error = %e,
+                    "failed to persist session on shutdown"
                 );
             }
         }
     }
-    println!("State persisted. Goodbye.");
+    tracing::info!("state persisted, goodbye");
 
     Ok(())
 }

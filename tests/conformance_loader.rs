@@ -66,6 +66,7 @@ fn encode_payload(fixture: &ConformanceFixture, msg: &ConformanceMessage) -> Vec
         t if t.starts_with("task.") => encode_task_payload(msg),
         t if t.starts_with("handoff.") => encode_handoff_payload(msg),
         t if t.starts_with("quorum.") => encode_quorum_payload(msg),
+        t if t.starts_with("multi_round.") => encode_multi_round_payload(msg),
         _ => panic!(
             "Unknown payload_type: {} in fixture for mode {}",
             msg.payload_type, fixture.mode
@@ -182,6 +183,19 @@ fn encode_quorum_payload(msg: &ConformanceMessage) -> Vec<u8> {
     }
 }
 
+fn encode_multi_round_payload(msg: &ConformanceMessage) -> Vec<u8> {
+    let p = &msg.payload;
+    match msg.message_type.as_str() {
+        "Contribute" => {
+            // Multi-round uses JSON-encoded ContributePayload
+            serde_json::json!({"value": p["value"].as_str().unwrap_or_default()})
+                .to_string()
+                .into_bytes()
+        }
+        _ => panic!("Unhandled multi_round message: {}", msg.message_type),
+    }
+}
+
 async fn run_conformance_fixture(path: &Path) {
     let content = std::fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("Failed to read fixture {}: {e}", path.display()));
@@ -292,3 +306,27 @@ conformance_test!(conformance_proposal_happy_path, "proposal_happy_path.json");
 conformance_test!(conformance_task_happy_path, "task_happy_path.json");
 conformance_test!(conformance_handoff_happy_path, "handoff_happy_path.json");
 conformance_test!(conformance_quorum_happy_path, "quorum_happy_path.json");
+conformance_test!(
+    conformance_multi_round_happy_path,
+    "multi_round_happy_path.json"
+);
+
+// Negative-path (rejection) conformance tests
+conformance_test!(
+    conformance_decision_reject_paths,
+    "decision_reject_paths.json"
+);
+conformance_test!(
+    conformance_proposal_reject_paths,
+    "proposal_reject_paths.json"
+);
+conformance_test!(conformance_task_reject_paths, "task_reject_paths.json");
+conformance_test!(
+    conformance_handoff_reject_paths,
+    "handoff_reject_paths.json"
+);
+conformance_test!(conformance_quorum_reject_paths, "quorum_reject_paths.json");
+conformance_test!(
+    conformance_multi_round_reject_paths,
+    "multi_round_reject_paths.json"
+);

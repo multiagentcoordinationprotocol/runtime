@@ -3,18 +3,16 @@ use std::sync::Arc;
 
 use crate::error::MacpError;
 use crate::log_store::{EntryKind, LogEntry, LogStore};
+use crate::metrics::RuntimeMetrics;
 use crate::mode_registry::ModeRegistry;
-use crate::pb::{Envelope, ModeDescriptor, SessionStartPayload};
+use crate::pb::{Envelope, ModeDescriptor};
 use crate::registry::SessionRegistry;
 use crate::session::{
-    extract_ttl_ms, is_standard_mode, parse_session_start_payload,
-    validate_session_id_for_acceptance, validate_standard_session_start_payload, Session,
-    SessionState,
+    extract_ttl_ms, parse_session_start_payload, validate_session_id_for_acceptance,
+    validate_standard_session_start_payload, Session, SessionState,
 };
 use crate::storage::StorageBackend;
 use crate::stream_bus::SessionStreamBus;
-
-const EXPERIMENTAL_DEFAULT_TTL_MS: i64 = 60_000;
 
 #[derive(Debug)]
 pub struct ProcessResult {
@@ -28,6 +26,7 @@ pub struct Runtime {
     pub log_store: Arc<LogStore>,
     stream_bus: Arc<SessionStreamBus>,
     mode_registry: Arc<ModeRegistry>,
+    metrics: Arc<RuntimeMetrics>,
 }
 
 impl Runtime {
@@ -56,6 +55,7 @@ impl Runtime {
             log_store,
             stream_bus: Arc::new(SessionStreamBus::default()),
             mode_registry,
+            metrics: Arc::new(RuntimeMetrics::new()),
         }
     }
 
@@ -69,6 +69,10 @@ impl Runtime {
 
     pub fn mode_registry(&self) -> &Arc<ModeRegistry> {
         &self.mode_registry
+    }
+
+    pub fn metrics(&self) -> &Arc<RuntimeMetrics> {
+        &self.metrics
     }
 
     pub fn subscribe_session_stream(
@@ -119,9 +123,10 @@ impl Runtime {
 
     async fn save_session_to_storage(&self, session: &Session) {
         if let Err(err) = self.storage.save_session(session).await {
-            eprintln!(
-                "warning: failed to persist session '{}': {err}",
-                session.session_id
+            tracing::warn!(
+                session_id = %session.session_id,
+                error = %err,
+                "failed to persist session snapshot"
             );
         }
     }
@@ -140,6 +145,8 @@ impl Runtime {
                 .map_err(|_| MacpError::StorageFailed)?;
             self.log_store.append(session_id, entry).await;
             session.state = SessionState::Expired;
+            self.metrics.record_session_expired(&session.mode);
+            tracing::info!(session_id, "session expired via TTL");
             return Ok(true);
         }
         Ok(false)
@@ -172,19 +179,9 @@ impl Runtime {
             .get_mode(mode_name)
             .ok_or(MacpError::UnknownMode)?;
 
-        let start_payload = if env.payload.is_empty() && !is_standard_mode(mode_name) {
-            SessionStartPayload::default()
-        } else {
-            parse_session_start_payload(&env.payload)?
-        };
+        let start_payload = parse_session_start_payload(&env.payload)?;
         validate_standard_session_start_payload(mode_name, &start_payload)?;
-        let ttl_ms = if is_standard_mode(mode_name) {
-            extract_ttl_ms(&start_payload)?
-        } else if start_payload.ttl_ms == 0 {
-            EXPERIMENTAL_DEFAULT_TTL_MS
-        } else {
-            extract_ttl_ms(&start_payload)?
-        };
+        let ttl_ms = extract_ttl_ms(&start_payload)?;
 
         let mut guard = self.registry.sessions.write().await;
         if let Some(existing) = guard.get(&env.session_id) {
@@ -258,22 +255,16 @@ impl Runtime {
         session.seen_message_ids.insert(env.message_id.clone());
         session.apply_mode_response(response);
 
-        // Multi-round mode stores participants in its own state rather than in
-        // the session-level field.  This block back-fills session.participants so
-        // that authorization checks work uniformly.  It is intentionally coupled
-        // to MultiRoundState; if new experimental modes adopt the same pattern
-        // this should be generalized.
-        if session.participants.is_empty() && !session.mode_state.is_empty() {
-            if let Ok(state) = serde_json::from_slice::<crate::mode::multi_round::MultiRoundState>(
-                &session.mode_state,
-            ) {
-                session.participants = state.participants.clone();
-            }
-        }
-
         let result_state = session.state.clone();
         // 3. Best-effort session save
         self.save_session_to_storage(&session).await;
+        self.metrics.record_session_start(mode_name);
+        tracing::info!(
+            session_id = %env.session_id,
+            mode = mode_name,
+            sender = %env.sender,
+            "session started"
+        );
         guard.insert(env.session_id.clone(), session);
         self.publish_accepted_envelope(env);
 
@@ -332,6 +323,24 @@ impl Runtime {
         session.apply_mode_response(response);
         let result_state = session.state.clone();
 
+        self.metrics.record_message_accepted(&session.mode);
+        if env.message_type == "Commitment" {
+            self.metrics.record_commitment_accepted(&session.mode);
+        }
+
+        tracing::debug!(
+            session_id = %env.session_id,
+            message_type = %env.message_type,
+            sender = %env.sender,
+            state = ?result_state,
+            "message accepted"
+        );
+
+        if result_state == SessionState::Resolved {
+            self.metrics.record_session_resolved(&session.mode);
+            tracing::info!(session_id = %env.session_id, mode = %session.mode, "session resolved");
+        }
+
         // 3. Best-effort session save
         self.save_session_to_storage(session).await;
         self.publish_accepted_envelope(env);
@@ -342,11 +351,14 @@ impl Runtime {
         })
     }
 
-    /// Process a Signal envelope.  Signals are defined in the MACP spec for
-    /// out-of-band notifications (progress, heartbeat, etc.) but their semantics
-    /// are not yet finalized.  This stub accepts any Signal without side-effects
-    /// so that compliant clients can send them without error.
-    async fn process_signal(&self, _env: &Envelope) -> Result<ProcessResult, MacpError> {
+    /// Process a Signal envelope. Signals are informational out-of-band
+    /// notifications (progress, heartbeat, etc.). Logged but no state mutation.
+    async fn process_signal(&self, env: &Envelope) -> Result<ProcessResult, MacpError> {
+        tracing::debug!(
+            sender = %env.sender,
+            message_id = %env.message_id,
+            "signal received"
+        );
         Ok(ProcessResult {
             session_state: SessionState::Open,
             duplicate: false,
@@ -402,6 +414,8 @@ impl Runtime {
         self.log_store.append(session_id, cancel_entry).await;
         session.state = SessionState::Expired;
         self.save_session_to_storage(session).await;
+        self.metrics.record_session_cancelled(&session.mode);
+        tracing::info!(session_id, reason, "session cancelled");
 
         Ok(ProcessResult {
             session_state: SessionState::Expired,
@@ -604,21 +618,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn experimental_mode_keeps_legacy_default_ttl() {
+    async fn multi_round_requires_standard_session_start() {
         let rt = make_runtime();
         let sid = new_sid();
+        // multi-round is now standards-track: empty mode_version should fail
         let payload = SessionStartPayload {
             participants: vec!["creator".into(), "other".into()],
             ..Default::default()
         }
         .encode_to_vec();
+        let err = rt
+            .process(
+                &env(
+                    "macp.mode.multi_round.v1",
+                    "SessionStart",
+                    "m1",
+                    &sid,
+                    "creator",
+                    payload,
+                ),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            MacpError::InvalidPayload | MacpError::InvalidTtl
+        ));
+    }
+
+    #[tokio::test]
+    async fn multi_round_valid_session_start() {
+        let rt = make_runtime();
+        let sid = new_sid();
+        let payload = session_start(vec!["alice".into(), "bob".into()]);
         rt.process(
             &env(
                 "macp.mode.multi_round.v1",
                 "SessionStart",
                 "m1",
                 &sid,
-                "creator",
+                "coordinator",
                 payload,
             ),
             None,
@@ -626,7 +666,8 @@ mod tests {
         .await
         .unwrap();
         let session = rt.get_session_checked(&sid).await.unwrap();
-        assert!(session.ttl_expiry > session.started_at_unix_ms);
+        assert_eq!(session.mode, "macp.mode.multi_round.v1");
+        assert_eq!(session.participants, vec!["alice", "bob"]);
     }
 
     #[tokio::test]

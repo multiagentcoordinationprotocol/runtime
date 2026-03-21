@@ -1,9 +1,10 @@
 #[path = "support/common.rs"]
 mod common;
 
-use common::{envelope, get_session_as, print_ack, send_as};
-use macp_runtime::pb::SessionStartPayload;
-use prost::Message;
+use common::{
+    canonical_commitment_payload, canonical_start_payload, envelope, get_session_as, print_ack,
+    send_as,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -12,16 +13,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("=== Multi-Round Convergence Demo ===\n");
 
-    let start_payload = SessionStartPayload {
-        intent: "convergence test".into(),
-        ttl_ms: 60_000,
-        participants: vec!["alice".into(), "bob".into()],
-        mode_version: "experimental".into(),
-        configuration_version: "legacy".into(),
-        policy_version: String::new(),
-        context: vec![],
-        roots: vec![],
-    };
+    // Standards-track SessionStart with required fields
     let ack = send_as(
         &mut client,
         "coordinator",
@@ -31,12 +23,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "m0",
             &session_id,
             "coordinator",
-            start_payload.encode_to_vec(),
+            canonical_start_payload("convergence test", &["alice", "bob"], 60_000),
         ),
     )
     .await?;
     print_ack("session_start", &ack);
 
+    // Alice contributes
     let ack = send_as(
         &mut client,
         "alice",
@@ -52,6 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     print_ack("alice_contributes", &ack);
 
+    // Bob contributes differently
     let ack = send_as(
         &mut client,
         "bob",
@@ -71,6 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let meta = session.metadata.expect("metadata");
     println!("[get_session] state={} mode={}", meta.state, meta.mode);
 
+    // Bob revises to match Alice → convergence
     let ack = send_as(
         &mut client,
         "bob",
@@ -85,6 +80,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     print_ack("bob_revises", &ack);
+
+    let session = get_session_as(&mut client, "alice", &session_id).await?;
+    let meta = session.metadata.expect("metadata");
+    println!(
+        "[get_session] state={} mode={} (converged, awaiting commitment)",
+        meta.state, meta.mode
+    );
+
+    // Coordinator commits after convergence
+    let ack = send_as(
+        &mut client,
+        "coordinator",
+        envelope(
+            "macp.mode.multi_round.v1",
+            "Commitment",
+            "m4",
+            &session_id,
+            "coordinator",
+            canonical_commitment_payload(
+                "c1",
+                "multi_round.converged",
+                "convergence",
+                "all participants agreed",
+            ),
+        ),
+    )
+    .await?;
+    print_ack("commitment", &ack);
 
     let session = get_session_as(&mut client, "alice", &session_id).await?;
     let meta = session.metadata.expect("metadata");

@@ -405,11 +405,11 @@ impl MacpRuntimeService for MacpServer {
                 manifest: Some(ManifestCapability { get_manifest: true }),
                 mode_registry: Some(ModeRegistryCapability {
                     list_modes: true,
-                    list_changed: false,
+                    list_changed: true,
                 }),
                 roots: Some(RootsCapability {
                     list_roots: true,
-                    list_changed: false,
+                    list_changed: true,
                 }),
                 experimental: None,
             }),
@@ -605,9 +605,18 @@ impl MacpRuntimeService for MacpServer {
         &self,
         _request: Request<WatchModeRegistryRequest>,
     ) -> Result<Response<Self::WatchModeRegistryStream>, Status> {
-        Err(Status::unimplemented(
-            "WatchModeRegistry is not yet implemented",
-        ))
+        let initial = WatchModeRegistryResponse {
+            change: Some(macp_runtime::pb::RegistryChanged {
+                registry: "modes".into(),
+                observed_at_unix_ms: chrono::Utc::now().timestamp_millis(),
+            }),
+        };
+        let stream = async_stream::try_stream! {
+            yield initial;
+            // Modes are static at runtime — keep the stream open but idle.
+            std::future::pending::<()>().await;
+        };
+        Ok(Response::new(Box::pin(stream)))
     }
 
     type WatchRootsStream = std::pin::Pin<
@@ -618,7 +627,17 @@ impl MacpRuntimeService for MacpServer {
         &self,
         _request: Request<WatchRootsRequest>,
     ) -> Result<Response<Self::WatchRootsStream>, Status> {
-        Err(Status::unimplemented("WatchRoots is not yet implemented"))
+        let initial = WatchRootsResponse {
+            change: Some(macp_runtime::pb::RootsChanged {
+                observed_at_unix_ms: chrono::Utc::now().timestamp_millis(),
+            }),
+        };
+        let stream = async_stream::try_stream! {
+            yield initial;
+            // Roots are static — keep the stream open but idle.
+            std::future::pending::<()>().await;
+        };
+        Ok(Response::new(Box::pin(stream)))
     }
 }
 
@@ -842,12 +861,13 @@ mod tests {
             .iter()
             .map(|m| m.mode.clone())
             .collect();
-        assert_eq!(names.len(), 5);
+        assert_eq!(names.len(), 6);
         assert!(names.contains(&"macp.mode.decision.v1".to_string()));
         assert!(names.contains(&"macp.mode.proposal.v1".to_string()));
         assert!(names.contains(&"macp.mode.task.v1".to_string()));
         assert!(names.contains(&"macp.mode.handoff.v1".to_string()));
         assert!(names.contains(&"macp.mode.quorum.v1".to_string()));
+        assert!(names.contains(&"macp.mode.multi_round.v1".to_string()));
     }
 
     #[tokio::test]

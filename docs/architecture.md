@@ -29,11 +29,10 @@ The `ModeRegistry` is the single source of truth for mode dispatch, replay, and 
 
 Responsibilities:
 
-- register all mode implementations (standards-track and experimental)
+- register all mode implementations
 - provide mode lookup for dispatch and replay
 - provide standards-track mode names for `ListModes`
 - provide mode descriptors for `ListModes` and `GetManifest`
-- classify modes as standards-track or experimental
 
 Key methods:
 
@@ -58,7 +57,7 @@ Implemented modes:
 - Task — delegated task with serial assignment, progress tracking, terminal reports
 - Handoff — serial handoff offers with accept/decline disposition
 - Quorum — threshold approval with ballots
-- MultiRound (experimental) — iterative value convergence
+- MultiRound — iterative value convergence with explicit Commitment
 
 ## 5. Storage layer
 
