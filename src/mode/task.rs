@@ -1029,6 +1029,53 @@ mod tests {
         }
     }
 
+    // --- Commitment version mismatch ---
+
+    #[test]
+    fn commitment_version_mismatch_rejected() {
+        let mode = TaskMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("planner", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("planner", "TaskRequest", make_task_request("t1", "worker")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("worker", "TaskAccept", make_task_accept("t1", "worker")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("worker", "TaskComplete", make_task_complete("t1", "worker")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let bad_commitment = CommitmentPayload {
+            commitment_id: "c1".into(),
+            action: "task.completed".into(),
+            authority_scope: "ops".into(),
+            reason: "done".into(),
+            mode_version: "wrong".into(),
+            policy_version: "policy".into(),
+            configuration_version: "config".into(),
+        }
+        .encode_to_vec();
+        let err = mode
+            .on_message(&session, &env("planner", "Commitment", bad_commitment))
+            .unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
+    }
+
     // --- Unknown message type ---
 
     #[test]

@@ -1,0 +1,48 @@
+{
+  "mode": "macp.mode.task.v1",
+  "initiator": "agent://planner",
+  "participants": ["agent://planner", "agent://worker"],
+  "mode_version": "1.0.0",
+  "configuration_version": "cfg-1",
+  "policy_version": "policy-1",
+  "ttl_ms": 60000,
+  "messages": [
+    {
+      "sender": "agent://planner",
+      "message_type": "TaskRequest",
+      "payload_type": "task.TaskRequest",
+      "payload": { "task_id": "t1", "title": "Build", "instructions": "Do it", "requested_assignee": "agent://worker", "input": [], "deadline_unix_ms": 0 },
+      "expect": "accept"
+    },
+    {
+      "sender": "agent://worker",
+      "message_type": "TaskAccept",
+      "payload_type": "task.TaskAccept",
+      "payload": { "task_id": "t1", "assignee": "agent://worker", "reason": "ready" },
+      "expect": "accept"
+    },
+    {
+      "sender": "agent://worker",
+      "message_type": "TaskComplete",
+      "payload_type": "task.TaskComplete",
+      "payload": { "task_id": "t1", "assignee": "agent://worker", "output": [], "summary": "done" },
+      "expect": "accept"
+    },
+    {
+      "sender": "agent://planner",
+      "message_type": "Commitment",
+      "payload_type": "Commitment",
+      "payload": {
+        "commitment_id": "c1",
+        "action": "task.completed",
+        "authority_scope": "test",
+        "reason": "done",
+        "mode_version": "1.0.0",
+        "policy_version": "policy-1",
+        "configuration_version": "cfg-1"
+      },
+      "expect": "accept"
+    }
+  ],
+  "expected_final_state": "Resolved"
+}

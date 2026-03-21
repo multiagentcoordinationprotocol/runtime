@@ -190,26 +190,73 @@ cargo run --bin fuzz_client
 | `WatchModeRegistry` | unimplemented |
 | `WatchRoots` | unimplemented |
 
+## Architecture
+
+```
+Client Request
+       |
+  [Transport/gRPC] -- server.rs, security.rs
+       |
+  [Coordination Kernel] -- runtime.rs
+       |
+  [Mode Registry] -- mode_registry.rs
+       |            \
+  [Mode Logic]     [Discovery]
+   mode/*.rs       ListModes, GetManifest
+       |
+  [Storage Layer] -- storage.rs, log_store.rs
+       |
+  [Replay] -- replay.rs
+```
+
+See `docs/architecture.md` for detailed layer descriptions.
+
 ## Project structure
 
 ```text
 runtime/
-├── proto/                # protobuf schemas copied from the RFC/spec repository
+├── proto/                  # protobuf schemas copied from the RFC/spec repository
 ├── src/
-│   ├── main.rs           # server startup, TLS, persistence, auth wiring
-│   ├── server.rs         # gRPC adapter and request authentication
-│   ├── runtime.rs        # coordination kernel and mode dispatch
-│   ├── security.rs       # auth config, sender derivation, rate limiting
-│   ├── session.rs        # canonical SessionStart validation and session model
-│   ├── registry.rs       # session store with optional persistence
-│   ├── log_store.rs      # in-memory accepted-history log cache
-│   ├── storage.rs        # storage backend trait, FileBackend persistence, crash recovery
-│   ├── replay.rs         # session rebuild from append-only log
-│   ├── mode/             # mode implementations
-│   └── bin/              # local development example clients
+│   ├── main.rs             # server startup, TLS, persistence, auth wiring
+│   ├── server.rs           # gRPC adapter and request authentication
+│   ├── runtime.rs          # coordination kernel and mode dispatch
+│   ├── mode_registry.rs    # single source of truth for mode registration
+│   ├── security.rs         # auth config, sender derivation, rate limiting
+│   ├── session.rs          # canonical SessionStart validation and session model
+│   ├── registry.rs         # session store with optional persistence
+│   ├── log_store.rs        # in-memory accepted-history log cache
+│   ├── storage.rs          # storage backend trait, FileBackend, crash recovery
+│   ├── replay.rs           # session rebuild from append-only log
+│   ├── mode/               # mode implementations
+│   └── bin/                # local development example clients
+├── tests/
+│   ├── integration_mode_lifecycle.rs  # full-stack integration tests
+│   ├── replay_round_trip.rs           # replay tests for all 5 modes
+│   ├── conformance_loader.rs          # JSON fixture runner
+│   └── conformance/                   # per-mode conformance fixtures
 ├── docs/
 └── build.rs
 ```
+
+## Troubleshooting
+
+**TLS required error on startup**
+Set `MACP_ALLOW_INSECURE=1` for local development, or provide `MACP_TLS_CERT_PATH` and `MACP_TLS_KEY_PATH` for production.
+
+**`InvalidSessionId` error**
+Session IDs must be UUID v4/v7 in hyphenated lowercase form (36 chars) or base64url tokens (22+ chars). Short or human-readable IDs like `"s1"` or `"my-session"` are rejected.
+
+**`InvalidPayload` on `SessionStart`**
+For standards-track modes, `SessionStartPayload` must include non-empty `participants`, `mode_version`, `configuration_version`, and a positive `ttl_ms`. Empty payloads are rejected.
+
+**`Forbidden` error**
+Check that the sender identity matches the session's participant list. For `Commitment` messages, only the session initiator is authorized. Verify your bearer token maps to the correct sender.
+
+**`StorageFailed` error**
+The runtime requires write access to `MACP_DATA_DIR`. Check directory permissions. Log append failures are fatal — the runtime will not acknowledge a message without a durable record.
+
+**Proto drift / `make check-protos` failure**
+Run `make sync-protos` to update local proto files from BSR.
 
 ## Development notes
 

@@ -84,4 +84,5 @@ export MACP_MEMORY_ONLY=1
 - `../README.md` — root-level quick start and configuration reference
 - `examples.md` — updated local-development examples and canonical message patterns
 - `protocol.md` — implementation notes and protocol surface summary
-- `architecture.md` — runtime component layout
+- `architecture.md` — runtime component layout and mode registry design
+- `deployment.md` — production deployment guide, container notes, and environment reference

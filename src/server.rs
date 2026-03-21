@@ -1,5 +1,4 @@
 use macp_runtime::error::MacpError;
-use macp_runtime::mode::standard_mode_descriptors;
 use macp_runtime::pb::macp_runtime_service_server::MacpRuntimeService;
 use macp_runtime::pb::{
     Ack, CancelSessionRequest, CancelSessionResponse, CancellationCapability, Capabilities,
@@ -418,7 +417,7 @@ impl MacpRuntimeService for MacpServer {
                 experimental: None,
             }),
             supported_modes: self.runtime.registered_mode_names(),
-            instructions: "Authenticate requests with Authorization: Bearer <token>. Use StreamSession for session-scoped bidirectional streaming of accepted envelopes. For local development only, x-macp-agent-id may be enabled by configuration.".into(),
+            instructions: "Authenticate requests with Authorization: Bearer <token>. Use the unary Send RPC for all session messaging. For local development only, x-macp-agent-id may be enabled by configuration.".into(),
         }))
     }
 
@@ -563,6 +562,7 @@ impl MacpRuntimeService for MacpServer {
                 input_content_types: vec!["application/macp-envelope+proto".into()],
                 output_content_types: vec!["application/macp-envelope+proto".into()],
                 metadata: HashMap::new(),
+                // Empty: unary-first profile has no dedicated transport endpoints.
                 transport_endpoints: vec![],
             }),
         }))
@@ -573,7 +573,7 @@ impl MacpRuntimeService for MacpServer {
         _request: Request<ListModesRequest>,
     ) -> Result<Response<ListModesResponse>, Status> {
         Ok(Response::new(ListModesResponse {
-            modes: standard_mode_descriptors(),
+            modes: self.runtime.standard_mode_descriptors(),
         }))
     }
 

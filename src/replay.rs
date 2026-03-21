@@ -1,8 +1,6 @@
-use std::collections::HashMap;
-
 use crate::error::MacpError;
 use crate::log_store::{EntryKind, LogEntry};
-use crate::mode::Mode;
+use crate::mode_registry::ModeRegistry;
 use crate::pb::Envelope;
 use crate::session::{
     extract_ttl_ms, is_standard_mode, parse_session_start_payload,
@@ -19,7 +17,7 @@ const EXPERIMENTAL_DEFAULT_TTL_MS: i64 = 60_000;
 pub fn replay_session(
     session_id: &str,
     log_entries: &[LogEntry],
-    modes: &HashMap<String, Box<dyn Mode>>,
+    registry: &ModeRegistry,
 ) -> Result<Session, MacpError> {
     // 1. Find the SessionStart entry
     let start_entry = log_entries
@@ -36,7 +34,7 @@ pub fn replay_session(
         &start_entry.mode
     };
 
-    let mode = modes.get(mode_name).ok_or(MacpError::UnknownMode)?;
+    let mode = registry.get_mode(mode_name).ok_or(MacpError::UnknownMode)?;
 
     // 2. Parse SessionStartPayload
     let start_payload = if start_entry.raw_payload.is_empty() && !is_standard_mode(mode_name) {
@@ -172,15 +170,11 @@ mod tests {
     use crate::decision_pb::ProposalPayload;
     use crate::decision_pb::VotePayload;
     use crate::log_store::EntryKind;
-    use crate::mode::decision::DecisionMode;
-    use crate::mode::Mode;
     use crate::pb::{CommitmentPayload, SessionStartPayload};
     use prost::Message;
 
-    fn make_modes() -> HashMap<String, Box<dyn Mode>> {
-        let mut modes: HashMap<String, Box<dyn Mode>> = HashMap::new();
-        modes.insert("macp.mode.decision.v1".into(), Box::new(DecisionMode));
-        modes
+    fn make_registry() -> ModeRegistry {
+        ModeRegistry::build_default()
     }
 
     fn start_payload_bytes() -> Vec<u8> {
@@ -233,7 +227,7 @@ mod tests {
 
     #[test]
     fn replay_rebuilds_decision_session() {
-        let modes = make_modes();
+        let registry = make_registry();
         let proposal = ProposalPayload {
             proposal_id: "p1".into(),
             option: "deploy".into(),
@@ -271,7 +265,7 @@ mod tests {
             incoming_entry("m4", "Commitment", "agent://orchestrator", commitment, 4000),
         ];
 
-        let session = replay_session("s1", &entries, &modes).unwrap();
+        let session = replay_session("s1", &entries, &registry).unwrap();
         assert_eq!(session.state, SessionState::Resolved);
         assert_eq!(session.session_id, "s1");
         assert!(session.seen_message_ids.contains("m1"));
@@ -283,7 +277,7 @@ mod tests {
 
     #[test]
     fn replay_preserves_original_ttl() {
-        let modes = make_modes();
+        let registry = make_registry();
         let original_time = 1_700_000_000_000i64;
         let entries = vec![incoming_entry(
             "m1",
@@ -293,7 +287,7 @@ mod tests {
             original_time,
         )];
 
-        let session = replay_session("s1", &entries, &modes).unwrap();
+        let session = replay_session("s1", &entries, &registry).unwrap();
         assert_eq!(session.started_at_unix_ms, original_time);
         assert_eq!(session.ttl_expiry, original_time + 60_000);
         assert_eq!(session.ttl_ms, 60_000);
@@ -301,7 +295,7 @@ mod tests {
 
     #[test]
     fn replay_handles_ttl_expired() {
-        let modes = make_modes();
+        let registry = make_registry();
         let entries = vec![
             incoming_entry(
                 "m1",
@@ -313,13 +307,13 @@ mod tests {
             internal_entry("TtlExpired", 61001),
         ];
 
-        let session = replay_session("s1", &entries, &modes).unwrap();
+        let session = replay_session("s1", &entries, &registry).unwrap();
         assert_eq!(session.state, SessionState::Expired);
     }
 
     #[test]
     fn replay_handles_session_cancel() {
-        let modes = make_modes();
+        let registry = make_registry();
         let entries = vec![
             incoming_entry(
                 "m1",
@@ -331,14 +325,14 @@ mod tests {
             internal_entry("SessionCancel", 5000),
         ];
 
-        let session = replay_session("s1", &entries, &modes).unwrap();
+        let session = replay_session("s1", &entries, &registry).unwrap();
         assert_eq!(session.state, SessionState::Expired);
     }
 
     #[test]
     fn replay_empty_log_returns_error() {
-        let modes = make_modes();
-        let result = replay_session("s1", &[], &modes);
+        let registry = make_registry();
+        let result = replay_session("s1", &[], &registry);
         assert!(result.is_err());
     }
 

@@ -1,17 +1,10 @@
 use chrono::Utc;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::error::MacpError;
 use crate::log_store::{EntryKind, LogEntry, LogStore};
-use crate::mode::decision::DecisionMode;
-use crate::mode::handoff::HandoffMode;
-use crate::mode::multi_round::MultiRoundMode;
-use crate::mode::proposal::ProposalMode;
-use crate::mode::quorum::QuorumMode;
-use crate::mode::task::TaskMode;
-use crate::mode::{standard_mode_names, Mode};
-use crate::pb::{Envelope, SessionStartPayload};
+use crate::mode_registry::ModeRegistry;
+use crate::pb::{Envelope, ModeDescriptor, SessionStartPayload};
 use crate::registry::SessionRegistry;
 use crate::session::{
     extract_ttl_ms, is_standard_mode, parse_session_start_payload,
@@ -34,7 +27,7 @@ pub struct Runtime {
     pub registry: Arc<SessionRegistry>,
     pub log_store: Arc<LogStore>,
     stream_bus: Arc<SessionStreamBus>,
-    modes: HashMap<String, Box<dyn Mode>>,
+    mode_registry: Arc<ModeRegistry>,
 }
 
 impl Runtime {
@@ -43,29 +36,39 @@ impl Runtime {
         registry: Arc<SessionRegistry>,
         log_store: Arc<LogStore>,
     ) -> Self {
-        let mut modes: HashMap<String, Box<dyn Mode>> = HashMap::new();
-        modes.insert("macp.mode.decision.v1".into(), Box::new(DecisionMode));
-        modes.insert("macp.mode.proposal.v1".into(), Box::new(ProposalMode));
-        modes.insert("macp.mode.task.v1".into(), Box::new(TaskMode));
-        modes.insert("macp.mode.handoff.v1".into(), Box::new(HandoffMode));
-        modes.insert("macp.mode.quorum.v1".into(), Box::new(QuorumMode));
-        modes.insert("macp.mode.multi_round.v1".into(), Box::new(MultiRoundMode));
+        Self::with_mode_registry(
+            storage,
+            registry,
+            log_store,
+            Arc::new(ModeRegistry::build_default()),
+        )
+    }
 
+    pub fn with_mode_registry(
+        storage: Arc<dyn StorageBackend>,
+        registry: Arc<SessionRegistry>,
+        log_store: Arc<LogStore>,
+        mode_registry: Arc<ModeRegistry>,
+    ) -> Self {
         Self {
             storage,
             registry,
             log_store,
             stream_bus: Arc::new(SessionStreamBus::default()),
-            modes,
+            mode_registry,
         }
     }
 
     pub fn registered_mode_names(&self) -> Vec<String> {
-        standard_mode_names()
-            .iter()
-            .filter(|mode_name| self.modes.contains_key(**mode_name))
-            .map(|mode_name| (*mode_name).to_string())
-            .collect()
+        self.mode_registry.standard_mode_names()
+    }
+
+    pub fn standard_mode_descriptors(&self) -> Vec<ModeDescriptor> {
+        self.mode_registry.standard_mode_descriptors()
+    }
+
+    pub fn mode_registry(&self) -> &Arc<ModeRegistry> {
+        &self.mode_registry
     }
 
     pub fn subscribe_session_stream(
@@ -164,7 +167,10 @@ impl Runtime {
         }
         validate_session_id_for_acceptance(&env.session_id)?;
         let mode_name = env.mode.as_str();
-        let mode = self.modes.get(mode_name).ok_or(MacpError::UnknownMode)?;
+        let mode = self
+            .mode_registry
+            .get_mode(mode_name)
+            .ok_or(MacpError::UnknownMode)?;
 
         let start_payload = if env.payload.is_empty() && !is_standard_mode(mode_name) {
             SessionStartPayload::default()
@@ -307,8 +313,8 @@ impl Runtime {
         }
 
         let mode = self
-            .modes
-            .get(&session.mode)
+            .mode_registry
+            .get_mode(&session.mode)
             .ok_or(MacpError::UnknownMode)?;
         mode.authorize_sender(session, env)?;
         let response = mode.on_message(session, env)?;

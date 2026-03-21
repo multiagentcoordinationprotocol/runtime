@@ -1,6 +1,7 @@
 mod server;
 
 use macp_runtime::log_store::LogStore;
+use macp_runtime::mode_registry::ModeRegistry;
 use macp_runtime::pb;
 use macp_runtime::registry::SessionRegistry;
 use macp_runtime::replay::replay_session;
@@ -36,37 +37,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load persisted state into in-memory caches
     let registry = Arc::new(SessionRegistry::new());
     let log_store = Arc::new(LogStore::new());
+    let mode_registry = Arc::new(ModeRegistry::build_default());
 
     if !memory_only {
-        // Build mode map for replay
-        use macp_runtime::mode::Mode;
-        use std::collections::HashMap;
-        let mut modes: HashMap<String, Box<dyn Mode>> = HashMap::new();
-        modes.insert(
-            "macp.mode.decision.v1".into(),
-            Box::new(macp_runtime::mode::decision::DecisionMode),
-        );
-        modes.insert(
-            "macp.mode.proposal.v1".into(),
-            Box::new(macp_runtime::mode::proposal::ProposalMode),
-        );
-        modes.insert(
-            "macp.mode.task.v1".into(),
-            Box::new(macp_runtime::mode::task::TaskMode),
-        );
-        modes.insert(
-            "macp.mode.handoff.v1".into(),
-            Box::new(macp_runtime::mode::handoff::HandoffMode),
-        );
-        modes.insert(
-            "macp.mode.quorum.v1".into(),
-            Box::new(macp_runtime::mode::quorum::QuorumMode),
-        );
-        modes.insert(
-            "macp.mode.multi_round.v1".into(),
-            Box::new(macp_runtime::mode::multi_round::MultiRoundMode),
-        );
-
         // Enumerate session directories and replay from logs
         let sessions_dir = data_dir.join("sessions");
         let mut recovered = 0usize;
@@ -82,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
 
-                match replay_session(&session_id, &log_entries, &modes) {
+                match replay_session(&session_id, &log_entries, &mode_registry) {
                     Ok(session) => {
                         // Best-effort snapshot update
                         if let Err(e) = storage.save_session(&session).await {
@@ -98,7 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             log_store.append(&session_id, log_entry.clone()).await;
                         }
 
-                        registry.insert_session_for_test(session_id, session).await;
+                        registry.insert_recovered_session(session_id, session).await;
                         recovered += 1;
                     }
                     Err(e) => {
@@ -115,10 +88,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let runtime = Arc::new(Runtime::new(
+    let runtime = Arc::new(Runtime::with_mode_registry(
         Arc::clone(&storage),
         Arc::clone(&registry),
         Arc::clone(&log_store),
+        mode_registry,
     ));
     let security = SecurityLayer::from_env()?;
     let svc = MacpServer::new(runtime, security);

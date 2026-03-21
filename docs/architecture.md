@@ -23,7 +23,26 @@ Responsibilities:
 - enforce lazy TTL expiry on reads and writes
 - persist updated session snapshots
 
-## 3. Mode layer (`src/mode/*`)
+## 3. Mode Registry (`src/mode_registry.rs`)
+
+The `ModeRegistry` is the single source of truth for mode dispatch, replay, and discovery. It eliminates the previous pattern of hardcoded mode maps in `runtime.rs`, `main.rs`, and `replay.rs`.
+
+Responsibilities:
+
+- register all mode implementations (standards-track and experimental)
+- provide mode lookup for dispatch and replay
+- provide standards-track mode names for `ListModes`
+- provide mode descriptors for `ListModes` and `GetManifest`
+- classify modes as standards-track or experimental
+
+Key methods:
+
+- `build_default()` — constructs the canonical mode set
+- `get_mode(name)` — mode lookup for dispatch
+- `standard_mode_names()` — drives `ListModes` and `GetManifest`
+- `standard_mode_descriptors()` — drives `ListModes` response
+
+## 4. Mode layer (`src/mode/*`)
 
 Responsibilities:
 
@@ -34,14 +53,14 @@ Responsibilities:
 
 Implemented modes:
 
-- Decision
-- Proposal
-- Task
-- Handoff
-- Quorum
-- MultiRound (experimental)
+- Decision — enforced phase transitions (Proposal -> Evaluation -> Voting -> Committed)
+- Proposal — negotiation with counterproposals, acceptance convergence, terminal rejections
+- Task — delegated task with serial assignment, progress tracking, terminal reports
+- Handoff — serial handoff offers with accept/decline disposition
+- Quorum — threshold approval with ballots
+- MultiRound (experimental) — iterative value convergence
 
-## 4. Storage layer
+## 5. Storage layer
 
 ### Storage backend (`src/storage.rs`)
 
@@ -71,7 +90,7 @@ In-memory cache of accepted-history logs. Stores:
 
 On-disk persistence is handled by `FileBackend`, not by LogStore.
 
-## 5. Security layer (`src/security.rs`)
+## 6. Security layer (`src/security.rs`)
 
 Responsibilities:
 
@@ -80,6 +99,25 @@ Responsibilities:
 - enforce allowed-mode policy
 - enforce session-start policy
 - enforce per-sender rate limits
+
+## Architecture diagram
+
+```
+Client Request
+       |
+  [Transport/gRPC] -- server.rs, security.rs
+       |
+  [Coordination Kernel] -- runtime.rs
+       |
+  [Mode Registry] -- mode_registry.rs
+       |            \
+  [Mode Logic]     [Discovery]
+   mode/*.rs       ListModes, GetManifest
+       |
+  [Storage Layer] -- storage.rs, log_store.rs
+       |
+  [Replay] -- replay.rs
+```
 
 ## Request path summary
 
