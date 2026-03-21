@@ -37,9 +37,9 @@ This runtime implements the current MACP core/service surface, the five standard
   - weak/human-readable IDs are rejected with `INVALID_SESSION_ID`
 - **Signal enforcement**
   - Signals are strictly ambient — non-empty `session_id` or `mode` is rejected
-- **StreamSession disabled in freeze profile**
-  - `Initialize` advertises `stream: false`
-  - `StreamSession` RPC returns `UNIMPLEMENTED` (implementation retained for future activation)
+- **StreamSession enabled**
+  - `Initialize` advertises `stream: true`
+  - `StreamSession` provides per-session bidirectional streaming of accepted envelopes
   - `WatchModeRegistry` and `WatchRoots` remain unimplemented
 
 ## Implemented modes
@@ -186,7 +186,7 @@ cargo run --bin fuzz_client
 | `GetManifest` | implemented |
 | `ListModes` | implemented |
 | `ListRoots` | implemented |
-| `StreamSession` | disabled (unary-first freeze profile) |
+| `StreamSession` | implemented |
 | `WatchModeRegistry` | unimplemented |
 | `WatchRoots` | unimplemented |
 
@@ -263,6 +263,6 @@ Run `make sync-protos` to update local proto files from BSR.
 - The RFC/spec repository remains the normative source for protocol semantics.
 - This runtime only accepts the canonical standards-track mode identifiers for the five main modes.
 - `multi_round` remains experimental and is not advertised by discovery RPCs.
-- `StreamSession` is disabled in the freeze profile. The implementation is retained for future activation.
+- `StreamSession` is enabled and binds one gRPC stream to one session, emitting accepted envelopes in order.
 
 See `docs/README.md` and `docs/examples.md` for the updated local development and usage guidance.

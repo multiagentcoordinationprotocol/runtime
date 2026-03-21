@@ -141,11 +141,11 @@ cargo run --bin multi_round_client
 
 This mode is still experimental. It remains callable by the explicit canonical name `macp.mode.multi_round.v1`, but it is not advertised by discovery RPCs and it does not use the strict standards-track `SessionStart` contract.
 
-## Example 7: StreamSession (disabled in freeze profile)
+## Example 7: StreamSession
 
-`StreamSession` is disabled in the unary-first freeze profile. The `Initialize` response advertises `stream: false` and the RPC returns `UNIMPLEMENTED`. The implementation is retained for future activation.
+`StreamSession` provides per-session bidirectional streaming. The `Initialize` response advertises `stream: true`.
 
-When enabled, `StreamSession` emits only accepted canonical MACP envelopes. A single gRPC stream binds to one session. If a client needs negative per-message acknowledgements, it should continue to use `Send`.
+`StreamSession` emits only accepted canonical MACP envelopes. A single gRPC stream binds to one session. If a client needs negative per-message acknowledgements, it should continue to use `Send`.
 
 Practical notes:
 
