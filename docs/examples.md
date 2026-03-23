@@ -12,16 +12,16 @@ cargo run
 
 The example binaries in `src/bin` attach `x-macp-agent-id` metadata so the runtime can derive the authenticated sender.
 
-## Ground rules for every standards-track session
+## Ground rules for sessions with strict validation
 
-For these modes:
+For these standards-track modes and built-in extensions:
 
 - `macp.mode.decision.v1`
 - `macp.mode.proposal.v1`
 - `macp.mode.task.v1`
 - `macp.mode.handoff.v1`
 - `macp.mode.quorum.v1`
-- `macp.mode.multi_round.v1`
+- `ext.multi_round.v1` (built-in extension)
 
 `SessionStartPayload` must include all of the following:
 
@@ -132,7 +132,7 @@ Flow:
 3. participants send ballots
 4. coordinator emits `Commitment` after threshold is satisfied
 
-## Example 6: Multi-round mode
+## Example 6: Multi-round mode (built-in extension)
 
 Run:
 
@@ -142,16 +142,16 @@ cargo run --bin multi_round_client
 
 Flow:
 
-1. coordinator starts the session with strict `SessionStart` (participants, mode_version, configuration_version, ttl_ms)
-2. participants exchange proposals across multiple rounds
+1. coordinator starts the session with mode `ext.multi_round.v1` and strict `SessionStart` (participants, mode_version, configuration_version, ttl_ms)
+2. participants exchange contributions across multiple rounds
 3. convergence is tracked by the runtime
 4. coordinator emits `Commitment` after convergence
 
 Important runtime behavior:
 
-- `macp.mode.multi_round.v1` is a standards-track mode and is advertised by discovery RPCs
+- `ext.multi_round.v1` is a built-in extension mode, discoverable via `ListExtModes`
 - convergence is tracked but does not auto-resolve the session — an explicit `Commitment` is required
-- uses the same strict `SessionStart` contract as all other standards-track modes
+- uses the same strict `SessionStart` contract as standards-track modes
 
 ## Example 7: StreamSession
 
@@ -167,7 +167,23 @@ Practical notes:
 - use a session-scoped `Signal` envelope with the correct `session_id` and `mode` to attach to an existing session without mutating it
 - mixed-session streams are rejected with `FAILED_PRECONDITION`
 
-## Example 8: Freeze-check / error-path client
+## Example 8: Extension mode lifecycle
+
+The runtime supports dynamic extension mode management via gRPC:
+
+1. **`ListExtModes`** — discover available extension modes (e.g. `ext.multi_round.v1`)
+2. **`RegisterExtMode`** — register a new extension mode by providing a `ModeDescriptor` with the mode name, message types, and terminal message types; the runtime creates a passthrough handler
+3. **`UnregisterExtMode`** — remove a dynamically registered extension (built-in modes like `ext.multi_round.v1` cannot be removed)
+4. **`PromoteMode`** — promote an extension to standards-track, optionally renaming the identifier (e.g. `ext.foo.v1` to `macp.mode.foo.v1`)
+
+Important runtime behavior:
+
+- extension mode names must not use the reserved `macp.mode.*` namespace
+- dynamically registered modes use a passthrough handler that accepts any listed message type and requires explicit `Commitment` from the initiator to resolve
+- `WatchModeRegistry` subscribers receive `RegistryChanged` events on every register, unregister, or promote operation
+- `GetManifest` and `Initialize` always include all modes (standards-track + extensions); `ListModes` only returns standards-track
+
+## Example 9: Freeze-check / error-path client
 
 Run:
 
@@ -208,7 +224,7 @@ and ensure the client sets `x-macp-agent-id`.
 
 ### `INVALID_ENVELOPE` on `SessionStart`
 
-For a standards-track mode, check that:
+For a standards-track mode or built-in extension, check that:
 
 - the mode name is canonical
 - the payload is not empty

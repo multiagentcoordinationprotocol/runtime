@@ -189,7 +189,7 @@ mod tests {
             ttl_ms: 60_000,
             started_at_unix_ms: 0,
             resolution: None,
-            mode: "macp.mode.multi_round.v1".into(),
+            mode: "ext.multi_round.v1".into(),
             mode_state: vec![],
             participants: vec![],
             seen_message_ids: HashSet::new(),
@@ -206,7 +206,7 @@ mod tests {
     fn session_start_env() -> Envelope {
         Envelope {
             macp_version: "1.0".into(),
-            mode: "macp.mode.multi_round.v1".into(),
+            mode: "ext.multi_round.v1".into(),
             message_type: "SessionStart".into(),
             message_id: "m0".into(),
             session_id: "s1".into(),
@@ -220,7 +220,7 @@ mod tests {
         let payload = serde_json::json!({"value": value}).to_string();
         Envelope {
             macp_version: "1.0".into(),
-            mode: "macp.mode.multi_round.v1".into(),
+            mode: "ext.multi_round.v1".into(),
             message_type: "Contribute".into(),
             message_id: format!("m_{}", sender),
             session_id: "s1".into(),
@@ -243,7 +243,7 @@ mod tests {
         .encode_to_vec();
         Envelope {
             macp_version: "1.0".into(),
-            mode: "macp.mode.multi_round.v1".into(),
+            mode: "ext.multi_round.v1".into(),
             message_type: "Commitment".into(),
             message_id: "m_commit".into(),
             session_id: "s1".into(),
@@ -531,7 +531,7 @@ mod tests {
         let session = session_with_state(&state);
         let env = Envelope {
             macp_version: "1.0".into(),
-            mode: "macp.mode.multi_round.v1".into(),
+            mode: "ext.multi_round.v1".into(),
             message_type: "Message".into(),
             message_id: "m1".into(),
             session_id: "s1".into(),
@@ -557,7 +557,7 @@ mod tests {
         let session = session_with_state(&state);
         let env = Envelope {
             macp_version: "1.0".into(),
-            mode: "macp.mode.multi_round.v1".into(),
+            mode: "ext.multi_round.v1".into(),
             message_type: "Contribute".into(),
             message_id: "m1".into(),
             session_id: "s1".into(),

@@ -18,7 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &mut client,
         "coordinator",
         envelope(
-            "macp.mode.multi_round.v1",
+            "ext.multi_round.v1",
             "SessionStart",
             "m0",
             &session_id,
@@ -34,7 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &mut client,
         "alice",
         envelope(
-            "macp.mode.multi_round.v1",
+            "ext.multi_round.v1",
             "Contribute",
             "m1",
             &session_id,
@@ -50,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &mut client,
         "bob",
         envelope(
-            "macp.mode.multi_round.v1",
+            "ext.multi_round.v1",
             "Contribute",
             "m2",
             &session_id,
@@ -70,7 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &mut client,
         "bob",
         envelope(
-            "macp.mode.multi_round.v1",
+            "ext.multi_round.v1",
             "Contribute",
             "m3",
             &session_id,
@@ -93,7 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &mut client,
         "coordinator",
         envelope(
-            "macp.mode.multi_round.v1",
+            "ext.multi_round.v1",
             "Commitment",
             "m4",
             &session_id,

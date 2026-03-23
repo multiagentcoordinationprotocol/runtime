@@ -9,7 +9,7 @@ use crate::pb::{Envelope, ModeDescriptor};
 use crate::registry::SessionRegistry;
 use crate::session::{
     extract_ttl_ms, parse_session_start_payload, validate_session_id_for_acceptance,
-    validate_standard_session_start_payload, Session, SessionState,
+    validate_strict_session_start_payload, Session, SessionState,
 };
 use crate::storage::StorageBackend;
 use crate::stream_bus::SessionStreamBus;
@@ -59,12 +59,36 @@ impl Runtime {
         }
     }
 
+    /// Returns all mode names the runtime can handle (standards-track + extensions).
+    /// Used by Initialize and GetManifest to advertise full capability.
     pub fn registered_mode_names(&self) -> Vec<String> {
-        self.mode_registry.standard_mode_names()
+        self.mode_registry.all_mode_names()
     }
 
+    /// Returns only standards-track mode descriptors for ListModes.
     pub fn standard_mode_descriptors(&self) -> Vec<ModeDescriptor> {
         self.mode_registry.standard_mode_descriptors()
+    }
+
+    /// Returns only extension mode descriptors for ListExtModes.
+    pub fn extension_mode_descriptors(&self) -> Vec<ModeDescriptor> {
+        self.mode_registry.extension_mode_descriptors()
+    }
+
+    pub fn register_extension(&self, descriptor: ModeDescriptor) -> Result<(), String> {
+        self.mode_registry.register_extension(descriptor)
+    }
+
+    pub fn unregister_extension(&self, mode: &str) -> Result<(), String> {
+        self.mode_registry.unregister_extension(mode)
+    }
+
+    pub fn promote_mode(&self, mode: &str, new_name: Option<&str>) -> Result<String, String> {
+        self.mode_registry.promote_mode(mode, new_name)
+    }
+
+    pub fn subscribe_mode_changes(&self) -> tokio::sync::broadcast::Receiver<()> {
+        self.mode_registry.subscribe_changes()
     }
 
     pub fn mode_registry(&self) -> &Arc<ModeRegistry> {
@@ -180,7 +204,7 @@ impl Runtime {
             .ok_or(MacpError::UnknownMode)?;
 
         let start_payload = parse_session_start_payload(&env.payload)?;
-        validate_standard_session_start_payload(mode_name, &start_payload)?;
+        validate_strict_session_start_payload(mode_name, &start_payload)?;
         let ttl_ms = extract_ttl_ms(&start_payload)?;
 
         let mut guard = self.registry.sessions.write().await;
@@ -630,7 +654,7 @@ mod tests {
         let err = rt
             .process(
                 &env(
-                    "macp.mode.multi_round.v1",
+                    "ext.multi_round.v1",
                     "SessionStart",
                     "m1",
                     &sid,
@@ -654,7 +678,7 @@ mod tests {
         let payload = session_start(vec!["alice".into(), "bob".into()]);
         rt.process(
             &env(
-                "macp.mode.multi_round.v1",
+                "ext.multi_round.v1",
                 "SessionStart",
                 "m1",
                 &sid,
@@ -666,7 +690,7 @@ mod tests {
         .await
         .unwrap();
         let session = rt.get_session_checked(&sid).await.unwrap();
-        assert_eq!(session.mode, "macp.mode.multi_round.v1");
+        assert_eq!(session.mode, "ext.multi_round.v1");
         assert_eq!(session.participants, vec!["alice", "bob"]);
     }
 

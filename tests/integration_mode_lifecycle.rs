@@ -449,7 +449,7 @@ async fn quorum_full_lifecycle_through_runtime() {
 async fn multi_round_full_lifecycle_through_runtime() {
     let rt = make_runtime();
     let sid = new_sid();
-    let mode = "macp.mode.multi_round.v1";
+    let mode = "ext.multi_round.v1";
 
     rt.process(
         &envelope(

@@ -2,7 +2,7 @@
 
 Reference runtime for the Multi-Agent Coordination Protocol (MACP).
 
-This runtime implements the current MACP core/service surface and all six standards-track modes in the main RFC repository. The focus of this release is freeze-readiness for SDKs and real-world unary and streaming integrations: strict `SessionStart`, mode-semantic correctness, authenticated senders, bounded resources, and durable restart recovery.
+This runtime implements the current MACP core/service surface, five standards-track modes, and one built-in extension mode. The focus of this release is freeze-readiness for SDKs and real-world unary and streaming integrations: strict `SessionStart`, mode-semantic correctness, authenticated senders, bounded resources, durable restart recovery, and extension mode lifecycle management.
 
 ## What changed in v0.4.0
 
@@ -40,7 +40,14 @@ This runtime implements the current MACP core/service surface and all six standa
 - **StreamSession enabled**
   - `Initialize` advertises `stream: true`
   - `StreamSession` provides per-session bidirectional streaming of accepted envelopes
-  - `WatchModeRegistry` and `WatchRoots` implemented (basic: send initial state, hold stream open)
+  - `WatchModeRegistry` fires live `RegistryChanged` events on mode register/unregister/promote
+  - `WatchRoots` implemented (basic: send initial state, hold stream open)
+- **Extension mode lifecycle**
+  - `multi_round` demoted from standards-track to built-in extension (`ext.multi_round.v1`)
+  - `ListExtModes` returns extension mode descriptors
+  - `RegisterExtMode` dynamically registers new extension modes with a passthrough handler
+  - `UnregisterExtMode` removes dynamically registered extensions (built-in modes protected)
+  - `PromoteMode` promotes extensions to standards-track with optional identifier rename
 - **Structured logging via `tracing`**
   - use `RUST_LOG` env var to control log level (e.g. `RUST_LOG=info`)
 - **Per-mode metrics**
@@ -55,13 +62,16 @@ Standards-track modes:
 - `macp.mode.task.v1`
 - `macp.mode.handoff.v1`
 - `macp.mode.quorum.v1`
-- `macp.mode.multi_round.v1`
+
+Built-in extension modes:
+
+- `ext.multi_round.v1`
 
 ## Runtime behavior that SDKs should assume
 
 ### Session bootstrap
 
-For all six standards-track modes, `SessionStartPayload` must include:
+For all standards-track modes and built-in extensions, `SessionStartPayload` must include:
 
 - `participants`
 - `mode_version`
@@ -191,6 +201,10 @@ cargo run --bin fuzz_client
 | `StreamSession` | implemented |
 | `WatchModeRegistry` | implemented |
 | `WatchRoots` | implemented |
+| `ListExtModes` | implemented |
+| `RegisterExtMode` | implemented |
+| `UnregisterExtMode` | implemented |
+| `PromoteMode` | implemented |
 
 ## Architecture
 
@@ -203,8 +217,9 @@ Client Request
        |
   [Mode Registry] -- mode_registry.rs
        |            \
-  [Mode Logic]     [Discovery]
-   mode/*.rs       ListModes, GetManifest
+  [Mode Logic]     [Discovery + Extension Lifecycle]
+   mode/*.rs       ListModes, ListExtModes, GetManifest,
+                   RegisterExtMode, UnregisterExtMode, PromoteMode
        |
   [Storage Layer] -- storage.rs, log_store.rs
        |
@@ -230,11 +245,13 @@ runtime/
 │   ├── storage.rs          # storage backend trait, FileBackend, crash recovery
 │   ├── replay.rs           # session rebuild from append-only log
 │   ├── metrics.rs          # per-mode metrics counters
-│   ├── mode/               # mode implementations
+│   ├── mode/               # mode implementations (standards-track + extensions)
+│   │   ├── passthrough.rs  # generic handler for dynamically registered extensions
+│   │   └── ...
 │   └── bin/                # local development example clients
 ├── tests/
 │   ├── integration_mode_lifecycle.rs  # full-stack integration tests
-│   ├── replay_round_trip.rs           # replay tests for all 6 modes
+│   ├── replay_round_trip.rs           # replay tests for all modes
 │   ├── conformance_loader.rs          # JSON fixture runner
 │   └── conformance/                   # per-mode conformance fixtures
 ├── docs/
@@ -250,7 +267,7 @@ Set `MACP_ALLOW_INSECURE=1` for local development, or provide `MACP_TLS_CERT_PAT
 Session IDs must be UUID v4/v7 in hyphenated lowercase form (36 chars) or base64url tokens (22+ chars). Short or human-readable IDs like `"s1"` or `"my-session"` are rejected.
 
 **`InvalidPayload` on `SessionStart`**
-For standards-track modes, `SessionStartPayload` must include non-empty `participants`, `mode_version`, `configuration_version`, and a positive `ttl_ms`. Empty payloads are rejected.
+For standards-track modes and built-in extensions (including `ext.multi_round.v1`), `SessionStartPayload` must include non-empty `participants`, `mode_version`, `configuration_version`, and a positive `ttl_ms`. Empty payloads are rejected.
 
 **`Forbidden` error**
 Check that the sender identity matches the session's participant list. For `Commitment` messages, only the session initiator is authorized. Verify your bearer token maps to the correct sender.
@@ -264,8 +281,9 @@ Run `make sync-protos` to update local proto files from BSR.
 ## Development notes
 
 - The RFC/spec repository remains the normative source for protocol semantics.
-- This runtime only accepts the canonical standards-track mode identifiers for all six modes.
-- `multi_round` is now standards-track and is advertised by discovery RPCs.
+- Five standards-track modes use the canonical `macp.mode.*` identifiers.
+- `multi_round` is a built-in extension (`ext.multi_round.v1`) — not standards-track, but ships with the runtime and enforces strict `SessionStart`.
+- Extension modes can be dynamically registered, unregistered, and promoted via `RegisterExtMode`, `UnregisterExtMode`, and `PromoteMode` RPCs.
 - `StreamSession` is enabled and binds one gRPC stream to one session, emitting accepted envelopes in order.
 
 See `docs/README.md` and `docs/examples.md` for the updated local development and usage guidance.

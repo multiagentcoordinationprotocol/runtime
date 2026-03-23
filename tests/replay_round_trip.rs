@@ -334,7 +334,7 @@ fn replay_quorum_session() {
 #[test]
 fn replay_multi_round_session() {
     let registry = make_registry();
-    let mode = "macp.mode.multi_round.v1";
+    let mode = "ext.multi_round.v1";
 
     let entries = vec![
         incoming(

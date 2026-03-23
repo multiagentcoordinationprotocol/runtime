@@ -3,8 +3,8 @@ use crate::log_store::{EntryKind, LogEntry};
 use crate::mode_registry::ModeRegistry;
 use crate::pb::Envelope;
 use crate::session::{
-    extract_ttl_ms, is_standard_mode, parse_session_start_payload,
-    validate_standard_session_start_payload, Session, SessionState,
+    extract_ttl_ms, parse_session_start_payload, requires_strict_session_start,
+    validate_strict_session_start_payload, Session, SessionState,
 };
 
 /// Rebuild a `Session` from its append-only log.
@@ -35,14 +35,15 @@ pub fn replay_session(
     let mode = registry.get_mode(mode_name).ok_or(MacpError::UnknownMode)?;
 
     // 2. Parse SessionStartPayload
-    let start_payload = if start_entry.raw_payload.is_empty() && !is_standard_mode(mode_name) {
-        crate::pb::SessionStartPayload::default()
-    } else {
-        parse_session_start_payload(&start_entry.raw_payload)?
-    };
-    validate_standard_session_start_payload(mode_name, &start_payload)?;
+    let start_payload =
+        if start_entry.raw_payload.is_empty() && !requires_strict_session_start(mode_name) {
+            crate::pb::SessionStartPayload::default()
+        } else {
+            parse_session_start_payload(&start_entry.raw_payload)?
+        };
+    validate_strict_session_start_payload(mode_name, &start_payload)?;
 
-    let ttl_ms = if !is_standard_mode(mode_name) && start_payload.ttl_ms == 0 {
+    let ttl_ms = if !requires_strict_session_start(mode_name) && start_payload.ttl_ms == 0 {
         // Legacy experimental modes may have 0 ttl_ms
         60_000i64
     } else {
