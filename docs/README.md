@@ -7,11 +7,12 @@ The RFC/spec repository is still the normative source for MACP semantics. These 
 ## What is in this runtime profile
 
 - MACP server over gRPC with unary RPCs and per-session bidirectional streaming
-- six standards-track modes from the main RFC repository
-- strict canonical `SessionStart` for standards-track modes
+- five standards-track modes from the main RFC repository and one built-in extension
+- strict canonical `SessionStart` for standards-track modes and qualifying extensions
 - authenticated sender derivation
 - payload limits and rate limiting
 - optional file-backed persistence for sessions and accepted-history logs
+- extension mode lifecycle management (register, unregister, promote)
 
 ## Standards-track modes
 
@@ -20,7 +21,10 @@ The RFC/spec repository is still the normative source for MACP semantics. These 
 - `macp.mode.task.v1`
 - `macp.mode.handoff.v1`
 - `macp.mode.quorum.v1`
-- `macp.mode.multi_round.v1`
+
+## Built-in extension modes
+
+- `ext.multi_round.v1`
 
 ## Freeze profile
 
@@ -37,10 +41,17 @@ Implemented and supported:
 - `ListModes`
 - `ListRoots`
 
-Streaming watch RPCs (basic — send initial state, hold stream open):
+Extension mode lifecycle:
 
-- `WatchModeRegistry`
-- `WatchRoots`
+- `ListExtModes`
+- `RegisterExtMode`
+- `UnregisterExtMode`
+- `PromoteMode`
+
+Streaming watch RPCs:
+
+- `WatchModeRegistry` — sends initial state, then fires on register/unregister/promote changes
+- `WatchRoots` — sends initial state, holds stream open
 
 ## Security model
 

@@ -22,11 +22,22 @@ Clients should call `Initialize` before using the runtime.
 - `ListRoots`
 - `WatchModeRegistry`
 - `WatchRoots`
+- `ListExtModes`
+- `RegisterExtMode`
+- `UnregisterExtMode`
+- `PromoteMode`
 
 ## Streaming watch RPCs
 
-- `WatchModeRegistry` — sends the current registry state, then holds the stream open
+- `WatchModeRegistry` — sends the current registry state, then fires `RegistryChanged` on register/unregister/promote
 - `WatchRoots` — sends the current roots state, then holds the stream open
+
+## Extension mode lifecycle RPCs
+
+- `ListExtModes` — returns `ModeDescriptor` entries for all extension modes
+- `RegisterExtMode` — registers a new extension mode from a `ModeDescriptor`; the runtime creates a passthrough handler that accepts message types listed in the descriptor and requires explicit `Commitment` to resolve
+- `UnregisterExtMode` — removes a dynamically registered extension; built-in and standards-track modes cannot be removed
+- `PromoteMode` — promotes an extension to standards-track; optionally renames the mode identifier (e.g. `ext.foo.v1` to `macp.mode.foo.v1`)
 
 ## StreamSession profile
 
@@ -40,16 +51,16 @@ Clients should call `Initialize` before using the runtime.
 - stream-level validation failures terminate the stream with a gRPC status; use `Send` if you need explicit per-message negative acknowledgements
 - to attach to an existing session without mutating it, send a session-scoped `Signal` envelope with the correct `session_id` and `mode`
 
-## Standards-track mode rules
+## Strict session start rules
 
-For these modes:
+For these standards-track modes and built-in extensions:
 
 - `macp.mode.decision.v1`
 - `macp.mode.proposal.v1`
 - `macp.mode.task.v1`
 - `macp.mode.handoff.v1`
 - `macp.mode.quorum.v1`
-- `macp.mode.multi_round.v1`
+- `ext.multi_round.v1` (built-in extension)
 
 `SessionStartPayload` must bind:
 
@@ -62,7 +73,7 @@ Empty payloads are rejected. Empty `mode` values are rejected. Duplicate partici
 
 ## Multi-round mode
 
-`macp.mode.multi_round.v1` is a standards-track mode. It uses the same strict `SessionStart` contract as all other standards-track modes. Convergence is tracked but does not auto-resolve the session — an explicit `Commitment` is required after convergence.
+`ext.multi_round.v1` is a built-in extension mode. It uses the same strict `SessionStart` contract as standards-track modes. Convergence is tracked but does not auto-resolve the session — an explicit `Commitment` is required after convergence.
 
 ## Security profile
 
@@ -92,8 +103,8 @@ This gives restart recovery for session metadata, dedup state, and accepted-hist
 
 ## Commitment validation
 
-For standards-track modes, `CommitmentPayload` must carry version fields that match the session-bound values.
+For standards-track modes and built-in extensions, `CommitmentPayload` must carry version fields that match the session-bound values. Dynamically registered extension modes use a passthrough handler that also validates commitment version fields.
 
 ## Discovery notes
 
-`ListModes` returns all six standards-track modes. `GetManifest` exposes a manifest that matches the implemented unary and streaming capabilities.
+`ListModes` returns five standards-track modes. `ListExtModes` returns extension mode descriptors. `GetManifest` exposes all supported modes (standards-track + extensions). `RegisterExtMode`, `UnregisterExtMode`, and `PromoteMode` manage extension lifecycle at runtime.

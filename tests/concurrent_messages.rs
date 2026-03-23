@@ -55,7 +55,7 @@ fn envelope(
 async fn concurrent_contributes_all_accepted() {
     let rt = make_runtime();
     let sid = new_sid();
-    let mode = "macp.mode.multi_round.v1";
+    let mode = "ext.multi_round.v1";
 
     // Create participants
     let n = 10;
@@ -87,7 +87,7 @@ async fn concurrent_contributes_all_accepted() {
                 .into_bytes();
             rt.process(
                 &envelope(
-                    "macp.mode.multi_round.v1",
+                    "ext.multi_round.v1",
                     "Contribute",
                     &format!("m{}", i + 1),
                     &sid,

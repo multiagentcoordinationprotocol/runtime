@@ -52,7 +52,7 @@ impl Session {
     }
 }
 
-pub fn is_standard_mode(mode: &str) -> bool {
+pub fn requires_strict_session_start(mode: &str) -> bool {
     matches!(
         mode,
         "macp.mode.decision.v1"
@@ -60,7 +60,7 @@ pub fn is_standard_mode(mode: &str) -> bool {
             | "macp.mode.task.v1"
             | "macp.mode.handoff.v1"
             | "macp.mode.quorum.v1"
-            | "macp.mode.multi_round.v1"
+            | "ext.multi_round.v1"
     )
 }
 
@@ -80,12 +80,12 @@ pub fn extract_ttl_ms(payload: &SessionStartPayload) -> Result<i64, MacpError> {
     Ok(payload.ttl_ms)
 }
 
-/// Enforce the canonical SessionStart binding contract for standards-track modes.
-pub fn validate_standard_session_start_payload(
+/// Enforce the strict SessionStart binding contract for standards-track and qualifying extension modes.
+pub fn validate_strict_session_start_payload(
     mode: &str,
     payload: &SessionStartPayload,
 ) -> Result<(), MacpError> {
-    if !is_standard_mode(mode) {
+    if !requires_strict_session_start(mode) {
         return Ok(());
     }
 
@@ -208,7 +208,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            validate_standard_session_start_payload("macp.mode.decision.v1", &payload)
+            validate_strict_session_start_payload("macp.mode.decision.v1", &payload)
                 .unwrap_err()
                 .to_string(),
             "InvalidPayload"
@@ -222,7 +222,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            validate_standard_session_start_payload("macp.mode.decision.v1", &payload)
+            validate_strict_session_start_payload("macp.mode.decision.v1", &payload)
                 .unwrap_err()
                 .to_string(),
             "InvalidPayload"
@@ -239,7 +239,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            validate_standard_session_start_payload("macp.mode.proposal.v1", &payload)
+            validate_strict_session_start_payload("macp.mode.proposal.v1", &payload)
                 .unwrap_err()
                 .to_string(),
             "InvalidPayload"
@@ -247,11 +247,9 @@ mod tests {
     }
 
     #[test]
-    fn multi_round_now_requires_standard_validation() {
+    fn multi_round_requires_strict_session_start() {
         let payload = SessionStartPayload::default();
-        assert!(
-            validate_standard_session_start_payload("macp.mode.multi_round.v1", &payload).is_err()
-        );
+        assert!(validate_strict_session_start_payload("ext.multi_round.v1", &payload).is_err());
     }
 
     #[test]

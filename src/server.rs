@@ -3,12 +3,14 @@ use macp_runtime::pb::macp_runtime_service_server::MacpRuntimeService;
 use macp_runtime::pb::{
     Ack, CancelSessionRequest, CancelSessionResponse, CancellationCapability, Capabilities,
     Envelope, GetManifestRequest, GetManifestResponse, GetSessionRequest, GetSessionResponse,
-    InitializeRequest, InitializeResponse, ListModesRequest, ListModesResponse, ListRootsRequest,
-    ListRootsResponse, MacpError as PbMacpError, ManifestCapability, ModeRegistryCapability,
-    ProgressCapability, RootsCapability, RuntimeInfo, SendRequest, SendResponse, SessionMetadata,
+    InitializeRequest, InitializeResponse, ListExtModesRequest, ListExtModesResponse,
+    ListModesRequest, ListModesResponse, ListRootsRequest, ListRootsResponse,
+    MacpError as PbMacpError, ManifestCapability, ModeRegistryCapability, ProgressCapability,
+    PromoteModeRequest, PromoteModeResponse, RegisterExtModeRequest, RegisterExtModeResponse,
+    RootsCapability, RuntimeInfo, SendRequest, SendResponse, SessionMetadata,
     SessionState as PbSessionState, SessionsCapability, StreamSessionRequest,
-    StreamSessionResponse, WatchModeRegistryRequest, WatchModeRegistryResponse, WatchRootsRequest,
-    WatchRootsResponse,
+    StreamSessionResponse, UnregisterExtModeRequest, UnregisterExtModeResponse,
+    WatchModeRegistryRequest, WatchModeRegistryResponse, WatchRootsRequest, WatchRootsResponse,
 };
 use macp_runtime::runtime::Runtime;
 use macp_runtime::security::{AuthIdentity, SecurityLayer};
@@ -411,7 +413,11 @@ impl MacpRuntimeService for MacpServer {
                     list_roots: true,
                     list_changed: true,
                 }),
-                experimental: None,
+                experimental: Some(macp_runtime::pb::ExperimentalCapabilities {
+                    features: HashMap::from([
+                        ("ext_mode_lifecycle".into(), "true".into()),
+                    ]),
+                }),
             }),
             supported_modes: self.runtime.registered_mode_names(),
             instructions: "Authenticate requests with Authorization: Bearer <token>. Use the unary Send RPC for all session messaging. For local development only, x-macp-agent-id may be enabled by configuration.".into(),
@@ -605,16 +611,24 @@ impl MacpRuntimeService for MacpServer {
         &self,
         _request: Request<WatchModeRegistryRequest>,
     ) -> Result<Response<Self::WatchModeRegistryStream>, Status> {
-        let initial = WatchModeRegistryResponse {
-            change: Some(macp_runtime::pb::RegistryChanged {
-                registry: "modes".into(),
-                observed_at_unix_ms: chrono::Utc::now().timestamp_millis(),
-            }),
-        };
+        let mut rx = self.runtime.subscribe_mode_changes();
         let stream = async_stream::try_stream! {
-            yield initial;
-            // Modes are static at runtime — keep the stream open but idle.
-            std::future::pending::<()>().await;
+            // Send initial state
+            yield WatchModeRegistryResponse {
+                change: Some(macp_runtime::pb::RegistryChanged {
+                    registry: "modes".into(),
+                    observed_at_unix_ms: chrono::Utc::now().timestamp_millis(),
+                }),
+            };
+            // Wait for changes from register/unregister/promote
+            while rx.recv().await.is_ok() {
+                yield WatchModeRegistryResponse {
+                    change: Some(macp_runtime::pb::RegistryChanged {
+                        registry: "modes".into(),
+                        observed_at_unix_ms: chrono::Utc::now().timestamp_millis(),
+                    }),
+                };
+            }
         };
         Ok(Response::new(Box::pin(stream)))
     }
@@ -638,6 +652,78 @@ impl MacpRuntimeService for MacpServer {
             std::future::pending::<()>().await;
         };
         Ok(Response::new(Box::pin(stream)))
+    }
+
+    // Extension mode lifecycle RPCs
+
+    async fn list_ext_modes(
+        &self,
+        _request: Request<ListExtModesRequest>,
+    ) -> Result<Response<ListExtModesResponse>, Status> {
+        Ok(Response::new(ListExtModesResponse {
+            modes: self.runtime.extension_mode_descriptors(),
+        }))
+    }
+
+    async fn register_ext_mode(
+        &self,
+        request: Request<RegisterExtModeRequest>,
+    ) -> Result<Response<RegisterExtModeResponse>, Status> {
+        let req = request.into_inner();
+        let descriptor = req
+            .descriptor
+            .ok_or_else(|| Status::invalid_argument("descriptor required"))?;
+        match self.runtime.register_extension(descriptor) {
+            Ok(()) => Ok(Response::new(RegisterExtModeResponse {
+                ok: true,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(RegisterExtModeResponse {
+                ok: false,
+                error: e,
+            })),
+        }
+    }
+
+    async fn unregister_ext_mode(
+        &self,
+        request: Request<UnregisterExtModeRequest>,
+    ) -> Result<Response<UnregisterExtModeResponse>, Status> {
+        let req = request.into_inner();
+        match self.runtime.unregister_extension(&req.mode) {
+            Ok(()) => Ok(Response::new(UnregisterExtModeResponse {
+                ok: true,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(UnregisterExtModeResponse {
+                ok: false,
+                error: e,
+            })),
+        }
+    }
+
+    async fn promote_mode(
+        &self,
+        request: Request<PromoteModeRequest>,
+    ) -> Result<Response<PromoteModeResponse>, Status> {
+        let req = request.into_inner();
+        let new_name = if req.promoted_mode_name.is_empty() {
+            None
+        } else {
+            Some(req.promoted_mode_name.as_str())
+        };
+        match self.runtime.promote_mode(&req.mode, new_name) {
+            Ok(final_name) => Ok(Response::new(PromoteModeResponse {
+                ok: true,
+                error: String::new(),
+                mode: final_name,
+            })),
+            Err(e) => Ok(Response::new(PromoteModeResponse {
+                ok: false,
+                error: e,
+                mode: String::new(),
+            })),
+        }
     }
 }
 
@@ -861,13 +947,47 @@ mod tests {
             .iter()
             .map(|m| m.mode.clone())
             .collect();
-        assert_eq!(names.len(), 6);
+        assert_eq!(names.len(), 5);
         assert!(names.contains(&"macp.mode.decision.v1".to_string()));
         assert!(names.contains(&"macp.mode.proposal.v1".to_string()));
         assert!(names.contains(&"macp.mode.task.v1".to_string()));
         assert!(names.contains(&"macp.mode.handoff.v1".to_string()));
         assert!(names.contains(&"macp.mode.quorum.v1".to_string()));
-        assert!(names.contains(&"macp.mode.multi_round.v1".to_string()));
+        // multi_round is now an extension, not in ListModes
+        assert!(!names.contains(&"ext.multi_round.v1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn list_ext_modes_returns_extensions() {
+        let (server, _) = make_server();
+        let resp = server
+            .list_ext_modes(Request::new(ListExtModesRequest {}))
+            .await
+            .unwrap();
+        let names: Vec<String> = resp
+            .into_inner()
+            .modes
+            .iter()
+            .map(|m| m.mode.clone())
+            .collect();
+        assert_eq!(names.len(), 1);
+        assert!(names.contains(&"ext.multi_round.v1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn get_manifest_includes_all_modes() {
+        let (server, _) = make_server();
+        let resp = server
+            .get_manifest(Request::new(macp_runtime::pb::GetManifestRequest {
+                agent_id: String::new(),
+            }))
+            .await
+            .unwrap();
+        let manifest = resp.into_inner().manifest.unwrap();
+        assert_eq!(manifest.supported_modes.len(), 6);
+        assert!(manifest
+            .supported_modes
+            .contains(&"ext.multi_round.v1".to_string()));
     }
 
     #[tokio::test]

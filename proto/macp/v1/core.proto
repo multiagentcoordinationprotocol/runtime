@@ -239,6 +239,44 @@ message WatchRootsResponse {
   RootsChanged change = 1;
 }
 
+// Extension mode lifecycle management
+message ListExtModesRequest {}
+
+message ListExtModesResponse {
+  repeated ModeDescriptor modes = 1;
+}
+
+message RegisterExtModeRequest {
+  ModeDescriptor descriptor = 1;
+}
+
+message RegisterExtModeResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
+message UnregisterExtModeRequest {
+  string mode = 1;
+}
+
+message UnregisterExtModeResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
+message PromoteModeRequest {
+  string mode = 1;
+  // Optional new identifier for the promoted mode (e.g., "macp.mode.foo.v1").
+  // If empty, the existing identifier is kept.
+  string promoted_mode_name = 2;
+}
+
+message PromoteModeResponse {
+  bool ok = 1;
+  string error = 2;
+  string mode = 3;
+}
+
 service MACPRuntimeService {
   rpc Initialize(InitializeRequest) returns (InitializeResponse);
   rpc Send(SendRequest) returns (SendResponse);
@@ -250,4 +288,9 @@ service MACPRuntimeService {
   rpc WatchModeRegistry(WatchModeRegistryRequest) returns (stream WatchModeRegistryResponse);
   rpc ListRoots(ListRootsRequest) returns (ListRootsResponse);
   rpc WatchRoots(WatchRootsRequest) returns (stream WatchRootsResponse);
+  // Extension mode lifecycle
+  rpc ListExtModes(ListExtModesRequest) returns (ListExtModesResponse);
+  rpc RegisterExtMode(RegisterExtModeRequest) returns (RegisterExtModeResponse);
+  rpc UnregisterExtMode(UnregisterExtModeRequest) returns (UnregisterExtModeResponse);
+  rpc PromoteMode(PromoteModeRequest) returns (PromoteModeResponse);
 }

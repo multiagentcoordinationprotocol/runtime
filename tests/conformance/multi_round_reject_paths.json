@@ -1,5 +1,5 @@
 {
-  "mode": "macp.mode.multi_round.v1",
+  "mode": "ext.multi_round.v1",
   "initiator": "agent://coordinator",
   "participants": ["agent://alice", "agent://bob"],
   "mode_version": "1.0.0",

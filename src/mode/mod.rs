@@ -1,6 +1,7 @@
 pub mod decision;
 pub mod handoff;
 pub mod multi_round;
+pub mod passthrough;
 pub mod proposal;
 pub mod quorum;
 pub mod task;
@@ -18,8 +19,10 @@ pub const STANDARD_MODE_NAMES: &[&str] = &[
     "macp.mode.task.v1",
     "macp.mode.handoff.v1",
     "macp.mode.quorum.v1",
-    "macp.mode.multi_round.v1",
 ];
+
+/// Built-in extension modes shipped with this runtime but not yet standards-track.
+pub const EXTENSION_MODE_NAMES: &[&str] = &["ext.multi_round.v1"];
 
 /// The result of a Mode processing a message.
 /// The runtime applies this response to mutate session state.
@@ -61,11 +64,15 @@ pub fn standard_mode_names() -> &'static [&'static str] {
     STANDARD_MODE_NAMES
 }
 
-pub fn standard_mode_descriptors() -> Vec<ModeDescriptor> {
-    fn schema_map(path: &str) -> HashMap<String, String> {
-        HashMap::from([("protobuf".to_string(), path.to_string())])
-    }
+pub fn extension_mode_names() -> &'static [&'static str] {
+    EXTENSION_MODE_NAMES
+}
 
+fn schema_map(path: &str) -> HashMap<String, String> {
+    HashMap::from([("protobuf".to_string(), path.to_string())])
+}
+
+pub fn standard_mode_descriptors() -> Vec<ModeDescriptor> {
     vec![
         ModeDescriptor {
             mode: "macp.mode.decision.v1".into(),
@@ -160,20 +167,29 @@ pub fn standard_mode_descriptors() -> Vec<ModeDescriptor> {
             terminal_message_types: vec!["Commitment".into()],
             schema_uris: schema_map("buf.build/multiagentcoordinationprotocol/macp"),
         },
-        ModeDescriptor {
-            mode: "macp.mode.multi_round.v1".into(),
-            mode_version: "1.0.0".into(),
-            title: "Multi-Round Mode".into(),
-            description: "Iterative convergence through multiple contribution rounds until all participants agree, with a terminal Commitment.".into(),
-            determinism_class: "semantic-deterministic".into(),
-            participant_model: "peer".into(),
-            message_types: vec![
-                "SessionStart".into(),
-                "Contribute".into(),
-                "Commitment".into(),
-            ],
-            terminal_message_types: vec!["Commitment".into()],
-            schema_uris: schema_map("buf.build/multiagentcoordinationprotocol/macp"),
-        },
     ]
+}
+
+pub fn extension_mode_descriptors() -> Vec<ModeDescriptor> {
+    vec![ModeDescriptor {
+        mode: "ext.multi_round.v1".into(),
+        mode_version: "1.0.0".into(),
+        title: "Multi-Round Mode".into(),
+        description: "Iterative convergence through multiple contribution rounds until all participants agree, with a terminal Commitment.".into(),
+        determinism_class: "semantic-deterministic".into(),
+        participant_model: "peer".into(),
+        message_types: vec![
+            "SessionStart".into(),
+            "Contribute".into(),
+            "Commitment".into(),
+        ],
+        terminal_message_types: vec!["Commitment".into()],
+        schema_uris: schema_map("buf.build/multiagentcoordinationprotocol/macp"),
+    }]
+}
+
+pub fn all_mode_descriptors() -> Vec<ModeDescriptor> {
+    let mut all = standard_mode_descriptors();
+    all.extend(extension_mode_descriptors());
+    all
 }

@@ -34,12 +34,20 @@ Responsibilities:
 - provide standards-track mode names for `ListModes`
 - provide mode descriptors for `ListModes` and `GetManifest`
 
+The registry uses `RwLock` for thread-safe dynamic mode registration.
+
 Key methods:
 
-- `build_default()` — constructs the canonical mode set
+- `build_default()` — constructs the canonical mode set (5 standards-track + 1 built-in extension)
 - `get_mode(name)` — mode lookup for dispatch
-- `standard_mode_names()` — drives `ListModes` and `GetManifest`
+- `standard_mode_names()` — drives `ListModes`
 - `standard_mode_descriptors()` — drives `ListModes` response
+- `all_mode_names()` — drives `GetManifest` and `Initialize` (all modes)
+- `extension_mode_descriptors()` — drives `ListExtModes`
+- `register_extension(descriptor)` — dynamic extension registration
+- `unregister_extension(mode)` — dynamic extension removal (built-in modes cannot be removed)
+- `promote_mode(mode, new_name)` — promote extension to standards-track
+- `subscribe_changes()` — broadcast channel for `WatchModeRegistry`
 
 ## 4. Mode layer (`src/mode/*`)
 
@@ -57,7 +65,8 @@ Implemented modes:
 - Task — delegated task with serial assignment, progress tracking, terminal reports
 - Handoff — serial handoff offers with accept/decline disposition
 - Quorum — threshold approval with ballots
-- MultiRound — iterative value convergence with explicit Commitment
+- MultiRound (`ext.multi_round.v1`) — built-in extension: iterative value convergence with explicit Commitment
+- PassthroughMode — generic handler for dynamically registered extension modes
 
 ## 5. Storage layer
 
@@ -110,8 +119,9 @@ Client Request
        |
   [Mode Registry] -- mode_registry.rs
        |            \
-  [Mode Logic]     [Discovery]
-   mode/*.rs       ListModes, GetManifest
+  [Mode Logic]     [Discovery + Extension Lifecycle]
+   mode/*.rs       ListModes, ListExtModes, GetManifest,
+                   RegisterExtMode, UnregisterExtMode, PromoteMode
        |
   [Storage Layer] -- storage.rs, log_store.rs
        |
