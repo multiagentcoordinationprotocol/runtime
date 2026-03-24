@@ -6,7 +6,7 @@ package macp.v1;
 
 message Envelope {
   string macp_version = 1;
-  string mode = 2;                // empty for ambient Signals
+  string mode = 2;             // empty for ambient Signals
   string message_type = 3;
   string message_id = 4;
   string session_id = 5;       // empty for ambient messages

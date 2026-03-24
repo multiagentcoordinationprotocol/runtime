@@ -178,6 +178,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: bufbuild/buf-setup-action@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
       - name: Verify protos match pinned BSR version
         run: |
           TMPDIR=$(mktemp -d)
