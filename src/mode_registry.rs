@@ -86,6 +86,30 @@ impl ModeRegistry {
         }
     }
 
+    fn ordered_standard_names(entries: &HashMap<String, ModeRegistration>) -> Vec<String> {
+        let mut names: Vec<String> = STANDARD_MODE_NAMES
+            .iter()
+            .filter(|name| {
+                entries
+                    .get(**name)
+                    .map(|entry| entry.standards_track)
+                    .unwrap_or(false)
+            })
+            .map(|name| (*name).to_string())
+            .collect();
+
+        let mut promoted: Vec<String> = entries
+            .iter()
+            .filter(|(name, entry)| {
+                entry.standards_track && !STANDARD_MODE_NAMES.contains(&name.as_str())
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        promoted.sort();
+        names.extend(promoted);
+        names
+    }
+
     pub fn get_mode(&self, name: &str) -> Option<ModeRef<'_>> {
         let guard = self.entries.read().expect("mode registry lock poisoned");
         if guard.contains_key(name) {
@@ -109,50 +133,54 @@ impl ModeRegistry {
 
     pub fn standard_mode_names(&self) -> Vec<String> {
         let guard = self.entries.read().expect("mode registry lock poisoned");
-        STANDARD_MODE_NAMES
-            .iter()
-            .filter(|name| guard.contains_key(**name))
-            .map(|name| (*name).to_string())
-            .collect()
+        Self::ordered_standard_names(&guard)
     }
 
     pub fn standard_mode_descriptors(&self) -> Vec<ModeDescriptor> {
         let guard = self.entries.read().expect("mode registry lock poisoned");
-        STANDARD_MODE_NAMES
-            .iter()
-            .filter_map(|name| guard.get(*name).and_then(|e| e.descriptor.clone()))
+        Self::ordered_standard_names(&guard)
+            .into_iter()
+            .filter_map(|name| guard.get(&name).and_then(|entry| entry.descriptor.clone()))
             .collect()
     }
 
     pub fn extension_mode_names(&self) -> Vec<String> {
         let guard = self.entries.read().expect("mode registry lock poisoned");
-        guard
+        let mut names: Vec<String> = guard
             .iter()
             .filter(|(_, e)| !e.standards_track)
             .map(|(name, _)| name.clone())
-            .collect()
+            .collect();
+        names.sort();
+        names
     }
 
     pub fn extension_mode_descriptors(&self) -> Vec<ModeDescriptor> {
         let guard = self.entries.read().expect("mode registry lock poisoned");
-        guard
+        let mut descriptors: Vec<ModeDescriptor> = guard
             .iter()
             .filter(|(_, e)| !e.standards_track)
             .filter_map(|(_, e)| e.descriptor.clone())
-            .collect()
+            .collect();
+        descriptors.sort_by(|a, b| a.mode.cmp(&b.mode));
+        descriptors
     }
 
     pub fn all_mode_names(&self) -> Vec<String> {
         let guard = self.entries.read().expect("mode registry lock poisoned");
-        guard.keys().cloned().collect()
+        let mut names: Vec<String> = guard.keys().cloned().collect();
+        names.sort();
+        names
     }
 
     pub fn all_mode_descriptors(&self) -> Vec<ModeDescriptor> {
         let guard = self.entries.read().expect("mode registry lock poisoned");
-        guard
+        let mut descriptors: Vec<ModeDescriptor> = guard
             .values()
             .filter_map(|e| e.descriptor.clone())
-            .collect()
+            .collect();
+        descriptors.sort_by(|a, b| a.mode.cmp(&b.mode));
+        descriptors
     }
 
     pub fn is_standard_mode(&self, name: &str) -> bool {
@@ -479,6 +507,32 @@ mod tests {
         let final_name = registry.promote_mode("ext.keep.v1", None).unwrap();
         assert_eq!(final_name, "ext.keep.v1");
         assert!(registry.is_standard_mode("ext.keep.v1"));
+    }
+
+    #[test]
+    fn promoted_mode_appears_in_standard_mode_names_and_descriptors() {
+        let registry = ModeRegistry::build_default();
+        let descriptor = ModeDescriptor {
+            mode: "ext.promoted.v1".into(),
+            mode_version: "1.0.0".into(),
+            title: "Promoted".into(),
+            message_types: vec!["SessionStart".into(), "Commitment".into()],
+            ..Default::default()
+        };
+        registry.register_extension(descriptor).unwrap();
+        registry
+            .promote_mode("ext.promoted.v1", Some("macp.mode.promoted.v1"))
+            .unwrap();
+
+        let standard_names = registry.standard_mode_names();
+        assert!(standard_names.contains(&"macp.mode.promoted.v1".to_string()));
+
+        let standard_modes: Vec<String> = registry
+            .standard_mode_descriptors()
+            .into_iter()
+            .map(|d| d.mode)
+            .collect();
+        assert!(standard_modes.contains(&"macp.mode.promoted.v1".to_string()));
     }
 
     #[test]

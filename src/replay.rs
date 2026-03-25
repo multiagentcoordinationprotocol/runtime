@@ -3,8 +3,8 @@ use crate::log_store::{EntryKind, LogEntry};
 use crate::mode_registry::ModeRegistry;
 use crate::pb::Envelope;
 use crate::session::{
-    extract_ttl_ms, parse_session_start_payload, requires_strict_session_start,
-    validate_strict_session_start_payload, Session, SessionState,
+    extract_ttl_ms, parse_session_start_payload, validate_canonical_session_start_payload, Session,
+    SessionState,
 };
 
 /// Rebuild a `Session` from its append-only log.
@@ -35,15 +35,18 @@ pub fn replay_session(
     let mode = registry.get_mode(mode_name).ok_or(MacpError::UnknownMode)?;
 
     // 2. Parse SessionStartPayload
-    let start_payload =
-        if start_entry.raw_payload.is_empty() && !requires_strict_session_start(mode_name) {
-            crate::pb::SessionStartPayload::default()
-        } else {
-            parse_session_start_payload(&start_entry.raw_payload)?
-        };
-    validate_strict_session_start_payload(mode_name, &start_payload)?;
+    let require_complete_start =
+        registry.is_standard_mode(mode_name) || mode_name == "ext.multi_round.v1";
+    let start_payload = if start_entry.raw_payload.is_empty() && !require_complete_start {
+        crate::pb::SessionStartPayload::default()
+    } else {
+        parse_session_start_payload(&start_entry.raw_payload)?
+    };
+    if require_complete_start {
+        validate_canonical_session_start_payload(&start_payload)?;
+    }
 
-    let ttl_ms = if !requires_strict_session_start(mode_name) && start_payload.ttl_ms == 0 {
+    let ttl_ms = if !require_complete_start && start_payload.ttl_ms == 0 {
         // Legacy experimental modes may have 0 ttl_ms
         60_000i64
     } else {
@@ -125,11 +128,12 @@ pub fn replay_session(
                     continue;
                 }
 
-                // Replay through mode — errors during replay are not fatal,
-                // the message was already accepted in the original run
-                if let Ok(response) = mode.on_message(&session, &replay_env) {
-                    session.apply_mode_response(response);
-                }
+                // Replay through the same authorization and mode callbacks used during
+                // live processing. Accepted history that no longer replays cleanly must
+                // fail recovery instead of silently drifting session state.
+                mode.authorize_sender(&session, &replay_env)?;
+                let response = mode.on_message(&session, &replay_env)?;
+                session.apply_mode_response(response);
                 if !replay_env.message_id.is_empty() {
                     session.seen_message_ids.insert(replay_env.message_id);
                 }
@@ -316,6 +320,36 @@ mod tests {
 
         let session = replay_session("s1", &entries, &registry).unwrap();
         assert_eq!(session.state, SessionState::Expired);
+    }
+
+    #[test]
+    fn replay_fails_when_accepted_history_no_longer_applies() {
+        let registry = make_registry();
+        let vote = VotePayload {
+            proposal_id: "p1".into(),
+            vote: "approve".into(),
+            reason: String::new(),
+        }
+        .encode_to_vec();
+        let entries = vec![
+            incoming_entry(
+                "m1",
+                "SessionStart",
+                "agent://orchestrator",
+                start_payload_bytes(),
+                1000,
+            ),
+            incoming_entry("m2", "Vote", "agent://fraud", vote, 2000),
+        ];
+
+        let err = replay_session("s1", &entries, &registry).unwrap_err();
+        // The exact error variant depends on which check fails first (authorize_sender
+        // or on_message); what matters is that replay does NOT silently succeed.
+        let msg = err.to_string();
+        assert!(
+            msg == "InvalidTransition" || msg == "InvalidPayload" || msg == "Forbidden",
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]

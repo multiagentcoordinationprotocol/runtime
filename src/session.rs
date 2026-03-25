@@ -80,15 +80,10 @@ pub fn extract_ttl_ms(payload: &SessionStartPayload) -> Result<i64, MacpError> {
     Ok(payload.ttl_ms)
 }
 
-/// Enforce the strict SessionStart binding contract for standards-track and qualifying extension modes.
-pub fn validate_strict_session_start_payload(
-    mode: &str,
+/// Validate the complete canonical SessionStart binding contract.
+pub fn validate_canonical_session_start_payload(
     payload: &SessionStartPayload,
 ) -> Result<(), MacpError> {
-    if !requires_strict_session_start(mode) {
-        return Ok(());
-    }
-
     extract_ttl_ms(payload)?;
 
     if payload.mode_version.trim().is_empty() || payload.configuration_version.trim().is_empty() {
@@ -108,6 +103,18 @@ pub fn validate_strict_session_start_payload(
     }
 
     Ok(())
+}
+
+/// Enforce the strict SessionStart binding contract for standards-track and qualifying extension modes.
+pub fn validate_strict_session_start_payload(
+    mode: &str,
+    payload: &SessionStartPayload,
+) -> Result<(), MacpError> {
+    if !requires_strict_session_start(mode) {
+        return Ok(());
+    }
+
+    validate_canonical_session_start_payload(payload)
 }
 
 /// Validate that a session ID meets the acceptance policy.
