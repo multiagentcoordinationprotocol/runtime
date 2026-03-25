@@ -8,8 +8,8 @@ use crate::mode_registry::ModeRegistry;
 use crate::pb::{Envelope, ModeDescriptor};
 use crate::registry::SessionRegistry;
 use crate::session::{
-    extract_ttl_ms, parse_session_start_payload, validate_session_id_for_acceptance,
-    validate_strict_session_start_payload, Session, SessionState,
+    extract_ttl_ms, parse_session_start_payload, validate_canonical_session_start_payload,
+    validate_session_id_for_acceptance, Session, SessionState,
 };
 use crate::storage::StorageBackend;
 use crate::stream_bus::SessionStreamBus;
@@ -204,7 +204,11 @@ impl Runtime {
             .ok_or(MacpError::UnknownMode)?;
 
         let start_payload = parse_session_start_payload(&env.payload)?;
-        validate_strict_session_start_payload(mode_name, &start_payload)?;
+        let require_complete_start =
+            self.mode_registry.is_standard_mode(mode_name) || mode_name == "ext.multi_round.v1";
+        if require_complete_start {
+            validate_canonical_session_start_payload(&start_payload)?;
+        }
         let ttl_ms = extract_ttl_ms(&start_payload)?;
 
         let mut guard = self.registry.sessions.write().await;

@@ -13,6 +13,7 @@ pub struct AuthIdentity {
     pub allowed_modes: Option<HashSet<String>>,
     pub can_start_sessions: bool,
     pub max_open_sessions: Option<usize>,
+    pub can_manage_mode_registry: bool,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -24,6 +25,8 @@ struct RawIdentity {
     #[serde(default = "default_true")]
     can_start_sessions: bool,
     max_open_sessions: Option<usize>,
+    #[serde(default)]
+    can_manage_mode_registry: bool,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -147,6 +150,7 @@ impl SecurityLayer {
                     },
                     can_start_sessions: item.can_start_sessions,
                     max_open_sessions: item.max_open_sessions,
+                    can_manage_mode_registry: item.can_manage_mode_registry,
                 },
             );
         }
@@ -186,6 +190,7 @@ impl SecurityLayer {
                     allowed_modes: None,
                     can_start_sessions: true,
                     max_open_sessions: None,
+                    can_manage_mode_registry: true,
                 });
             }
         }
@@ -208,6 +213,14 @@ impl SecurityLayer {
             }
         }
         Ok(())
+    }
+
+    pub fn authorize_mode_registry(&self, identity: &AuthIdentity) -> Result<(), MacpError> {
+        if identity.can_manage_mode_registry {
+            Ok(())
+        } else {
+            Err(MacpError::Forbidden)
+        }
     }
 
     async fn check_bucket(
@@ -543,6 +556,7 @@ mod tests {
             allowed_modes: None,
             can_start_sessions: true,
             max_open_sessions: None,
+            can_manage_mode_registry: false,
         };
         assert!(layer
             .authorize_mode(&id, "macp.mode.decision.v1", false)
@@ -562,6 +576,7 @@ mod tests {
             allowed_modes: Some(allowed),
             can_start_sessions: true,
             max_open_sessions: None,
+            can_manage_mode_registry: false,
         };
         assert!(layer
             .authorize_mode(&id, "macp.mode.decision.v1", false)
@@ -580,6 +595,7 @@ mod tests {
             allowed_modes: None,
             can_start_sessions: false,
             max_open_sessions: None,
+            can_manage_mode_registry: false,
         };
         let err = layer
             .authorize_mode(&id, "macp.mode.decision.v1", true)
@@ -595,6 +611,7 @@ mod tests {
             allowed_modes: None,
             can_start_sessions: false,
             max_open_sessions: None,
+            can_manage_mode_registry: false,
         };
         // Regular messages (not session start) should succeed
         assert!(layer
@@ -613,6 +630,7 @@ mod tests {
             allowed_modes: Some(allowed),
             can_start_sessions: false,
             max_open_sessions: None,
+            can_manage_mode_registry: false,
         };
 
         // Cannot start sessions (checked first)
@@ -631,6 +649,29 @@ mod tests {
         assert!(layer
             .authorize_mode(&id, "macp.mode.decision.v1", false)
             .is_ok());
+    }
+
+    #[test]
+    fn authorize_mode_registry_requires_explicit_privilege() {
+        let layer = SecurityLayer::dev_mode();
+        let id = AuthIdentity {
+            sender: "agent://no-admin".into(),
+            allowed_modes: None,
+            can_start_sessions: true,
+            max_open_sessions: None,
+            can_manage_mode_registry: false,
+        };
+        let err = layer.authorize_mode_registry(&id).unwrap_err();
+        assert!(matches!(err, MacpError::Forbidden));
+    }
+
+    #[test]
+    fn dev_sender_header_can_manage_mode_registry() {
+        let layer = SecurityLayer::dev_mode();
+        let mut meta = MetadataMap::new();
+        meta.insert("x-macp-agent-id", "agent://dev-admin".parse().unwrap());
+        let id = layer.authenticate_metadata(&meta).unwrap();
+        assert!(layer.authorize_mode_registry(&id).is_ok());
     }
 
     // ---------------------------------------------------------------

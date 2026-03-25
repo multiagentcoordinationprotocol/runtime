@@ -140,7 +140,8 @@ Token JSON may be either a raw list or an object with a `tokens` array. Example:
       "allowed_modes": [
         "macp.mode.task.v1"
       ],
-      "can_start_sessions": false
+      "can_start_sessions": false,
+      "can_manage_mode_registry": false
     }
   ]
 }

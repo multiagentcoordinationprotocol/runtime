@@ -669,6 +669,13 @@ impl MacpRuntimeService for MacpServer {
         &self,
         request: Request<RegisterExtModeRequest>,
     ) -> Result<Response<RegisterExtModeResponse>, Status> {
+        let identity = self
+            .security
+            .authenticate_metadata(request.metadata())
+            .map_err(Self::status_from_error)?;
+        self.security
+            .authorize_mode_registry(&identity)
+            .map_err(Self::status_from_error)?;
         let req = request.into_inner();
         let descriptor = req
             .descriptor
@@ -689,6 +696,13 @@ impl MacpRuntimeService for MacpServer {
         &self,
         request: Request<UnregisterExtModeRequest>,
     ) -> Result<Response<UnregisterExtModeResponse>, Status> {
+        let identity = self
+            .security
+            .authenticate_metadata(request.metadata())
+            .map_err(Self::status_from_error)?;
+        self.security
+            .authorize_mode_registry(&identity)
+            .map_err(Self::status_from_error)?;
         let req = request.into_inner();
         match self.runtime.unregister_extension(&req.mode) {
             Ok(()) => Ok(Response::new(UnregisterExtModeResponse {
@@ -706,6 +720,13 @@ impl MacpRuntimeService for MacpServer {
         &self,
         request: Request<PromoteModeRequest>,
     ) -> Result<Response<PromoteModeResponse>, Status> {
+        let identity = self
+            .security
+            .authenticate_metadata(request.metadata())
+            .map_err(Self::status_from_error)?;
+        self.security
+            .authorize_mode_registry(&identity)
+            .map_err(Self::status_from_error)?;
         let req = request.into_inner();
         let new_name = if req.promoted_mode_name.is_empty() {
             None
@@ -853,12 +874,35 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 
+    #[tokio::test]
+    async fn register_ext_mode_requires_authenticated_registry_permission() {
+        let storage: Arc<dyn macp_runtime::storage::StorageBackend> =
+            Arc::new(macp_runtime::storage::MemoryBackend);
+        let registry = Arc::new(SessionRegistry::new());
+        let log_store = Arc::new(LogStore::new());
+        let runtime = Arc::new(Runtime::new(storage, registry, log_store));
+        let security = SecurityLayer::from_env().unwrap_or_else(|_| SecurityLayer::dev_mode());
+        let server = MacpServer::new(runtime, security);
+
+        let req = Request::new(RegisterExtModeRequest {
+            descriptor: Some(macp_runtime::pb::ModeDescriptor {
+                mode: "ext.custom.v1".into(),
+                mode_version: "1.0.0".into(),
+                message_types: vec!["SessionStart".into(), "Commitment".into()],
+                ..Default::default()
+            }),
+        });
+        let err = server.register_ext_mode(req).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
     fn stream_identity(sender: &str) -> AuthIdentity {
         AuthIdentity {
             sender: sender.into(),
             allowed_modes: None,
             can_start_sessions: true,
             max_open_sessions: None,
+            can_manage_mode_registry: false,
         }
     }
 

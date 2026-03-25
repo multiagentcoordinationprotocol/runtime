@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 pub struct ModeMetrics {
     pub messages_accepted: AtomicU64,
@@ -35,7 +35,7 @@ impl Default for ModeMetrics {
 }
 
 pub struct RuntimeMetrics {
-    per_mode: RwLock<HashMap<String, ModeMetrics>>,
+    per_mode: RwLock<HashMap<String, Arc<ModeMetrics>>>,
 }
 
 impl RuntimeMetrics {
@@ -93,23 +93,20 @@ impl RuntimeMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    fn get_or_create(&self, mode: &str) -> &ModeMetrics {
-        // Fast path: read lock
+    fn get_or_create(&self, mode: &str) -> Arc<ModeMetrics> {
         {
             let guard = self.per_mode.read().unwrap();
-            if guard.contains_key(mode) {
-                // SAFETY: We never remove entries and HashMap doesn't move values
-                // on insert of other keys. The reference is valid for the lifetime
-                // of RuntimeMetrics.
-                let ptr = guard.get(mode).unwrap() as *const ModeMetrics;
-                return unsafe { &*ptr };
+            if let Some(metrics) = guard.get(mode) {
+                return Arc::clone(metrics);
             }
         }
-        // Slow path: write lock to insert
+
         let mut guard = self.per_mode.write().unwrap();
-        guard.entry(mode.to_string()).or_default();
-        let ptr = guard.get(mode).unwrap() as *const ModeMetrics;
-        unsafe { &*ptr }
+        Arc::clone(
+            guard
+                .entry(mode.to_string())
+                .or_insert_with(|| Arc::new(ModeMetrics::default())),
+        )
     }
 
     pub fn snapshot(&self) -> Vec<(String, MetricsSnapshot)> {
