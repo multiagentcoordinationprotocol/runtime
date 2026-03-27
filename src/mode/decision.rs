@@ -8,18 +8,13 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DecisionPhase {
+    #[default]
     Proposal,
     Evaluation,
     Voting,
     Committed,
-}
-
-impl Default for DecisionPhase {
-    fn default() -> Self {
-        Self::Proposal
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

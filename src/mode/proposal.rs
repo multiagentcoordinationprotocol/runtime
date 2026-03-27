@@ -18,18 +18,13 @@ pub enum ProposalDisposition {
     Withdrawn,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ProposalPhase {
+    #[default]
     Negotiating,
     Converged,
     TerminalRejected,
     Committed,
-}
-
-impl Default for ProposalPhase {
-    fn default() -> Self {
-        Self::Negotiating
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
