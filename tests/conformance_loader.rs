@@ -2,11 +2,13 @@ use chrono::Utc;
 use macp_runtime::log_store::LogStore;
 use macp_runtime::pb::{CommitmentPayload, Envelope, SessionStartPayload};
 use macp_runtime::registry::SessionRegistry;
+use macp_runtime::replay::replay_session;
 use macp_runtime::runtime::Runtime;
-use macp_runtime::session::SessionState;
+use macp_runtime::session::{Session, SessionState};
 use macp_runtime::storage::MemoryBackend;
 use prost::Message;
 use serde::Deserialize;
+use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -21,6 +23,14 @@ struct ConformanceFixture {
     ttl_ms: i64,
     messages: Vec<ConformanceMessage>,
     expected_final_state: String,
+    #[serde(default)]
+    expected_mode_state: Option<Value>,
+    #[serde(default)]
+    expected_resolution: Option<Value>,
+    #[serde(default)]
+    expect_resolution_present: Option<bool>,
+    #[serde(default = "default_true")]
+    verify_replay_equivalence: bool,
 }
 
 #[derive(Deserialize)]
@@ -28,8 +38,14 @@ struct ConformanceMessage {
     sender: String,
     message_type: String,
     payload_type: String,
-    payload: serde_json::Value,
+    payload: Value,
     expect: String,
+    #[serde(default)]
+    expected_error_code: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn new_sid() -> String {
@@ -84,6 +100,19 @@ fn encode_decision_payload(msg: &ConformanceMessage) -> Vec<u8> {
             supporting_data: vec![],
         }
         .encode_to_vec(),
+        "Evaluation" => macp_runtime::decision_pb::EvaluationPayload {
+            proposal_id: p["proposal_id"].as_str().unwrap_or_default().into(),
+            recommendation: p["recommendation"].as_str().unwrap_or_default().into(),
+            confidence: p["confidence"].as_f64().unwrap_or_default(),
+            reason: p["reason"].as_str().unwrap_or_default().into(),
+        }
+        .encode_to_vec(),
+        "Objection" => macp_runtime::decision_pb::ObjectionPayload {
+            proposal_id: p["proposal_id"].as_str().unwrap_or_default().into(),
+            reason: p["reason"].as_str().unwrap_or_default().into(),
+            severity: p["severity"].as_str().unwrap_or_default().into(),
+        }
+        .encode_to_vec(),
         "Vote" => macp_runtime::decision_pb::VotePayload {
             proposal_id: p["proposal_id"].as_str().unwrap_or_default().into(),
             vote: p["vote"].as_str().unwrap_or_default().into(),
@@ -105,7 +134,29 @@ fn encode_proposal_payload(msg: &ConformanceMessage) -> Vec<u8> {
             tags: vec![],
         }
         .encode_to_vec(),
+        "CounterProposal" => macp_runtime::proposal_pb::CounterProposalPayload {
+            proposal_id: p["proposal_id"].as_str().unwrap_or_default().into(),
+            supersedes_proposal_id: p["supersedes_proposal_id"]
+                .as_str()
+                .unwrap_or_default()
+                .into(),
+            title: p["title"].as_str().unwrap_or_default().into(),
+            summary: p["summary"].as_str().unwrap_or_default().into(),
+            details: vec![],
+        }
+        .encode_to_vec(),
         "Accept" => macp_runtime::proposal_pb::AcceptPayload {
+            proposal_id: p["proposal_id"].as_str().unwrap_or_default().into(),
+            reason: p["reason"].as_str().unwrap_or_default().into(),
+        }
+        .encode_to_vec(),
+        "Reject" => macp_runtime::proposal_pb::RejectPayload {
+            proposal_id: p["proposal_id"].as_str().unwrap_or_default().into(),
+            reason: p["reason"].as_str().unwrap_or_default().into(),
+            terminal: p["terminal"].as_bool().unwrap_or(false),
+        }
+        .encode_to_vec(),
+        "Withdraw" => macp_runtime::proposal_pb::WithdrawPayload {
             proposal_id: p["proposal_id"].as_str().unwrap_or_default().into(),
             reason: p["reason"].as_str().unwrap_or_default().into(),
         }
@@ -159,6 +210,21 @@ fn encode_handoff_payload(msg: &ConformanceMessage) -> Vec<u8> {
             reason: p["reason"].as_str().unwrap_or_default().into(),
         }
         .encode_to_vec(),
+        "HandoffDecline" => macp_runtime::handoff_pb::HandoffDeclinePayload {
+            handoff_id: p["handoff_id"].as_str().unwrap_or_default().into(),
+            declined_by: p["declined_by"].as_str().unwrap_or_default().into(),
+            reason: p["reason"].as_str().unwrap_or_default().into(),
+        }
+        .encode_to_vec(),
+        "HandoffContext" => macp_runtime::handoff_pb::HandoffContextPayload {
+            handoff_id: p["handoff_id"].as_str().unwrap_or_default().into(),
+            content_type: p["content_type"].as_str().unwrap_or_default().into(),
+            context: p["context"]
+                .as_str()
+                .map(|s| s.as_bytes().to_vec())
+                .unwrap_or_default(),
+        }
+        .encode_to_vec(),
         _ => panic!("Unhandled handoff message: {}", msg.message_type),
     }
 }
@@ -186,14 +252,89 @@ fn encode_quorum_payload(msg: &ConformanceMessage) -> Vec<u8> {
 fn encode_multi_round_payload(msg: &ConformanceMessage) -> Vec<u8> {
     let p = &msg.payload;
     match msg.message_type.as_str() {
-        "Contribute" => {
-            // Multi-round uses JSON-encoded ContributePayload
-            serde_json::json!({"value": p["value"].as_str().unwrap_or_default()})
-                .to_string()
-                .into_bytes()
-        }
+        "Contribute" => json!({"value": p["value"].as_str().unwrap_or_default()})
+            .to_string()
+            .into_bytes(),
         _ => panic!("Unhandled multi_round message: {}", msg.message_type),
     }
+}
+
+fn expected_state(name: &str) -> SessionState {
+    match name {
+        "Open" => SessionState::Open,
+        "Resolved" => SessionState::Resolved,
+        "Expired" => SessionState::Expired,
+        other => panic!("Unknown expected_final_state: {other}"),
+    }
+}
+
+fn resolution_to_json(resolution: &[u8]) -> Option<Value> {
+    CommitmentPayload::decode(resolution)
+        .ok()
+        .map(|commitment| {
+            json!({
+                "commitment_id": commitment.commitment_id,
+                "action": commitment.action,
+                "authority_scope": commitment.authority_scope,
+                "reason": commitment.reason,
+                "mode_version": commitment.mode_version,
+                "policy_version": commitment.policy_version,
+                "configuration_version": commitment.configuration_version,
+            })
+        })
+}
+
+fn mode_state_to_json(session: &Session) -> Option<Value> {
+    if session.mode_state.is_empty() {
+        return None;
+    }
+    serde_json::from_slice(&session.mode_state).ok()
+}
+
+fn assert_json_contains(actual: &Value, expected: &Value) {
+    match (actual, expected) {
+        (Value::Object(actual_map), Value::Object(expected_map)) => {
+            for (key, expected_value) in expected_map {
+                let actual_value = actual_map
+                    .get(key)
+                    .unwrap_or_else(|| panic!("missing key '{key}' in actual json {actual:?}"));
+                assert_json_contains(actual_value, expected_value);
+            }
+        }
+        (Value::Array(actual_items), Value::Array(expected_items)) => {
+            assert!(
+                actual_items.len() >= expected_items.len(),
+                "actual array shorter than expected: {actual_items:?} vs {expected_items:?}"
+            );
+            for (idx, expected_item) in expected_items.iter().enumerate() {
+                assert_json_contains(&actual_items[idx], expected_item);
+            }
+        }
+        _ => assert_eq!(actual, expected),
+    }
+}
+
+async fn assert_replay_equivalence(rt: &Runtime, sid: &str, live_session: &Session) {
+    let log = rt
+        .log_store
+        .get_log(sid)
+        .await
+        .unwrap_or_else(|| panic!("missing log entries for {sid}"));
+    let replayed = replay_session(sid, &log, rt.mode_registry().as_ref())
+        .unwrap_or_else(|e| panic!("replay failed for {sid}: {e}"));
+    assert_eq!(replayed.state, live_session.state, "replay state mismatch");
+    assert_eq!(
+        replayed.resolution, live_session.resolution,
+        "replay resolution mismatch"
+    );
+    assert_eq!(
+        replayed.mode_state, live_session.mode_state,
+        "replay mode_state mismatch"
+    );
+    assert_eq!(
+        replayed.seen_message_ids, live_session.seen_message_ids,
+        "replay dedup state mismatch"
+    );
 }
 
 async fn run_conformance_fixture(path: &Path) {
@@ -205,7 +346,6 @@ async fn run_conformance_fixture(path: &Path) {
     let rt = make_runtime();
     let sid = new_sid();
 
-    // SessionStart
     let start_payload = SessionStartPayload {
         intent: "conformance".into(),
         participants: fixture.participants.clone(),
@@ -234,7 +374,6 @@ async fn run_conformance_fixture(path: &Path) {
     .await
     .unwrap_or_else(|e| panic!("SessionStart failed for {}: {e}", path.display()));
 
-    // Process messages
     for (i, msg) in fixture.messages.iter().enumerate() {
         let payload = encode_payload(&fixture, msg);
         let env = Envelope {
@@ -268,25 +407,59 @@ async fn run_conformance_fixture(path: &Path) {
                     msg.message_type,
                     path.display()
                 );
+                if let Some(expected_error_code) = &msg.expected_error_code {
+                    let err = result.unwrap_err();
+                    assert_eq!(
+                        err.error_code(),
+                        expected_error_code,
+                        "reject error code mismatch at message {} ({}) in {}",
+                        i + 1,
+                        msg.message_type,
+                        path.display()
+                    );
+                }
             }
             other => panic!("Unknown expect value: {other}"),
         }
     }
 
-    // Verify final state
     let session = rt.get_session_checked(&sid).await.unwrap();
-    let expected_state = match fixture.expected_final_state.as_str() {
-        "Open" => SessionState::Open,
-        "Resolved" => SessionState::Resolved,
-        "Expired" => SessionState::Expired,
-        other => panic!("Unknown expected_final_state: {other}"),
-    };
     assert_eq!(
         session.state,
-        expected_state,
+        expected_state(&fixture.expected_final_state),
         "Final state mismatch for {}",
         path.display()
     );
+
+    if let Some(expect_resolution_present) = fixture.expect_resolution_present {
+        assert_eq!(
+            session.resolution.is_some(),
+            expect_resolution_present,
+            "resolution presence mismatch for {}",
+            path.display()
+        );
+    }
+
+    if let Some(expected_resolution) = &fixture.expected_resolution {
+        let actual_resolution = session
+            .resolution
+            .as_ref()
+            .and_then(|resolution| resolution_to_json(resolution))
+            .unwrap_or_else(|| {
+                panic!("resolution missing or not decodable for {}", path.display())
+            });
+        assert_json_contains(&actual_resolution, expected_resolution);
+    }
+
+    if let Some(expected_mode_state) = &fixture.expected_mode_state {
+        let actual_mode_state = mode_state_to_json(&session)
+            .unwrap_or_else(|| panic!("mode state missing or not json for {}", path.display()));
+        assert_json_contains(&actual_mode_state, expected_mode_state);
+    }
+
+    if fixture.verify_replay_equivalence {
+        assert_replay_equivalence(&rt, &sid, &session).await;
+    }
 }
 
 macro_rules! conformance_test {
@@ -310,8 +483,6 @@ conformance_test!(
     conformance_multi_round_happy_path,
     "multi_round_happy_path.json"
 );
-
-// Negative-path (rejection) conformance tests
 conformance_test!(
     conformance_decision_reject_paths,
     "decision_reject_paths.json"

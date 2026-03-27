@@ -1,7 +1,10 @@
 {
   "mode": "macp.mode.decision.v1",
   "initiator": "agent://orchestrator",
-  "participants": ["agent://a", "agent://b"],
+  "participants": [
+    "agent://a",
+    "agent://b"
+  ],
   "mode_version": "1.0.0",
   "configuration_version": "cfg-1",
   "policy_version": "policy-1",
@@ -11,14 +14,25 @@
       "sender": "agent://outsider",
       "message_type": "Proposal",
       "payload_type": "decision.Proposal",
-      "payload": { "proposal_id": "p1", "option": "deploy", "rationale": "ready", "supporting_data": [] },
-      "expect": "reject"
+      "payload": {
+        "proposal_id": "p1",
+        "option": "deploy",
+        "rationale": "ready",
+        "supporting_data": []
+      },
+      "expect": "reject",
+      "expected_error_code": "FORBIDDEN"
     },
     {
       "sender": "agent://orchestrator",
       "message_type": "Proposal",
       "payload_type": "decision.Proposal",
-      "payload": { "proposal_id": "p1", "option": "deploy", "rationale": "ready", "supporting_data": [] },
+      "payload": {
+        "proposal_id": "p1",
+        "option": "deploy",
+        "rationale": "ready",
+        "supporting_data": []
+      },
       "expect": "accept"
     },
     {
@@ -34,8 +48,44 @@
         "policy_version": "policy-1",
         "configuration_version": "cfg-1"
       },
-      "expect": "reject"
+      "expect": "reject",
+      "expected_error_code": "FORBIDDEN"
+    },
+    {
+      "sender": "agent://a",
+      "message_type": "Vote",
+      "payload_type": "decision.Vote",
+      "payload": {
+        "proposal_id": "p1",
+        "vote": "approve",
+        "reason": "good"
+      },
+      "expect": "accept"
+    },
+    {
+      "sender": "agent://b",
+      "message_type": "Evaluation",
+      "payload_type": "decision.Evaluation",
+      "payload": {
+        "proposal_id": "p1",
+        "recommendation": "approve",
+        "confidence": 0.7,
+        "reason": "late"
+      },
+      "expect": "reject",
+      "expected_error_code": "INVALID_ENVELOPE"
     }
   ],
-  "expected_final_state": "Open"
+  "expected_final_state": "Open",
+  "expected_mode_state": {
+    "phase": "Voting",
+    "votes": {
+      "p1": {
+        "agent://a": {
+          "vote": "approve"
+        }
+      }
+    }
+  },
+  "expect_resolution_present": false
 }

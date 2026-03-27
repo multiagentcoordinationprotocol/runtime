@@ -35,8 +35,7 @@ pub fn replay_session(
     let mode = registry.get_mode(mode_name).ok_or(MacpError::UnknownMode)?;
 
     // 2. Parse SessionStartPayload
-    let require_complete_start =
-        registry.is_standard_mode(mode_name) || mode_name == "ext.multi_round.v1";
+    let require_complete_start = registry.requires_strict_session_start(mode_name);
     let start_payload = if start_entry.raw_payload.is_empty() && !require_complete_start {
         crate::pb::SessionStartPayload::default()
     } else {

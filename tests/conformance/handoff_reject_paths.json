@@ -1,7 +1,10 @@
 {
   "mode": "macp.mode.handoff.v1",
   "initiator": "agent://owner",
-  "participants": ["agent://owner", "agent://target"],
+  "participants": [
+    "agent://owner",
+    "agent://target"
+  ],
   "mode_version": "1.0.0",
   "configuration_version": "cfg-1",
   "policy_version": "policy-1",
@@ -11,16 +14,57 @@
       "sender": "agent://target",
       "message_type": "HandoffAccept",
       "payload_type": "handoff.HandoffAccept",
-      "payload": { "handoff_id": "h1", "accepted_by": "agent://target", "reason": "ready" },
-      "expect": "reject"
+      "payload": {
+        "handoff_id": "h1",
+        "accepted_by": "agent://target",
+        "reason": "ready"
+      },
+      "expect": "reject",
+      "expected_error_code": "INVALID_ENVELOPE"
     },
     {
       "sender": "agent://owner",
       "message_type": "HandoffOffer",
       "payload_type": "handoff.HandoffOffer",
-      "payload": { "handoff_id": "h1", "target_participant": "agent://target", "scope": "support", "reason": "escalate" },
+      "payload": {
+        "handoff_id": "h1",
+        "target_participant": "agent://target",
+        "scope": "support",
+        "reason": "escalate"
+      },
       "expect": "accept"
+    },
+    {
+      "sender": "agent://target",
+      "message_type": "HandoffAccept",
+      "payload_type": "handoff.HandoffAccept",
+      "payload": {
+        "handoff_id": "h1",
+        "accepted_by": "agent://target",
+        "reason": "ready"
+      },
+      "expect": "accept"
+    },
+    {
+      "sender": "agent://owner",
+      "message_type": "HandoffContext",
+      "payload_type": "handoff.HandoffContext",
+      "payload": {
+        "handoff_id": "h1",
+        "content_type": "text/plain",
+        "context": "late context"
+      },
+      "expect": "reject",
+      "expected_error_code": "INVALID_ENVELOPE"
     }
   ],
-  "expected_final_state": "Open"
+  "expected_final_state": "Open",
+  "expected_mode_state": {
+    "offers": {
+      "h1": {
+        "disposition": "Accepted"
+      }
+    }
+  },
+  "expect_resolution_present": false
 }

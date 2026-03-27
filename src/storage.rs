@@ -3,8 +3,10 @@ use crate::registry::PersistedSession;
 use crate::session::Session;
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, BufRead, Write};
+use std::io;
 use std::path::{Path, PathBuf};
+use tokio::fs as tfs;
+use tokio::io::AsyncWriteExt;
 
 const STORAGE_VERSION: u32 = 3;
 
@@ -81,32 +83,32 @@ impl FileBackend {
         self.session_dir(session_id).join("log.jsonl")
     }
 
-    fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
+    async fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
         let tmp_path = path.with_extension("json.tmp");
-        fs::write(&tmp_path, data)?;
-        fs::rename(&tmp_path, path)
+        tfs::write(&tmp_path, data).await?;
+        tfs::rename(&tmp_path, path).await
     }
 }
 
 #[async_trait::async_trait]
 impl StorageBackend for FileBackend {
     async fn create_session_storage(&self, session_id: &str) -> io::Result<()> {
-        fs::create_dir_all(self.session_dir(session_id))
+        tfs::create_dir_all(self.session_dir(session_id)).await
     }
 
     async fn save_session(&self, session: &Session) -> io::Result<()> {
         let persisted = PersistedSession::from(session);
         let bytes = serde_json::to_vec_pretty(&persisted)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        Self::atomic_write(&self.session_file(&session.session_id), &bytes)
+        Self::atomic_write(&self.session_file(&session.session_id), &bytes).await
     }
 
     async fn load_session(&self, session_id: &str) -> io::Result<Option<Session>> {
         let path = self.session_file(session_id);
-        if !path.exists() {
+        if tfs::metadata(&path).await.is_err() {
             return Ok(None);
         }
-        let bytes = fs::read(&path)?;
+        let bytes = tfs::read(&path).await?;
         let persisted: PersistedSession = serde_json::from_slice(&bytes)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         Ok(Some(Session::from(persisted)))
@@ -114,20 +116,20 @@ impl StorageBackend for FileBackend {
 
     async fn load_all_sessions(&self) -> io::Result<Vec<Session>> {
         let sessions_dir = self.base_dir.join("sessions");
-        if !sessions_dir.exists() {
+        if tfs::metadata(&sessions_dir).await.is_err() {
             return Ok(vec![]);
         }
         let mut sessions = Vec::new();
-        for entry in fs::read_dir(&sessions_dir)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
+        let mut entries = tfs::read_dir(&sessions_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            if !entry.file_type().await?.is_dir() {
                 continue;
             }
             let session_file = entry.path().join("session.json");
-            if !session_file.exists() {
+            if tfs::metadata(&session_file).await.is_err() {
                 continue;
             }
-            let bytes = fs::read(&session_file)?;
+            let bytes = tfs::read(&session_file).await?;
             match serde_json::from_slice::<PersistedSession>(&bytes) {
                 Ok(persisted) => sessions.push(Session::from(persisted)),
                 Err(e) => {
@@ -147,29 +149,28 @@ impl StorageBackend for FileBackend {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         line.push('\n');
 
-        let mut file = fs::OpenOptions::new()
+        let mut file = tfs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&path)?;
-        file.write_all(line.as_bytes())?;
-        file.sync_data()?;
+            .open(&path)
+            .await?;
+        file.write_all(line.as_bytes()).await?;
+        file.sync_data().await?;
         Ok(())
     }
 
     async fn load_log(&self, session_id: &str) -> io::Result<Vec<LogEntry>> {
         let path = self.log_file(session_id);
-        if !path.exists() {
+        if tfs::metadata(&path).await.is_err() {
             return Ok(vec![]);
         }
-        let file = fs::File::open(&path)?;
-        let reader = io::BufReader::new(file);
+        let content = tfs::read_to_string(&path).await?;
         let mut entries = Vec::new();
-        for (line_num, line) in reader.lines().enumerate() {
-            let line = line?;
+        for (line_num, line) in content.lines().enumerate() {
             if line.trim().is_empty() {
                 continue;
             }
-            match serde_json::from_str::<LogEntry>(&line) {
+            match serde_json::from_str::<LogEntry>(line) {
                 Ok(entry) => entries.push(entry),
                 Err(e) => {
                     eprintln!(
