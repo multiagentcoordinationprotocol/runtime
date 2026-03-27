@@ -204,8 +204,7 @@ impl Runtime {
             .ok_or(MacpError::UnknownMode)?;
 
         let start_payload = parse_session_start_payload(&env.payload)?;
-        let require_complete_start =
-            self.mode_registry.is_standard_mode(mode_name) || mode_name == "ext.multi_round.v1";
+        let require_complete_start = self.mode_registry.requires_strict_session_start(mode_name);
         if require_complete_start {
             validate_canonical_session_start_payload(&start_payload)?;
         }

@@ -12,10 +12,24 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ProposalDisposition {
     Live,
     Withdrawn,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ProposalPhase {
+    Negotiating,
+    Converged,
+    TerminalRejected,
+    Committed,
+}
+
+impl Default for ProposalPhase {
+    fn default() -> Self {
+        Self::Negotiating
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +56,8 @@ pub struct ProposalState {
     pub proposals: BTreeMap<String, ProposalRecord>,
     pub accepts: BTreeMap<String, String>,
     pub terminal_rejections: Vec<TerminalRejectRecord>,
+    #[serde(default)]
+    pub phase: ProposalPhase,
 }
 
 pub struct ProposalMode;
@@ -65,12 +81,10 @@ impl ProposalMode {
             .filter(|record| record.disposition == ProposalDisposition::Live)
     }
 
-    fn commitment_ready(session: &Session, state: &ProposalState) -> bool {
-        if !state.terminal_rejections.is_empty() {
-            return true;
-        }
-
-        state
+    fn refresh_phase(session: &Session, state: &mut ProposalState) {
+        state.phase = if !state.terminal_rejections.is_empty() {
+            ProposalPhase::TerminalRejected
+        } else if state
             .proposals
             .values()
             .filter(|proposal| proposal.disposition == ProposalDisposition::Live)
@@ -81,6 +95,26 @@ impl ProposalMode {
                     &proposal.proposal_id,
                 )
             })
+        {
+            ProposalPhase::Converged
+        } else {
+            ProposalPhase::Negotiating
+        };
+    }
+
+    fn commitment_ready(state: &ProposalState) -> bool {
+        matches!(
+            state.phase,
+            ProposalPhase::Converged | ProposalPhase::TerminalRejected
+        )
+    }
+
+    fn ensure_mutable(state: &ProposalState) -> Result<(), MacpError> {
+        if state.phase == ProposalPhase::Committed {
+            Err(MacpError::SessionNotOpen)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -113,12 +147,13 @@ impl Mode for ProposalMode {
         } else {
             Self::decode_state(&session.mode_state)?
         };
+        Self::ensure_mutable(&state)?;
 
         match env.message_type.as_str() {
             "Proposal" => {
                 let payload = ProposalPayload::decode(&*env.payload)
                     .map_err(|_| MacpError::InvalidPayload)?;
-                if payload.proposal_id.is_empty()
+                if payload.proposal_id.trim().is_empty()
                     || state.proposals.contains_key(&payload.proposal_id)
                 {
                     return Err(MacpError::InvalidPayload);
@@ -136,13 +171,14 @@ impl Mode for ProposalMode {
                         disposition: ProposalDisposition::Live,
                     },
                 );
+                Self::refresh_phase(session, &mut state);
                 Ok(ModeResponse::PersistState(Self::encode_state(&state)))
             }
             "CounterProposal" => {
                 let payload = CounterProposalPayload::decode(&*env.payload)
                     .map_err(|_| MacpError::InvalidPayload)?;
-                if payload.proposal_id.is_empty()
-                    || payload.supersedes_proposal_id.is_empty()
+                if payload.proposal_id.trim().is_empty()
+                    || payload.supersedes_proposal_id.trim().is_empty()
                     || state.proposals.contains_key(&payload.proposal_id)
                     || !state
                         .proposals
@@ -163,6 +199,7 @@ impl Mode for ProposalMode {
                         disposition: ProposalDisposition::Live,
                     },
                 );
+                Self::refresh_phase(session, &mut state);
                 Ok(ModeResponse::PersistState(Self::encode_state(&state)))
             }
             "Accept" => {
@@ -174,6 +211,7 @@ impl Mode for ProposalMode {
                 state
                     .accepts
                     .insert(env.sender.clone(), payload.proposal_id);
+                Self::refresh_phase(session, &mut state);
                 Ok(ModeResponse::PersistState(Self::encode_state(&state)))
             }
             "Reject" => {
@@ -189,6 +227,7 @@ impl Mode for ProposalMode {
                         reason: payload.reason,
                     });
                 }
+                Self::refresh_phase(session, &mut state);
                 Ok(ModeResponse::PersistState(Self::encode_state(&state)))
             }
             "Withdraw" => {
@@ -209,6 +248,7 @@ impl Mode for ProposalMode {
                 state
                     .terminal_rejections
                     .retain(|r| r.proposal_id != payload.proposal_id);
+                Self::refresh_phase(session, &mut state);
                 Ok(ModeResponse::PersistState(Self::encode_state(&state)))
             }
             "Commitment" => {
@@ -216,9 +256,11 @@ impl Mode for ProposalMode {
                     return Err(MacpError::Forbidden);
                 }
                 validate_commitment_payload_for_session(session, &env.payload)?;
-                if !Self::commitment_ready(session, &state) {
+                Self::refresh_phase(session, &mut state);
+                if !Self::commitment_ready(&state) {
                     return Err(MacpError::InvalidPayload);
                 }
+                state.phase = ProposalPhase::Committed;
                 Ok(ModeResponse::PersistAndResolve {
                     state: Self::encode_state(&state),
                     resolution: env.payload.clone(),
@@ -256,6 +298,10 @@ mod tests {
             roots: vec![],
             initiator_sender: "agent://buyer".into(),
         }
+    }
+
+    fn decode(session: &Session) -> ProposalState {
+        serde_json::from_slice(&session.mode_state).unwrap()
     }
 
     fn env(sender: &str, message_type: &str, payload: Vec<u8>) -> Envelope {
@@ -772,5 +818,84 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn phase_becomes_converged_when_all_participants_accept_same_live_proposal() {
+        let mode = ProposalMode;
+        let mut session = base_session();
+        let resp = mode
+            .on_session_start(&session, &env("agent://buyer", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, resp);
+        assert_eq!(decode(&session).phase, ProposalPhase::Negotiating);
+
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://seller", "Proposal", make_proposal("p1")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        assert_eq!(decode(&session).phase, ProposalPhase::Negotiating);
+
+        let resp = mode
+            .on_message(&session, &env("agent://buyer", "Accept", make_accept("p1")))
+            .unwrap();
+        apply(&mut session, resp);
+        assert_eq!(decode(&session).phase, ProposalPhase::Negotiating);
+
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://seller", "Accept", make_accept("p1")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        assert_eq!(decode(&session).phase, ProposalPhase::Converged);
+    }
+
+    #[test]
+    fn terminal_reject_sets_terminal_rejected_phase() {
+        let mode = ProposalMode;
+        let mut session = base_session();
+        let resp = mode
+            .on_session_start(&session, &env("agent://buyer", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, resp);
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://seller", "Proposal", make_proposal("p1")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://buyer", "Reject", make_reject("p1", true)),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        assert_eq!(decode(&session).phase, ProposalPhase::TerminalRejected);
+    }
+
+    #[test]
+    fn malformed_counterproposal_payload_rejected() {
+        let mode = ProposalMode;
+        let mut session = base_session();
+        let resp = mode
+            .on_session_start(&session, &env("agent://buyer", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, resp);
+        assert_eq!(
+            mode.on_message(
+                &session,
+                &env("agent://seller", "CounterProposal", vec![0xff, 0x00])
+            )
+            .unwrap_err()
+            .to_string(),
+            "InvalidPayload"
+        );
     }
 }

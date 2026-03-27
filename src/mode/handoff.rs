@@ -142,6 +142,9 @@ impl Mode for HandoffMode {
                 if offer.offered_by != env.sender {
                     return Err(MacpError::Forbidden);
                 }
+                if offer.disposition != HandoffDisposition::Offered {
+                    return Err(MacpError::InvalidPayload);
+                }
                 state
                     .contexts
                     .entry(payload.handoff_id)
@@ -881,5 +884,38 @@ mod tests {
             .on_message(&session, &env("owner", "CustomType", vec![]))
             .unwrap_err();
         assert_eq!(err.to_string(), "InvalidPayload");
+    }
+
+    #[test]
+    fn context_after_accept_is_rejected() {
+        let mode = HandoffMode;
+        let mut session = base_session();
+        let resp = mode
+            .on_session_start(&session, &env("owner", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, resp);
+        let resp = mode
+            .on_message(
+                &session,
+                &env("owner", "HandoffOffer", make_offer("h1", "target")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        let resp = mode
+            .on_message(
+                &session,
+                &env("target", "HandoffAccept", make_accept("h1", "target")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        assert_eq!(
+            mode.on_message(
+                &session,
+                &env("owner", "HandoffContext", make_context("h1"))
+            )
+            .unwrap_err()
+            .to_string(),
+            "InvalidPayload"
+        );
     }
 }

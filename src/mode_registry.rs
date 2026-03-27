@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 
 use crate::mode::decision::DecisionMode;
@@ -14,12 +14,169 @@ use crate::mode::{
 };
 use crate::pb::ModeDescriptor;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModeConformanceCatalog {
+    pub fixture_set_name: String,
+    pub golden_transcript_paths: Vec<String>,
+    pub conformance_fixture_paths: Vec<String>,
+}
+
+pub trait ModeFactory: Send + Sync {
+    fn create(&self) -> Box<dyn Mode>;
+}
+
+pub trait ModeDescriptorProvider: Send + Sync {
+    fn descriptor(&self) -> Option<ModeDescriptor>;
+}
+
+pub trait ModeSchemaProvider: Send + Sync {
+    fn schema_uris(&self) -> HashMap<String, String>;
+}
+
+pub trait ModeConformanceProvider: Send + Sync {
+    fn fixture_set_name(&self) -> &'static str;
+    fn golden_transcript_paths(&self) -> Vec<&'static str>;
+    fn conformance_fixture_paths(&self) -> Vec<&'static str>;
+}
+
+pub struct StaticModeFactory {
+    constructor: fn() -> Box<dyn Mode>,
+}
+
+impl StaticModeFactory {
+    pub fn new(constructor: fn() -> Box<dyn Mode>) -> Self {
+        Self { constructor }
+    }
+}
+
+impl ModeFactory for StaticModeFactory {
+    fn create(&self) -> Box<dyn Mode> {
+        (self.constructor)()
+    }
+}
+
+pub struct ClosureModeFactory {
+    constructor: Arc<dyn Fn() -> Box<dyn Mode> + Send + Sync>,
+}
+
+impl ClosureModeFactory {
+    pub fn new(constructor: Arc<dyn Fn() -> Box<dyn Mode> + Send + Sync>) -> Self {
+        Self { constructor }
+    }
+}
+
+impl ModeFactory for ClosureModeFactory {
+    fn create(&self) -> Box<dyn Mode> {
+        (self.constructor)()
+    }
+}
+
+#[derive(Clone)]
+pub struct StaticModeDescriptorProvider {
+    descriptor: Option<ModeDescriptor>,
+}
+
+impl StaticModeDescriptorProvider {
+    pub fn new(descriptor: Option<ModeDescriptor>) -> Self {
+        Self { descriptor }
+    }
+}
+
+impl ModeDescriptorProvider for StaticModeDescriptorProvider {
+    fn descriptor(&self) -> Option<ModeDescriptor> {
+        self.descriptor.clone()
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct StaticModeSchemaProvider {
+    schema_uris: HashMap<String, String>,
+}
+
+impl StaticModeSchemaProvider {
+    pub fn new(schema_uris: HashMap<String, String>) -> Self {
+        Self { schema_uris }
+    }
+}
+
+impl ModeSchemaProvider for StaticModeSchemaProvider {
+    fn schema_uris(&self) -> HashMap<String, String> {
+        self.schema_uris.clone()
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct StaticModeConformanceProvider {
+    fixture_set_name: &'static str,
+    golden_transcript_paths: Vec<&'static str>,
+    conformance_fixture_paths: Vec<&'static str>,
+}
+
+impl StaticModeConformanceProvider {
+    pub fn new(
+        fixture_set_name: &'static str,
+        golden_transcript_paths: Vec<&'static str>,
+        conformance_fixture_paths: Vec<&'static str>,
+    ) -> Self {
+        Self {
+            fixture_set_name,
+            golden_transcript_paths,
+            conformance_fixture_paths,
+        }
+    }
+}
+
+impl ModeConformanceProvider for StaticModeConformanceProvider {
+    fn fixture_set_name(&self) -> &'static str {
+        self.fixture_set_name
+    }
+
+    fn golden_transcript_paths(&self) -> Vec<&'static str> {
+        self.golden_transcript_paths.clone()
+    }
+
+    fn conformance_fixture_paths(&self) -> Vec<&'static str> {
+        self.conformance_fixture_paths.clone()
+    }
+}
+
 pub struct ModeRegistration {
     pub mode_name: String,
-    pub mode: Box<dyn Mode>,
-    pub descriptor: Option<ModeDescriptor>,
+    pub factory: Arc<dyn ModeFactory>,
+    pub descriptor_provider: Arc<dyn ModeDescriptorProvider>,
+    pub schema_provider: Arc<dyn ModeSchemaProvider>,
+    pub conformance_provider: Arc<dyn ModeConformanceProvider>,
     pub standards_track: bool,
     pub builtin: bool,
+    pub strict_session_start: bool,
+}
+
+impl ModeRegistration {
+    pub fn descriptor(&self) -> Option<ModeDescriptor> {
+        self.descriptor_provider.descriptor().map(|mut descriptor| {
+            descriptor.mode = self.mode_name.clone();
+            descriptor.schema_uris = self.schema_provider.schema_uris();
+            descriptor
+        })
+    }
+
+    pub fn conformance_catalog(&self) -> ModeConformanceCatalog {
+        ModeConformanceCatalog {
+            fixture_set_name: self.conformance_provider.fixture_set_name().to_string(),
+            golden_transcript_paths: self
+                .conformance_provider
+                .golden_transcript_paths()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            conformance_fixture_paths: self
+                .conformance_provider
+                .conformance_fixture_paths()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        }
+    }
 }
 
 pub struct ModeRegistry {
@@ -40,50 +197,146 @@ impl ModeRegistry {
 
         let mut entries = HashMap::new();
 
-        // Standards-track modes
-        let standard_modes: Vec<(&str, Box<dyn Mode>)> = vec![
-            ("macp.mode.decision.v1", Box::new(DecisionMode)),
-            ("macp.mode.proposal.v1", Box::new(ProposalMode)),
-            ("macp.mode.task.v1", Box::new(TaskMode)),
-            ("macp.mode.handoff.v1", Box::new(HandoffMode)),
-            ("macp.mode.quorum.v1", Box::new(QuorumMode)),
-        ];
-
-        for (name, mode) in standard_modes {
-            entries.insert(
-                name.to_string(),
-                ModeRegistration {
-                    mode_name: name.to_string(),
-                    mode,
-                    descriptor: descriptor_map.remove(name),
-                    standards_track: true,
-                    builtin: true,
-                },
-            );
-        }
-
-        // Built-in extension modes
-        let extension_modes: Vec<(&str, Box<dyn Mode>)> =
-            vec![("ext.multi_round.v1", Box::new(MultiRoundMode))];
-
-        for (name, mode) in extension_modes {
-            entries.insert(
-                name.to_string(),
-                ModeRegistration {
-                    mode_name: name.to_string(),
-                    mode,
-                    descriptor: descriptor_map.remove(name),
-                    standards_track: false,
-                    builtin: true,
-                },
-            );
-        }
+        Self::insert_builtin(
+            &mut entries,
+            "macp.mode.decision.v1",
+            Arc::new(StaticModeFactory::new(|| {
+                Box::new(DecisionMode) as Box<dyn Mode>
+            })),
+            descriptor_map.remove("macp.mode.decision.v1"),
+            true,
+            true,
+            "decision",
+            vec!["tests/conformance/decision_happy_path.json"],
+            vec![
+                "tests/conformance/decision_happy_path.json",
+                "tests/conformance/decision_reject_paths.json",
+            ],
+        );
+        Self::insert_builtin(
+            &mut entries,
+            "macp.mode.proposal.v1",
+            Arc::new(StaticModeFactory::new(|| {
+                Box::new(ProposalMode) as Box<dyn Mode>
+            })),
+            descriptor_map.remove("macp.mode.proposal.v1"),
+            true,
+            true,
+            "proposal",
+            vec!["tests/conformance/proposal_happy_path.json"],
+            vec![
+                "tests/conformance/proposal_happy_path.json",
+                "tests/conformance/proposal_reject_paths.json",
+            ],
+        );
+        Self::insert_builtin(
+            &mut entries,
+            "macp.mode.task.v1",
+            Arc::new(StaticModeFactory::new(|| {
+                Box::new(TaskMode) as Box<dyn Mode>
+            })),
+            descriptor_map.remove("macp.mode.task.v1"),
+            true,
+            true,
+            "task",
+            vec!["tests/conformance/task_happy_path.json"],
+            vec![
+                "tests/conformance/task_happy_path.json",
+                "tests/conformance/task_reject_paths.json",
+            ],
+        );
+        Self::insert_builtin(
+            &mut entries,
+            "macp.mode.handoff.v1",
+            Arc::new(StaticModeFactory::new(|| {
+                Box::new(HandoffMode) as Box<dyn Mode>
+            })),
+            descriptor_map.remove("macp.mode.handoff.v1"),
+            true,
+            true,
+            "handoff",
+            vec!["tests/conformance/handoff_happy_path.json"],
+            vec![
+                "tests/conformance/handoff_happy_path.json",
+                "tests/conformance/handoff_reject_paths.json",
+            ],
+        );
+        Self::insert_builtin(
+            &mut entries,
+            "macp.mode.quorum.v1",
+            Arc::new(StaticModeFactory::new(|| {
+                Box::new(QuorumMode) as Box<dyn Mode>
+            })),
+            descriptor_map.remove("macp.mode.quorum.v1"),
+            true,
+            true,
+            "quorum",
+            vec!["tests/conformance/quorum_happy_path.json"],
+            vec![
+                "tests/conformance/quorum_happy_path.json",
+                "tests/conformance/quorum_reject_paths.json",
+            ],
+        );
+        Self::insert_builtin(
+            &mut entries,
+            "ext.multi_round.v1",
+            Arc::new(StaticModeFactory::new(|| {
+                Box::new(MultiRoundMode) as Box<dyn Mode>
+            })),
+            descriptor_map.remove("ext.multi_round.v1"),
+            false,
+            true,
+            "multi_round",
+            vec!["tests/conformance/multi_round_happy_path.json"],
+            vec![
+                "tests/conformance/multi_round_happy_path.json",
+                "tests/conformance/multi_round_reject_paths.json",
+            ],
+        );
 
         let (change_tx, _) = broadcast::channel(16);
         Self {
             entries: RwLock::new(entries),
             change_tx,
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_builtin(
+        entries: &mut HashMap<String, ModeRegistration>,
+        name: &str,
+        factory: Arc<dyn ModeFactory>,
+        descriptor: Option<ModeDescriptor>,
+        standards_track: bool,
+        strict_session_start: bool,
+        fixture_set_name: &'static str,
+        golden_transcripts: Vec<&'static str>,
+        conformance_fixtures: Vec<&'static str>,
+    ) {
+        let schema_uris = descriptor
+            .as_ref()
+            .map(|d| d.schema_uris.clone())
+            .unwrap_or_default();
+        let descriptor_provider = Arc::new(StaticModeDescriptorProvider::new(descriptor));
+        let schema_provider = Arc::new(StaticModeSchemaProvider::new(schema_uris));
+        let conformance_provider = Arc::new(StaticModeConformanceProvider::new(
+            fixture_set_name,
+            golden_transcripts,
+            conformance_fixtures,
+        ));
+        entries.insert(
+            name.to_string(),
+            ModeRegistration {
+                mode_name: name.to_string(),
+                factory,
+                descriptor_provider,
+                schema_provider,
+                conformance_provider,
+                standards_track,
+                builtin: true,
+                strict_session_start,
+            },
+        );
     }
 
     fn ordered_standard_names(entries: &HashMap<String, ModeRegistration>) -> Vec<String> {
@@ -122,15 +375,6 @@ impl ModeRegistry {
         }
     }
 
-    /// Execute a mode callback while holding the read lock.
-    pub fn with_mode<F, R>(&self, name: &str, f: F) -> Option<R>
-    where
-        F: FnOnce(&dyn Mode) -> R,
-    {
-        let guard = self.entries.read().expect("mode registry lock poisoned");
-        guard.get(name).map(|e| f(e.mode.as_ref()))
-    }
-
     pub fn standard_mode_names(&self) -> Vec<String> {
         let guard = self.entries.read().expect("mode registry lock poisoned");
         Self::ordered_standard_names(&guard)
@@ -140,7 +384,7 @@ impl ModeRegistry {
         let guard = self.entries.read().expect("mode registry lock poisoned");
         Self::ordered_standard_names(&guard)
             .into_iter()
-            .filter_map(|name| guard.get(&name).and_then(|entry| entry.descriptor.clone()))
+            .filter_map(|name| guard.get(&name).and_then(ModeRegistration::descriptor))
             .collect()
     }
 
@@ -160,7 +404,7 @@ impl ModeRegistry {
         let mut descriptors: Vec<ModeDescriptor> = guard
             .iter()
             .filter(|(_, e)| !e.standards_track)
-            .filter_map(|(_, e)| e.descriptor.clone())
+            .filter_map(|(_, e)| e.descriptor())
             .collect();
         descriptors.sort_by(|a, b| a.mode.cmp(&b.mode));
         descriptors
@@ -177,10 +421,20 @@ impl ModeRegistry {
         let guard = self.entries.read().expect("mode registry lock poisoned");
         let mut descriptors: Vec<ModeDescriptor> = guard
             .values()
-            .filter_map(|e| e.descriptor.clone())
+            .filter_map(ModeRegistration::descriptor)
             .collect();
         descriptors.sort_by(|a, b| a.mode.cmp(&b.mode));
         descriptors
+    }
+
+    pub fn all_mode_conformance(&self) -> Vec<(String, ModeConformanceCatalog)> {
+        let guard = self.entries.read().expect("mode registry lock poisoned");
+        let mut conformance: Vec<(String, ModeConformanceCatalog)> = guard
+            .iter()
+            .map(|(name, entry)| (name.clone(), entry.conformance_catalog()))
+            .collect();
+        conformance.sort_by(|a, b| a.0.cmp(&b.0));
+        conformance
     }
 
     pub fn is_standard_mode(&self, name: &str) -> bool {
@@ -188,25 +442,70 @@ impl ModeRegistry {
         guard.get(name).map(|e| e.standards_track).unwrap_or(false)
     }
 
-    /// Register a new extension mode dynamically.
-    pub fn register_extension(&self, descriptor: ModeDescriptor) -> Result<(), String> {
-        let name = descriptor.mode.clone();
-        if name.is_empty() {
+    pub fn requires_strict_session_start(&self, name: &str) -> bool {
+        let guard = self.entries.read().expect("mode registry lock poisoned");
+        guard
+            .get(name)
+            .map(|entry| entry.strict_session_start)
+            .unwrap_or(false)
+    }
+
+    fn validate_extension_descriptor(descriptor: &ModeDescriptor) -> Result<(), String> {
+        if descriptor.mode.trim().is_empty() {
             return Err("mode name must not be empty".into());
         }
-        if name.starts_with("macp.mode.") {
+        if descriptor.mode.starts_with("macp.mode.") {
             return Err("cannot register extension with reserved macp.mode.* namespace".into());
         }
+        if descriptor.message_types.is_empty() {
+            return Err("extension descriptor must declare at least one message type".into());
+        }
+        if descriptor.mode_version.trim().is_empty() {
+            return Err("extension descriptor must bind mode_version".into());
+        }
+        for terminal in &descriptor.terminal_message_types {
+            if !descriptor
+                .message_types
+                .iter()
+                .any(|message_type| message_type == terminal)
+            {
+                return Err(format!(
+                    "terminal message type '{}' must also appear in message_types",
+                    terminal
+                ));
+            }
+        }
+        Ok(())
+    }
 
-        let allowed_types = descriptor
+    /// Register a new descriptor-driven extension mode dynamically.
+    ///
+    /// Dynamically registered extensions currently use `PassthroughMode`, which
+    /// validates only the descriptor-declared message types and commitment
+    /// authority. This keeps runtime behavior explicit until a richer external
+    /// plugin mechanism is introduced.
+    pub fn register_extension(&self, descriptor: ModeDescriptor) -> Result<(), String> {
+        Self::validate_extension_descriptor(&descriptor)?;
+        let name = descriptor.mode.clone();
+        let schema_uris = descriptor.schema_uris.clone();
+        let allowed_types: Vec<String> = descriptor
             .message_types
             .iter()
             .filter(|t| *t != "SessionStart")
             .cloned()
             .collect();
-        let mode: Box<dyn Mode> = Box::new(PassthroughMode {
-            allowed_message_types: allowed_types,
-        });
+        let allowed_types = Arc::new(allowed_types);
+        let factory: Arc<dyn ModeFactory> = Arc::new(ClosureModeFactory::new(Arc::new({
+            let allowed_types = Arc::clone(&allowed_types);
+            move || {
+                Box::new(PassthroughMode {
+                    allowed_message_types: (*allowed_types).clone(),
+                }) as Box<dyn Mode>
+            }
+        })));
+        let descriptor_provider = Arc::new(StaticModeDescriptorProvider::new(Some(descriptor)));
+        let schema_provider = Arc::new(StaticModeSchemaProvider::new(schema_uris));
+        let conformance_provider = Arc::new(StaticModeConformanceProvider::default());
 
         let mut guard = self.entries.write().expect("mode registry lock poisoned");
         if guard.contains_key(&name) {
@@ -216,10 +515,13 @@ impl ModeRegistry {
             name.clone(),
             ModeRegistration {
                 mode_name: name,
-                mode,
-                descriptor: Some(descriptor),
+                factory,
+                descriptor_provider,
+                schema_provider,
+                conformance_provider,
                 standards_track: false,
                 builtin: false,
+                strict_session_start: false,
             },
         );
         drop(guard);
@@ -265,15 +567,12 @@ impl ModeRegistry {
             ));
         }
 
-        // Remove old entry and re-insert with updated flags
         let mut registration = guard
             .remove(mode)
             .ok_or_else(|| format!("mode '{}' not found", mode))?;
         registration.standards_track = true;
+        registration.strict_session_start = true;
         registration.mode_name = final_name.clone();
-        if let Some(ref mut desc) = registration.descriptor {
-            desc.mode = final_name.clone();
-        }
         guard.insert(final_name.clone(), registration);
         drop(guard);
         let _ = self.change_tx.send(());
@@ -286,28 +585,33 @@ impl ModeRegistry {
     }
 }
 
-/// A handle that allows calling mode methods while the registry read lock is not held
-/// across await points. Callers use `with_mode` or obtain a `ModeRef` and call its methods.
+/// A handle that allows calling mode methods without keeping the registry read
+/// lock held across callback execution.
 pub struct ModeRef<'a> {
     registry: &'a ModeRegistry,
     name: String,
 }
 
 impl<'a> ModeRef<'a> {
-    pub fn on_session_start(
-        &self,
-        session: &crate::session::Session,
-        env: &crate::pb::Envelope,
-    ) -> Result<crate::mode::ModeResponse, crate::error::MacpError> {
+    fn factory(&self) -> Result<Arc<dyn ModeFactory>, crate::error::MacpError> {
         let guard = self
             .registry
             .entries
             .read()
             .expect("mode registry lock poisoned");
-        let entry = guard
+        guard
             .get(&self.name)
-            .ok_or(crate::error::MacpError::UnknownMode)?;
-        entry.mode.on_session_start(session, env)
+            .map(|entry| Arc::clone(&entry.factory))
+            .ok_or(crate::error::MacpError::UnknownMode)
+    }
+
+    pub fn on_session_start(
+        &self,
+        session: &crate::session::Session,
+        env: &crate::pb::Envelope,
+    ) -> Result<crate::mode::ModeResponse, crate::error::MacpError> {
+        let mode = self.factory()?.create();
+        mode.on_session_start(session, env)
     }
 
     pub fn on_message(
@@ -315,15 +619,8 @@ impl<'a> ModeRef<'a> {
         session: &crate::session::Session,
         env: &crate::pb::Envelope,
     ) -> Result<crate::mode::ModeResponse, crate::error::MacpError> {
-        let guard = self
-            .registry
-            .entries
-            .read()
-            .expect("mode registry lock poisoned");
-        let entry = guard
-            .get(&self.name)
-            .ok_or(crate::error::MacpError::UnknownMode)?;
-        entry.mode.on_message(session, env)
+        let mode = self.factory()?.create();
+        mode.on_message(session, env)
     }
 
     pub fn authorize_sender(
@@ -331,15 +628,8 @@ impl<'a> ModeRef<'a> {
         session: &crate::session::Session,
         env: &crate::pb::Envelope,
     ) -> Result<(), crate::error::MacpError> {
-        let guard = self
-            .registry
-            .entries
-            .read()
-            .expect("mode registry lock poisoned");
-        let entry = guard
-            .get(&self.name)
-            .ok_or(crate::error::MacpError::UnknownMode)?;
-        entry.mode.authorize_sender(session, env)
+        let mode = self.factory()?.create();
+        mode.authorize_sender(session, env)
     }
 }
 
@@ -354,6 +644,7 @@ mod tests {
         for name in STANDARD_MODE_NAMES {
             assert!(registry.get_mode(name).is_some(), "missing mode: {name}");
             assert!(registry.is_standard_mode(name));
+            assert!(registry.requires_strict_session_start(name));
         }
     }
 
@@ -362,6 +653,7 @@ mod tests {
         let registry = ModeRegistry::build_default();
         assert!(registry.get_mode("ext.multi_round.v1").is_some());
         assert!(!registry.is_standard_mode("ext.multi_round.v1"));
+        assert!(registry.requires_strict_session_start("ext.multi_round.v1"));
     }
 
     #[test]
@@ -403,6 +695,7 @@ mod tests {
         let registry = ModeRegistry::build_default();
         assert!(registry.get_mode("nonexistent").is_none());
         assert!(!registry.is_standard_mode("nonexistent"));
+        assert!(!registry.requires_strict_session_start("nonexistent"));
     }
 
     #[test]
@@ -433,6 +726,32 @@ mod tests {
         let registry = ModeRegistry::build_default();
         let descriptor = ModeDescriptor {
             mode: "macp.mode.evil.v1".into(),
+            mode_version: "1.0.0".into(),
+            message_types: vec!["SessionStart".into(), "Commitment".into()],
+            ..Default::default()
+        };
+        assert!(registry.register_extension(descriptor).is_err());
+    }
+
+    #[test]
+    fn register_rejects_empty_message_types() {
+        let registry = ModeRegistry::build_default();
+        let descriptor = ModeDescriptor {
+            mode: "ext.invalid.v1".into(),
+            mode_version: "1.0.0".into(),
+            ..Default::default()
+        };
+        assert!(registry.register_extension(descriptor).is_err());
+    }
+
+    #[test]
+    fn register_rejects_terminal_not_in_message_types() {
+        let registry = ModeRegistry::build_default();
+        let descriptor = ModeDescriptor {
+            mode: "ext.invalid.v1".into(),
+            mode_version: "1.0.0".into(),
+            message_types: vec!["SessionStart".into(), "Custom".into()],
+            terminal_message_types: vec!["Commitment".into()],
             ..Default::default()
         };
         assert!(registry.register_extension(descriptor).is_err());
@@ -443,6 +762,8 @@ mod tests {
         let registry = ModeRegistry::build_default();
         let descriptor = ModeDescriptor {
             mode: "ext.multi_round.v1".into(),
+            mode_version: "1.0.0".into(),
+            message_types: vec!["SessionStart".into(), "Commitment".into()],
             ..Default::default()
         };
         assert!(registry.register_extension(descriptor).is_err());
@@ -480,16 +801,19 @@ mod tests {
             mode: "ext.new.v1".into(),
             mode_version: "1.0.0".into(),
             message_types: vec!["SessionStart".into(), "Commitment".into()],
+            terminal_message_types: vec!["Commitment".into()],
             ..Default::default()
         };
         registry.register_extension(descriptor).unwrap();
         assert!(!registry.is_standard_mode("ext.new.v1"));
+        assert!(!registry.requires_strict_session_start("ext.new.v1"));
 
         let final_name = registry
             .promote_mode("ext.new.v1", Some("macp.mode.new.v1"))
             .unwrap();
         assert_eq!(final_name, "macp.mode.new.v1");
         assert!(registry.is_standard_mode("macp.mode.new.v1"));
+        assert!(registry.requires_strict_session_start("macp.mode.new.v1"));
         assert!(registry.get_mode("ext.new.v1").is_none());
         assert!(registry.get_mode("macp.mode.new.v1").is_some());
     }
@@ -501,12 +825,14 @@ mod tests {
             mode: "ext.keep.v1".into(),
             mode_version: "1.0.0".into(),
             message_types: vec!["SessionStart".into(), "Commitment".into()],
+            terminal_message_types: vec!["Commitment".into()],
             ..Default::default()
         };
         registry.register_extension(descriptor).unwrap();
         let final_name = registry.promote_mode("ext.keep.v1", None).unwrap();
         assert_eq!(final_name, "ext.keep.v1");
         assert!(registry.is_standard_mode("ext.keep.v1"));
+        assert!(registry.requires_strict_session_start("ext.keep.v1"));
     }
 
     #[test]
@@ -517,6 +843,7 @@ mod tests {
             mode_version: "1.0.0".into(),
             title: "Promoted".into(),
             message_types: vec!["SessionStart".into(), "Commitment".into()],
+            terminal_message_types: vec!["Commitment".into()],
             ..Default::default()
         };
         registry.register_extension(descriptor).unwrap();
@@ -552,5 +879,21 @@ mod tests {
                 "EXTENSION_MODE_NAMES entry missing from registry: {name}"
             );
         }
+    }
+
+    #[test]
+    fn conformance_catalog_exposes_builtin_fixture_sets() {
+        let registry = ModeRegistry::build_default();
+        let catalog = registry.all_mode_conformance();
+        let decision = catalog
+            .into_iter()
+            .find(|(name, _)| name == "macp.mode.decision.v1")
+            .expect("decision catalog should exist");
+        assert_eq!(decision.1.fixture_set_name, "decision");
+        assert!(decision
+            .1
+            .conformance_fixture_paths
+            .iter()
+            .any(|path| path.ends_with("decision_happy_path.json")));
     }
 }

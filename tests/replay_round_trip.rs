@@ -58,6 +58,68 @@ fn commitment(action: &str) -> Vec<u8> {
 }
 
 #[test]
+fn replay_decision_session() {
+    use macp_runtime::decision_pb::{ProposalPayload, VotePayload};
+
+    let registry = make_registry();
+    let mode = "macp.mode.decision.v1";
+
+    let entries = vec![
+        incoming(
+            "m1",
+            "SessionStart",
+            "agent://orchestrator",
+            start_payload(vec!["agent://a", "agent://b"]),
+            mode,
+            1000,
+        ),
+        incoming(
+            "m2",
+            "Proposal",
+            "agent://orchestrator",
+            ProposalPayload {
+                proposal_id: "p1".into(),
+                option: "deploy".into(),
+                rationale: "ready".into(),
+                supporting_data: vec![],
+            }
+            .encode_to_vec(),
+            mode,
+            2000,
+        ),
+        incoming(
+            "m3",
+            "Vote",
+            "agent://a",
+            VotePayload {
+                proposal_id: "p1".into(),
+                vote: "approve".into(),
+                reason: "good".into(),
+            }
+            .encode_to_vec(),
+            mode,
+            3000,
+        ),
+        incoming(
+            "m4",
+            "Commitment",
+            "agent://orchestrator",
+            commitment("decision.selected"),
+            mode,
+            4000,
+        ),
+    ];
+
+    let session = replay_session("s1", &entries, &registry).unwrap();
+    assert_eq!(session.state, SessionState::Resolved);
+    assert!(session.resolution.is_some());
+    assert_eq!(session.seen_message_ids.len(), 4);
+    let mode_state: serde_json::Value = serde_json::from_slice(&session.mode_state).unwrap();
+    assert_eq!(mode_state["phase"], "Committed");
+    assert_eq!(mode_state["votes"]["p1"]["agent://a"]["vote"], "approve");
+}
+
+#[test]
 fn replay_proposal_session() {
     use macp_runtime::proposal_pb::{AcceptPayload, ProposalPayload};
 
