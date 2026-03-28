@@ -133,9 +133,20 @@ async fn file_backend_full_lifecycle() {
         .unwrap();
     assert_eq!(result.session_state, SessionState::Resolved);
 
-    // Verify log was persisted
+    // After resolution, the log is compacted to a single checkpoint entry
     let log = storage.load_log(&sid).await.unwrap();
-    assert_eq!(log.len(), 4);
+    assert!(
+        !log.is_empty(),
+        "log should have at least one entry after compaction"
+    );
+    // Verify the session can be replayed from the compacted log
+    let replayed = macp_runtime::replay::replay_session(
+        &sid,
+        &log,
+        &macp_runtime::mode_registry::ModeRegistry::build_default(),
+    )
+    .unwrap();
+    assert_eq!(replayed.state, SessionState::Resolved);
 }
 
 #[tokio::test]

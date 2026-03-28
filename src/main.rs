@@ -34,13 +34,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         PathBuf::from(std::env::var("MACP_DATA_DIR").unwrap_or_else(|_| ".macp-data".into()));
     let strict_recovery = std::env::var("MACP_STRICT_RECOVERY").ok().as_deref() == Some("1");
 
+    let backend_name = std::env::var("MACP_STORAGE_BACKEND").unwrap_or_else(|_| "file".into());
     let storage: Arc<dyn StorageBackend> = if memory_only {
         Arc::new(MemoryBackend)
     } else {
-        std::fs::create_dir_all(&data_dir)?;
-        migrate_if_needed(&data_dir)?;
-        cleanup_temp_files(&data_dir);
-        Arc::new(FileBackend::new(data_dir.clone())?)
+        match backend_name.as_str() {
+            "file" => {
+                std::fs::create_dir_all(&data_dir)?;
+                migrate_if_needed(&data_dir)?;
+                cleanup_temp_files(&data_dir);
+                Arc::new(FileBackend::new(data_dir.clone())?)
+            }
+            #[cfg(feature = "rocksdb-backend")]
+            "rocksdb" => {
+                let path = std::env::var("MACP_ROCKSDB_PATH")
+                    .unwrap_or_else(|_| data_dir.join("rocksdb").to_string_lossy().to_string());
+                Arc::new(macp_runtime::storage::RocksDbBackend::open(&path)?)
+            }
+            #[cfg(feature = "redis-backend")]
+            "redis" => {
+                let url = std::env::var("MACP_REDIS_URL")
+                    .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+                Arc::new(macp_runtime::storage::RedisBackend::connect(&url, "macp").await?)
+            }
+            other => {
+                return Err(format!(
+                    "unknown storage backend: {other}. Valid: file, rocksdb, redis"
+                )
+                .into());
+            }
+        }
     };
 
     // Load persisted state into in-memory caches
@@ -49,76 +72,69 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mode_registry = Arc::new(ModeRegistry::build_default());
 
     if !memory_only {
-        // Enumerate session directories and replay from logs
-        let sessions_dir = data_dir.join("sessions");
+        // Replay sessions from logs
+        let session_ids = storage.list_session_ids().await?;
         let mut recovered = 0usize;
-        if tokio::fs::metadata(&sessions_dir).await.is_ok() {
-            let mut entries = tokio::fs::read_dir(&sessions_dir).await?;
-            while let Some(entry) = entries.next_entry().await? {
-                if !entry.file_type().await?.is_dir() {
+        for session_id in session_ids {
+            let log_entries = match storage.load_log(&session_id).await {
+                Ok(entries) => entries,
+                Err(e) if strict_recovery => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("strict recovery: failed to load log for {session_id}: {e}"),
+                    )
+                    .into());
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        "failed to load session log; skipping"
+                    );
                     continue;
                 }
-                let session_id = entry.file_name().to_string_lossy().to_string();
-                let log_entries = match storage.load_log(&session_id).await {
-                    Ok(entries) => entries,
-                    Err(e) if strict_recovery => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("strict recovery: failed to load log for {session_id}: {e}"),
-                        )
-                        .into());
-                    }
-                    Err(e) => {
+            };
+            if log_entries.is_empty() {
+                continue;
+            }
+
+            match replay_session(&session_id, &log_entries, &mode_registry) {
+                Ok(session) => {
+                    if let Err(e) = storage.save_session(&session).await {
+                        if strict_recovery {
+                            return Err(io::Error::other(format!(
+                                "strict recovery: failed to persist recovered session {session_id}: {e}"
+                            ))
+                            .into());
+                        }
                         tracing::warn!(
                             session_id = %session_id,
                             error = %e,
-                            "failed to load session log; skipping"
+                            "failed to persist recovered session"
                         );
-                        continue;
                     }
-                };
-                if log_entries.is_empty() {
-                    continue;
+
+                    log_store.create_session_log(&session_id).await;
+                    for log_entry in &log_entries {
+                        log_store.append(&session_id, log_entry.clone()).await;
+                    }
+
+                    registry.insert_recovered_session(session_id, session).await;
+                    recovered += 1;
                 }
-
-                match replay_session(&session_id, &log_entries, &mode_registry) {
-                    Ok(session) => {
-                        if let Err(e) = storage.save_session(&session).await {
-                            if strict_recovery {
-                                return Err(io::Error::other(format!(
-                                    "strict recovery: failed to persist recovered session {session_id}: {e}"
-                                ))
-                                .into());
-                            }
-                            tracing::warn!(
-                                session_id = %session_id,
-                                error = %e,
-                                "failed to persist recovered session"
-                            );
-                        }
-
-                        log_store.create_session_log(&session_id).await;
-                        for log_entry in &log_entries {
-                            log_store.append(&session_id, log_entry.clone()).await;
-                        }
-
-                        registry.insert_recovered_session(session_id, session).await;
-                        recovered += 1;
-                    }
-                    Err(e) if strict_recovery => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("strict recovery: failed to replay session {session_id}: {e}"),
-                        )
-                        .into());
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            session_id = %session_id,
-                            error = %e,
-                            "failed to replay session; skipping"
-                        );
-                    }
+                Err(e) if strict_recovery => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("strict recovery: failed to replay session {session_id}: {e}"),
+                    )
+                    .into());
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        "failed to replay session; skipping"
+                    );
                 }
             }
         }

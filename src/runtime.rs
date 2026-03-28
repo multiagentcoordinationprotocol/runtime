@@ -27,6 +27,7 @@ pub struct Runtime {
     stream_bus: Arc<SessionStreamBus>,
     mode_registry: Arc<ModeRegistry>,
     metrics: Arc<RuntimeMetrics>,
+    checkpoint_interval: usize,
 }
 
 impl Runtime {
@@ -49,6 +50,10 @@ impl Runtime {
         log_store: Arc<LogStore>,
         mode_registry: Arc<ModeRegistry>,
     ) -> Self {
+        let checkpoint_interval = std::env::var("MACP_CHECKPOINT_INTERVAL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0); // 0 = disabled by default
         Self {
             storage,
             registry,
@@ -56,6 +61,7 @@ impl Runtime {
             stream_bus: Arc::new(SessionStreamBus::default()),
             mode_registry,
             metrics: Arc::new(RuntimeMetrics::new()),
+            checkpoint_interval,
         }
     }
 
@@ -368,8 +374,13 @@ impl Runtime {
             tracing::info!(session_id = %env.session_id, mode = %session.mode, "session resolved");
         }
 
-        // 3. Best-effort session save
+        // 3. Best-effort session save + checkpoint
         self.save_session_to_storage(session).await;
+        if result_state == SessionState::Resolved {
+            self.maybe_compact_log(&env.session_id, session).await;
+        } else {
+            self.maybe_insert_checkpoint(&env.session_id, session).await;
+        }
         self.publish_accepted_envelope(env);
 
         Ok(ProcessResult {
@@ -441,6 +452,7 @@ impl Runtime {
         self.log_store.append(session_id, cancel_entry).await;
         session.state = SessionState::Expired;
         self.save_session_to_storage(session).await;
+        self.maybe_compact_log(session_id, session).await;
         self.metrics.record_session_cancelled(&session.mode);
         tracing::info!(session_id, reason, "session cancelled");
 
@@ -448,6 +460,62 @@ impl Runtime {
             session_state: SessionState::Expired,
             duplicate: false,
         })
+    }
+
+    /// Best-effort log compaction for terminal sessions.
+    async fn maybe_compact_log(&self, session_id: &str, session: &Session) {
+        if let Err(e) =
+            crate::storage::compaction::compact_session_log(&*self.storage, session_id, session)
+                .await
+        {
+            tracing::debug!(
+                session_id,
+                error = %e,
+                "log compaction skipped (backend may not support it)"
+            );
+        }
+    }
+
+    /// Insert a checkpoint entry if the log has reached the configured interval.
+    async fn maybe_insert_checkpoint(&self, session_id: &str, session: &Session) {
+        if self.checkpoint_interval == 0 {
+            return;
+        }
+        let log_len = self
+            .log_store
+            .get_log(session_id)
+            .await
+            .map(|l| l.len())
+            .unwrap_or(0);
+        // Only checkpoint at interval boundaries, and not on the first entry
+        if log_len < self.checkpoint_interval || log_len % self.checkpoint_interval != 0 {
+            return;
+        }
+        let persisted = crate::registry::PersistedSession::from(session);
+        let raw_payload = match serde_json::to_vec(&persisted) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(session_id, error = %e, "failed to serialize checkpoint");
+                return;
+            }
+        };
+        let checkpoint = LogEntry {
+            message_id: String::new(),
+            received_at_ms: Utc::now().timestamp_millis(),
+            sender: "_runtime".into(),
+            message_type: "Checkpoint".into(),
+            raw_payload,
+            entry_kind: EntryKind::Checkpoint,
+            session_id: session_id.into(),
+            mode: session.mode.clone(),
+            macp_version: String::new(),
+        };
+        if let Err(e) = self.storage.append_log_entry(session_id, &checkpoint).await {
+            tracing::warn!(session_id, error = %e, "failed to write checkpoint");
+            return;
+        }
+        self.log_store.append(session_id, checkpoint).await;
+        tracing::debug!(session_id, log_len, "checkpoint inserted");
     }
 }
 
@@ -1031,6 +1099,12 @@ mod tests {
             async fn load_all_sessions(&self) -> io::Result<Vec<Session>> {
                 Ok(vec![])
             }
+            async fn delete_session(&self, _: &str) -> io::Result<()> {
+                Ok(())
+            }
+            async fn list_session_ids(&self) -> io::Result<Vec<String>> {
+                Ok(vec![])
+            }
             async fn append_log_entry(&self, _: &str, _: &LogEntry) -> io::Result<()> {
                 Err(io::Error::other("disk full"))
             }
@@ -1082,6 +1156,12 @@ mod tests {
                 Ok(None)
             }
             async fn load_all_sessions(&self) -> io::Result<Vec<Session>> {
+                Ok(vec![])
+            }
+            async fn delete_session(&self, _: &str) -> io::Result<()> {
+                Ok(())
+            }
+            async fn list_session_ids(&self) -> io::Result<Vec<String>> {
                 Ok(vec![])
             }
             async fn append_log_entry(&self, _: &str, _: &LogEntry) -> io::Result<()> {
@@ -1169,6 +1249,12 @@ mod tests {
                 Ok(None)
             }
             async fn load_all_sessions(&self) -> io::Result<Vec<Session>> {
+                Ok(vec![])
+            }
+            async fn delete_session(&self, _: &str) -> io::Result<()> {
+                Ok(())
+            }
+            async fn list_session_ids(&self) -> io::Result<Vec<String>> {
                 Ok(vec![])
             }
             async fn append_log_entry(&self, _: &str, _: &LogEntry) -> io::Result<()> {
