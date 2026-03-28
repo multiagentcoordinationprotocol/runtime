@@ -3,6 +3,11 @@ name = "macp-runtime"
 version = "0.4.0"
 edition = "2021"
 
+[features]
+default = []
+rocksdb-backend = ["dep:rocksdb"]
+redis-backend = ["dep:redis"]
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 tonic = { version = "0.14", features = ["transport", "tls-ring"] }
@@ -20,6 +25,8 @@ async-trait = "0.1"
 uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rocksdb = { version = "0.22", optional = true }
+redis = { version = "0.27", features = ["tokio-comp", "aio"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"

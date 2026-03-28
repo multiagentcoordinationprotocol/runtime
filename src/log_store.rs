@@ -5,6 +5,7 @@ use tokio::sync::RwLock;
 pub enum EntryKind {
     Incoming,
     Internal,
+    Checkpoint,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]

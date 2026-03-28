@@ -2,6 +2,7 @@ use crate::error::MacpError;
 use crate::log_store::{EntryKind, LogEntry};
 use crate::mode_registry::ModeRegistry;
 use crate::pb::Envelope;
+use crate::registry::PersistedSession;
 use crate::session::{
     extract_ttl_ms, parse_session_start_payload, validate_canonical_session_start_payload, Session,
     SessionState,
@@ -9,10 +10,114 @@ use crate::session::{
 
 /// Rebuild a `Session` from its append-only log.
 ///
-/// This replays the same mode callbacks (`on_session_start`, `on_message`) in
-/// order so mode state, dedup state, and session lifecycle are reconstructed
-/// identically to how they were built during live processing.
+/// If the log contains `Checkpoint` entries, replay starts from the last
+/// checkpoint (restoring the serialized session state) and only replays
+/// subsequent entries. Otherwise, a full replay from `SessionStart` is
+/// performed.
 pub fn replay_session(
+    session_id: &str,
+    log_entries: &[LogEntry],
+    registry: &ModeRegistry,
+) -> Result<Session, MacpError> {
+    // Try checkpoint-based fast path first
+    if let Some(session) = try_replay_from_checkpoint(session_id, log_entries, registry)? {
+        return Ok(session);
+    }
+
+    replay_from_start(session_id, log_entries, registry)
+}
+
+/// Attempt to restore from the last checkpoint entry and replay remaining entries.
+/// Returns `Ok(None)` if no checkpoint exists.
+fn try_replay_from_checkpoint(
+    session_id: &str,
+    log_entries: &[LogEntry],
+    registry: &ModeRegistry,
+) -> Result<Option<Session>, MacpError> {
+    let checkpoint_idx = log_entries
+        .iter()
+        .rposition(|e| e.entry_kind == EntryKind::Checkpoint);
+
+    let idx = match checkpoint_idx {
+        Some(idx) => idx,
+        None => return Ok(None),
+    };
+
+    let checkpoint = &log_entries[idx];
+    let persisted: PersistedSession =
+        serde_json::from_slice(&checkpoint.raw_payload).map_err(|_| MacpError::InvalidPayload)?;
+    let mut session = Session::from(persisted);
+    session.session_id = session_id.into();
+
+    let mode = registry
+        .get_mode(&session.mode)
+        .ok_or(MacpError::UnknownMode)?;
+
+    // Replay entries after the checkpoint
+    for entry in &log_entries[idx + 1..] {
+        replay_entry(&mut session, session_id, entry, &mode)?;
+    }
+
+    Ok(Some(session))
+}
+
+/// Replay a single log entry onto a session.
+fn replay_entry(
+    session: &mut Session,
+    session_id: &str,
+    entry: &LogEntry,
+    mode: &crate::mode_registry::ModeRef<'_>,
+) -> Result<(), MacpError> {
+    match entry.entry_kind {
+        EntryKind::Incoming => {
+            let replay_env = Envelope {
+                macp_version: if entry.macp_version.is_empty() {
+                    "1.0".into()
+                } else {
+                    entry.macp_version.clone()
+                },
+                mode: if entry.mode.is_empty() {
+                    session.mode.clone()
+                } else {
+                    entry.mode.clone()
+                },
+                message_type: entry.message_type.clone(),
+                message_id: entry.message_id.clone(),
+                session_id: session_id.into(),
+                sender: entry.sender.clone(),
+                timestamp_unix_ms: entry.received_at_ms,
+                payload: entry.raw_payload.clone(),
+            };
+
+            if session.state != SessionState::Open {
+                if !replay_env.message_id.is_empty() {
+                    session.seen_message_ids.insert(replay_env.message_id);
+                }
+                return Ok(());
+            }
+
+            mode.authorize_sender(session, &replay_env)?;
+            let response = mode.on_message(session, &replay_env)?;
+            session.apply_mode_response(response);
+            if !replay_env.message_id.is_empty() {
+                session.seen_message_ids.insert(replay_env.message_id);
+            }
+        }
+        EntryKind::Internal => match entry.message_type.as_str() {
+            "TtlExpired" | "SessionCancel" => {
+                session.state = SessionState::Expired;
+            }
+            _ => {}
+        },
+        EntryKind::Checkpoint => {
+            // Skip intermediate checkpoints when replaying from an earlier one
+        }
+    }
+    Ok(())
+}
+
+/// Full replay from the SessionStart entry.
+fn replay_from_start(
     session_id: &str,
     log_entries: &[LogEntry],
     registry: &ModeRegistry,
@@ -98,59 +203,7 @@ pub fn replay_session(
 
     // 5. Replay subsequent entries
     for entry in log_entries.iter().skip(1) {
-        match entry.entry_kind {
-            EntryKind::Incoming => {
-                let replay_env = Envelope {
-                    macp_version: if entry.macp_version.is_empty() {
-                        "1.0".into()
-                    } else {
-                        entry.macp_version.clone()
-                    },
-                    mode: if entry.mode.is_empty() {
-                        session.mode.clone()
-                    } else {
-                        entry.mode.clone()
-                    },
-                    message_type: entry.message_type.clone(),
-                    message_id: entry.message_id.clone(),
-                    session_id: session_id.into(),
-                    sender: entry.sender.clone(),
-                    timestamp_unix_ms: entry.received_at_ms,
-                    payload: entry.raw_payload.clone(),
-                };
-
-                if session.state != SessionState::Open {
-                    // Session already resolved/expired, just rebuild dedup
-                    if !replay_env.message_id.is_empty() {
-                        session.seen_message_ids.insert(replay_env.message_id);
-                    }
-                    continue;
-                }
-
-                // Replay through the same authorization and mode callbacks used during
-                // live processing. Accepted history that no longer replays cleanly must
-                // fail recovery instead of silently drifting session state.
-                mode.authorize_sender(&session, &replay_env)?;
-                let response = mode.on_message(&session, &replay_env)?;
-                session.apply_mode_response(response);
-                if !replay_env.message_id.is_empty() {
-                    session.seen_message_ids.insert(replay_env.message_id);
-                }
-            }
-            EntryKind::Internal => {
-                match entry.message_type.as_str() {
-                    "TtlExpired" => {
-                        session.state = SessionState::Expired;
-                    }
-                    "SessionCancel" => {
-                        session.state = SessionState::Expired;
-                    }
-                    _ => {
-                        // Unknown internal event — skip
-                    }
-                }
-            }
-        }
+        replay_entry(&mut session, session_id, entry, &mode)?;
     }
 
     Ok(session)
@@ -366,5 +419,93 @@ mod tests {
         assert_eq!(entry.session_id, "");
         assert_eq!(entry.mode, "");
         assert_eq!(entry.macp_version, "");
+    }
+
+    #[test]
+    fn replay_from_checkpoint_restores_state() {
+        use crate::registry::PersistedSession;
+
+        let registry = make_registry();
+
+        // Build a session via normal replay first
+        let proposal = ProposalPayload {
+            proposal_id: "p1".into(),
+            option: "deploy".into(),
+            rationale: "ready".into(),
+            supporting_data: vec![],
+        }
+        .encode_to_vec();
+
+        let full_entries = vec![
+            incoming_entry(
+                "m1",
+                "SessionStart",
+                "agent://orchestrator",
+                start_payload_bytes(),
+                1000,
+            ),
+            incoming_entry(
+                "m2",
+                "Proposal",
+                "agent://orchestrator",
+                proposal.clone(),
+                2000,
+            ),
+        ];
+        let full_session = replay_session("s1", &full_entries, &registry).unwrap();
+
+        // Create a checkpoint from the replayed session state
+        let persisted = PersistedSession::from(&full_session);
+        let checkpoint_payload = serde_json::to_vec(&persisted).unwrap();
+        let checkpoint = LogEntry {
+            message_id: String::new(),
+            received_at_ms: 3000,
+            sender: "_runtime".into(),
+            message_type: "Checkpoint".into(),
+            raw_payload: checkpoint_payload,
+            entry_kind: EntryKind::Checkpoint,
+            session_id: "s1".into(),
+            mode: "macp.mode.decision.v1".into(),
+            macp_version: "1.0".into(),
+        };
+
+        // A vote after the checkpoint
+        let vote = VotePayload {
+            proposal_id: "p1".into(),
+            vote: "approve".into(),
+            reason: "lgtm".into(),
+        }
+        .encode_to_vec();
+
+        // Log: SessionStart, Proposal, Checkpoint, Vote
+        let entries_with_checkpoint = vec![
+            full_entries[0].clone(),
+            full_entries[1].clone(),
+            checkpoint,
+            incoming_entry("m3", "Vote", "agent://fraud", vote, 4000),
+        ];
+
+        let session = replay_session("s1", &entries_with_checkpoint, &registry).unwrap();
+        assert_eq!(session.state, SessionState::Open);
+        // Should have dedup from checkpoint (m1, m2) plus newly replayed m3
+        assert!(session.seen_message_ids.contains("m1"));
+        assert!(session.seen_message_ids.contains("m2"));
+        assert!(session.seen_message_ids.contains("m3"));
+    }
+
+    #[test]
+    fn replay_without_checkpoint_still_works() {
+        // Ensure logs without checkpoints replay correctly (backward compat)
+        let registry = make_registry();
+        let entries = vec![incoming_entry(
+            "m1",
+            "SessionStart",
+            "agent://orchestrator",
+            start_payload_bytes(),
+            1000,
+        )];
+        let session = replay_session("s1", &entries, &registry).unwrap();
+        assert_eq!(session.state, SessionState::Open);
+        assert!(session.seen_message_ids.contains("m1"));
     }
 }
