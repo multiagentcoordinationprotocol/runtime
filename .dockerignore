@@ -1,0 +1,15 @@
+target/
+.git/
+.github/
+.claude/
+.vscode/
+.idea/
+plans/
+tmp/
+temp/
+.macp-data/
+.DS_Store
+*.swp
+*.swo
+*~
+CLAUDE.md
