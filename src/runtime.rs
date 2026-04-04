@@ -25,6 +25,7 @@ pub struct Runtime {
     pub registry: Arc<SessionRegistry>,
     pub log_store: Arc<LogStore>,
     stream_bus: Arc<SessionStreamBus>,
+    signal_bus: tokio::sync::broadcast::Sender<Envelope>,
     mode_registry: Arc<ModeRegistry>,
     metrics: Arc<RuntimeMetrics>,
     checkpoint_interval: usize,
@@ -54,11 +55,13 @@ impl Runtime {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0); // 0 = disabled by default
+        let (signal_tx, _) = tokio::sync::broadcast::channel(256);
         Self {
             storage,
             registry,
             log_store,
             stream_bus: Arc::new(SessionStreamBus::default()),
+            signal_bus: signal_tx,
             mode_registry,
             metrics: Arc::new(RuntimeMetrics::new()),
             checkpoint_interval,
@@ -110,6 +113,10 @@ impl Runtime {
         session_id: &str,
     ) -> tokio::sync::broadcast::Receiver<Envelope> {
         self.stream_bus.subscribe(session_id)
+    }
+
+    pub fn subscribe_signals(&self) -> tokio::sync::broadcast::Receiver<Envelope> {
+        self.signal_bus.subscribe()
     }
 
     fn publish_accepted_envelope(&self, env: &Envelope) {
@@ -390,13 +397,15 @@ impl Runtime {
     }
 
     /// Process a Signal envelope. Signals are informational out-of-band
-    /// notifications (progress, heartbeat, etc.). Logged but no state mutation.
+    /// notifications (progress, heartbeat, etc.). Broadcast to signal
+    /// subscribers but no session state mutation.
     async fn process_signal(&self, env: &Envelope) -> Result<ProcessResult, MacpError> {
         tracing::debug!(
             sender = %env.sender,
             message_id = %env.message_id,
             "signal received"
         );
+        let _ = self.signal_bus.send(env.clone());
         Ok(ProcessResult {
             session_state: SessionState::Open,
             duplicate: false,

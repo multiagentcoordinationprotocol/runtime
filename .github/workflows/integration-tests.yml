@@ -1,0 +1,89 @@
+name: Integration Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_e2e:
+        description: 'Also run Tier 3 E2E tests (requires OPENAI_API_KEY secret)'
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  integration:
+    name: Tier 1+2 Integration Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            integration_tests/target
+          key: ${{ runner.os }}-integration-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-integration-
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Build runtime binary
+        run: cargo build
+
+      - name: Run Tier 1+2 integration tests
+        working-directory: integration_tests
+        env:
+          MACP_TEST_BINARY: ../target/debug/macp-runtime
+        run: cargo test -- --test-threads=1
+        timeout-minutes: 10
+
+  e2e:
+    name: Tier 3 E2E Tests
+    runs-on: ubuntu-latest
+    if: github.event.inputs.run_e2e == 'true'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            integration_tests/target
+          key: ${{ runner.os }}-integration-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-integration-
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Build runtime binary
+        run: cargo build
+
+      - name: Run Tier 3 E2E tests
+        working-directory: integration_tests
+        env:
+          MACP_TEST_BINARY: ../target/debug/macp-runtime
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: cargo test -- --ignored --test-threads=1
+        timeout-minutes: 10

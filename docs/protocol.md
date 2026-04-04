@@ -22,6 +22,7 @@ Clients should call `Initialize` before using the runtime.
 - `ListRoots`
 - `WatchModeRegistry`
 - `WatchRoots`
+- `WatchSignals`
 - `ListExtModes`
 - `RegisterExtMode`
 - `UnregisterExtMode`
@@ -31,6 +32,7 @@ Clients should call `Initialize` before using the runtime.
 
 - `WatchModeRegistry` — sends the current registry state, then fires `RegistryChanged` on register/unregister/promote
 - `WatchRoots` — sends the current roots state, then holds the stream open
+- `WatchSignals` — broadcasts ambient Signal envelopes to all subscribers in real time; Signals correlate with sessions via `SignalPayload.correlation_session_id` but do not enter session history
 
 ## Extension mode lifecycle RPCs
 

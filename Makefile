@@ -1,4 +1,4 @@
-.PHONY: setup build test test-integration test-conformance test-all fmt clippy check audit coverage sync-protos sync-protos-local check-protos
+.PHONY: setup build test test-integration test-conformance test-all fmt clippy check audit coverage sync-protos sync-protos-local check-protos test-integration-grpc test-integration-agents test-integration-e2e test-integration-hosted
 
 SPEC_PROTO_DIR := ../multiagentcoordinationprotocol/schemas/proto
 PROTO_FILES := macp/v1/envelope.proto macp/v1/core.proto macp/modes/decision/v1/decision.proto macp/modes/proposal/v1/proposal.proto macp/modes/task/v1/task.proto macp/modes/handoff/v1/handoff.proto macp/modes/quorum/v1/quorum.proto
@@ -54,6 +54,19 @@ sync-protos-local:
 		echo "  Copied $$f"; \
 	done
 	@echo "Done. Run 'git diff proto/' to review changes."
+
+## Integration tests (gRPC, Rig agents)
+test-integration-grpc:
+	cd integration_tests && cargo test --test tier1 -- --test-threads=1
+
+test-integration-agents:
+	cd integration_tests && cargo test --test tier2 -- --test-threads=1
+
+test-integration-e2e:
+	cd integration_tests && cargo test -- --ignored --test-threads=1
+
+test-integration-hosted:
+	cd integration_tests && cargo test -- --test-threads=1
 
 ## Check if local protos match BSR
 check-protos:
