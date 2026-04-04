@@ -11,6 +11,7 @@ use macp_runtime::pb::{
     SessionState as PbSessionState, SessionsCapability, StreamSessionRequest,
     StreamSessionResponse, UnregisterExtModeRequest, UnregisterExtModeResponse,
     WatchModeRegistryRequest, WatchModeRegistryResponse, WatchRootsRequest, WatchRootsResponse,
+    WatchSignalsRequest, WatchSignalsResponse,
 };
 use macp_runtime::runtime::Runtime;
 use macp_runtime::security::{AuthIdentity, SecurityLayer};
@@ -650,6 +651,25 @@ impl MacpRuntimeService for MacpServer {
             yield initial;
             // Roots are static — keep the stream open but idle.
             std::future::pending::<()>().await;
+        };
+        Ok(Response::new(Box::pin(stream)))
+    }
+
+    type WatchSignalsStream = std::pin::Pin<
+        Box<dyn futures_core::Stream<Item = Result<WatchSignalsResponse, Status>> + Send>,
+    >;
+
+    async fn watch_signals(
+        &self,
+        _request: Request<WatchSignalsRequest>,
+    ) -> Result<Response<Self::WatchSignalsStream>, Status> {
+        let mut rx = self.runtime.subscribe_signals();
+        let stream = async_stream::try_stream! {
+            while let Ok(envelope) = rx.recv().await {
+                yield WatchSignalsResponse {
+                    envelope: Some(envelope),
+                };
+            }
         };
         Ok(Response::new(Box::pin(stream)))
     }

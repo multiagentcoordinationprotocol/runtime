@@ -20,6 +20,9 @@
 /temp/
 CLAUDE.md
 
+# Integration tests build artifacts
+integration_tests/target/
+
 # OS
 .DS_Store
 Thumbs.db

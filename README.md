@@ -279,6 +279,29 @@ The runtime requires write access to `MACP_DATA_DIR`. Check directory permission
 **Proto drift / `make check-protos` failure**
 Run `make sync-protos` to update local proto files from BSR.
 
+## Testing
+
+```bash
+cargo test --all-targets          # Unit tests + Rust integration tests
+make test-conformance             # JSON fixture-driven conformance suite
+```
+
+A separate integration test crate (`integration_tests/`) tests the runtime through the real gRPC boundary:
+
+```bash
+cargo build
+cd integration_tests
+MACP_TEST_BINARY=../target/debug/macp-runtime cargo test -- --test-threads=1
+```
+
+The integration suite has three tiers:
+
+- **Tier 1 (Protocol)** — 47 scripted gRPC tests covering all modes, error paths, signals, version binding, dedup, and RFC cross-cutting features
+- **Tier 2 (Rig Tools)** — 5 tests using [Rig](https://rig.rs) agent framework `Tool` implementations for all MACP operations
+- **Tier 3 (E2E)** — 3 tests with real OpenAI GPT-4o-mini agents coordinating through the runtime (requires `OPENAI_API_KEY`)
+
+See `docs/testing.md` for full details on running locally, in CI, or against a hosted runtime.
+
 ## Development notes
 
 - The RFC/spec repository remains the normative source for protocol semantics.
@@ -286,5 +309,6 @@ Run `make sync-protos` to update local proto files from BSR.
 - `multi_round` is a built-in extension (`ext.multi_round.v1`) — not standards-track, but ships with the runtime and enforces strict `SessionStart`.
 - Extension modes can be dynamically registered, unregistered, and promoted via `RegisterExtMode`, `UnregisterExtMode`, and `PromoteMode` RPCs.
 - `StreamSession` is enabled and binds one gRPC stream to one session, emitting accepted envelopes in order.
+- `WatchSignals` broadcasts ambient Signal envelopes to all subscribers in real time.
 
 See `docs/README.md` and `docs/examples.md` for the updated local development and usage guidance.

@@ -277,6 +277,12 @@ message PromoteModeResponse {
   string mode = 3;
 }
 
+message WatchSignalsRequest {}
+
+message WatchSignalsResponse {
+  Envelope envelope = 1;
+}
+
 service MACPRuntimeService {
   rpc Initialize(InitializeRequest) returns (InitializeResponse);
   rpc Send(SendRequest) returns (SendResponse);
@@ -293,4 +299,6 @@ service MACPRuntimeService {
   rpc RegisterExtMode(RegisterExtModeRequest) returns (RegisterExtModeResponse);
   rpc UnregisterExtMode(UnregisterExtModeRequest) returns (UnregisterExtModeResponse);
   rpc PromoteMode(PromoteModeRequest) returns (PromoteModeResponse);
+  // Ambient signal observation
+  rpc WatchSignals(WatchSignalsRequest) returns (stream WatchSignalsResponse);
 }
