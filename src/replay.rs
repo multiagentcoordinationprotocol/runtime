@@ -194,6 +194,8 @@ fn replay_from_start(
         context: start_payload.context.clone(),
         roots: start_payload.roots.clone(),
         initiator_sender: start_entry.sender.clone(),
+        participant_message_counts: std::collections::HashMap::new(),
+        participant_last_seen: std::collections::HashMap::new(),
     };
 
     // 4. Call mode.on_session_start(), apply response

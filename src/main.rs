@@ -18,12 +18,44 @@ use tonic::transport::{Identity, Server, ServerTlsConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    #[cfg(feature = "otel")]
+    {
+        use opentelemetry::trace::TracerProvider;
+        use opentelemetry_otlp::WithExportConfig;
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        let otlp_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+            .unwrap_or_else(|_| "http://localhost:4317".into());
+        let exporter = opentelemetry_otlp::new_exporter()
+            .tonic()
+            .with_endpoint(&otlp_endpoint);
+        let provider = opentelemetry_otlp::new_pipeline()
+            .tracing()
+            .with_exporter(exporter)
+            .install_batch(opentelemetry_sdk::runtime::Tokio)
+            .expect("failed to init OTEL tracer");
+        let tracer = provider.tracer("macp-runtime");
+        let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(tracing_subscriber::fmt::layer())
+            .with(otel_layer)
+            .init();
+        tracing::info!(
+            "OpenTelemetry tracing enabled (endpoint: {})",
+            otlp_endpoint
+        );
+    }
+
+    #[cfg(not(feature = "otel"))]
+    {
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    }
 
     let addr = std::env::var("MACP_BIND_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:50051".into())
@@ -154,7 +186,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mode_registry,
     ));
     let security = SecurityLayer::from_env()?;
-    let svc = MacpServer::new(runtime, security);
+    let svc = MacpServer::new(Arc::clone(&runtime), security);
 
     let allow_insecure = std::env::var("MACP_ALLOW_INSECURE").ok().as_deref() == Some("1");
     let tls_cert = std::env::var("MACP_TLS_CERT_PATH").ok();

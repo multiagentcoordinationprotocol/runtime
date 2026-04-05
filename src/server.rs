@@ -5,10 +5,10 @@ use macp_runtime::pb::{
     Envelope, GetManifestRequest, GetManifestResponse, GetSessionRequest, GetSessionResponse,
     InitializeRequest, InitializeResponse, ListExtModesRequest, ListExtModesResponse,
     ListModesRequest, ListModesResponse, ListRootsRequest, ListRootsResponse,
-    MacpError as PbMacpError, ManifestCapability, ModeRegistryCapability, ProgressCapability,
-    PromoteModeRequest, PromoteModeResponse, RegisterExtModeRequest, RegisterExtModeResponse,
-    RootsCapability, RuntimeInfo, SendRequest, SendResponse, SessionMetadata,
-    SessionState as PbSessionState, SessionsCapability, StreamSessionRequest,
+    MacpError as PbMacpError, ManifestCapability, ModeRegistryCapability, ParticipantActivity,
+    ProgressCapability, PromoteModeRequest, PromoteModeResponse, RegisterExtModeRequest,
+    RegisterExtModeResponse, RootsCapability, RuntimeInfo, SendRequest, SendResponse,
+    SessionMetadata, SessionState as PbSessionState, SessionsCapability, StreamSessionRequest,
     StreamSessionResponse, UnregisterExtModeRequest, UnregisterExtModeResponse,
     WatchModeRegistryRequest, WatchModeRegistryResponse, WatchRootsRequest, WatchRootsResponse,
     WatchSignalsRequest, WatchSignalsResponse,
@@ -404,7 +404,7 @@ impl MacpRuntimeService for MacpServer {
                 cancellation: Some(CancellationCapability {
                     cancel_session: true,
                 }),
-                progress: Some(ProgressCapability { progress: false }),
+                progress: Some(ProgressCapability { progress: true }),
                 manifest: Some(ManifestCapability { get_manifest: true }),
                 mode_registry: Some(ModeRegistryCapability {
                     list_modes: true,
@@ -475,6 +475,20 @@ impl MacpRuntimeService for MacpServer {
             .await
             .ok_or_else(|| Status::not_found(format!("Session '{}' not found", session_id)))?;
 
+        let participant_activity = session
+            .participant_message_counts
+            .iter()
+            .map(|(pid, count)| ParticipantActivity {
+                participant_id: pid.clone(),
+                last_message_at_unix_ms: session
+                    .participant_last_seen
+                    .get(pid)
+                    .copied()
+                    .unwrap_or(0),
+                message_count: *count,
+            })
+            .collect();
+
         Ok(Response::new(GetSessionResponse {
             metadata: Some(SessionMetadata {
                 session_id: session.session_id.clone(),
@@ -485,6 +499,8 @@ impl MacpRuntimeService for MacpServer {
                 mode_version: session.mode_version.clone(),
                 configuration_version: session.configuration_version.clone(),
                 policy_version: session.policy_version.clone(),
+                participants: session.participants.clone(),
+                participant_activity,
             }),
         }))
     }

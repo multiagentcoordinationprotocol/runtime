@@ -120,6 +120,12 @@ message CommitmentPayload {
   string configuration_version = 7;
 }
 
+message ParticipantActivity {
+  string participant_id = 1;
+  int64 last_message_at_unix_ms = 2;
+  uint32 message_count = 3;
+}
+
 message SessionMetadata {
   string session_id = 1;
   string mode = 2;
@@ -129,6 +135,8 @@ message SessionMetadata {
   string mode_version = 6;
   string configuration_version = 7;
   string policy_version = 8;
+  repeated string participants = 9;
+  repeated ParticipantActivity participant_activity = 10;
 }
 
 message GetSessionRequest {

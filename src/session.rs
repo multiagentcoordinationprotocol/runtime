@@ -2,7 +2,7 @@ use crate::error::MacpError;
 use crate::mode::ModeResponse;
 use crate::pb::SessionStartPayload;
 use prost::Message;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub const MAX_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 
@@ -32,9 +32,20 @@ pub struct Session {
     pub context: Vec<u8>,
     pub roots: Vec<crate::pb::Root>,
     pub initiator_sender: String,
+    pub participant_message_counts: HashMap<String, u32>,
+    pub participant_last_seen: HashMap<String, i64>,
 }
 
 impl Session {
+    pub fn record_participant_activity(&mut self, sender: &str, timestamp_ms: i64) {
+        *self
+            .participant_message_counts
+            .entry(sender.to_string())
+            .or_insert(0) += 1;
+        self.participant_last_seen
+            .insert(sender.to_string(), timestamp_ms);
+    }
+
     pub fn apply_mode_response(&mut self, response: ModeResponse) {
         match response {
             ModeResponse::NoOp => {}

@@ -196,7 +196,7 @@ impl Runtime {
     ) -> Result<ProcessResult, MacpError> {
         match env.message_type.as_str() {
             "SessionStart" => self.process_session_start(env, max_open_sessions).await,
-            "Signal" => self.process_signal(env).await,
+            "Signal" | "Progress" => self.process_signal(env).await,
             _ => self.process_message(env).await,
         }
     }
@@ -272,6 +272,8 @@ impl Runtime {
             context: start_payload.context.clone(),
             roots: start_payload.roots.clone(),
             initiator_sender: env.sender.clone(),
+            participant_message_counts: std::collections::HashMap::new(),
+            participant_last_seen: std::collections::HashMap::new(),
         };
 
         let response = mode.on_session_start(&session, env)?;
@@ -360,6 +362,7 @@ impl Runtime {
         // 2. Update in-memory state
         self.log_store.append(&env.session_id, incoming_entry).await;
         session.seen_message_ids.insert(env.message_id.clone());
+        session.record_participant_activity(&env.sender, chrono::Utc::now().timestamp_millis());
         session.apply_mode_response(response);
         let result_state = session.state.clone();
 
