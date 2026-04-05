@@ -23,6 +23,11 @@ CLAUDE.md
 # Integration tests build artifacts
 integration_tests/target/
 
+# Secrets / environment
+.env
+.env.local
+.env.*.local
+
 # OS
 .DS_Store
 Thumbs.db

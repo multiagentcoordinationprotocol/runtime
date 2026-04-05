@@ -176,6 +176,8 @@ mod tests {
                 name: "r1".into(),
             }],
             initiator_sender: "alice".into(),
+            participant_message_counts: std::collections::HashMap::new(),
+            participant_last_seen: std::collections::HashMap::new(),
         }
     }
 

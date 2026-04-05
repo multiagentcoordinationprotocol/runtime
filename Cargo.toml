@@ -2,11 +2,13 @@
 name = "macp-runtime"
 version = "0.4.0"
 edition = "2021"
+default-run = "macp-runtime"
 
 [features]
 default = []
 rocksdb-backend = ["dep:rocksdb"]
 redis-backend = ["dep:redis"]
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -25,6 +27,10 @@ async-trait = "0.1"
 uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+opentelemetry = { version = "0.22", optional = true }
+opentelemetry_sdk = { version = "0.22", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.15", features = ["tonic"], optional = true }
+tracing-opentelemetry = { version = "0.23", optional = true }
 rocksdb = { version = "0.22", optional = true }
 redis = { version = "0.27", features = ["tokio-comp", "aio"], optional = true }
 
