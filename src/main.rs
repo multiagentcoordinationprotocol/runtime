@@ -3,6 +3,7 @@ mod server;
 use macp_runtime::log_store::LogStore;
 use macp_runtime::mode_registry::ModeRegistry;
 use macp_runtime::pb;
+use macp_runtime::policy::registry::PolicyRegistry;
 use macp_runtime::registry::SessionRegistry;
 use macp_runtime::replay::replay_session;
 use macp_runtime::runtime::Runtime;
@@ -102,6 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let registry = Arc::new(SessionRegistry::new());
     let log_store = Arc::new(LogStore::new());
     let mode_registry = Arc::new(ModeRegistry::build_default());
+    let policy_registry = Arc::new(PolicyRegistry::new());
 
     if !memory_only {
         // Replay sessions from logs
@@ -130,7 +132,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
 
-            match replay_session(&session_id, &log_entries, &mode_registry) {
+            match replay_session(
+                &session_id,
+                &log_entries,
+                &mode_registry,
+                Some(&policy_registry),
+            ) {
                 Ok(session) => {
                     if let Err(e) = storage.save_session(&session).await {
                         if strict_recovery {
@@ -179,11 +186,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let runtime = Arc::new(Runtime::with_mode_registry(
+    let runtime = Arc::new(Runtime::with_registries(
         Arc::clone(&storage),
         Arc::clone(&registry),
         Arc::clone(&log_store),
         mode_registry,
+        policy_registry,
     ));
     let security = SecurityLayer::from_env()?;
     let svc = MacpServer::new(Arc::clone(&runtime), security);

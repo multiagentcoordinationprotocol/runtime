@@ -7,7 +7,7 @@
   ],
   "mode_version": "1.0.0",
   "configuration_version": "cfg-1",
-  "policy_version": "policy-1",
+  "policy_version": "",
   "ttl_ms": 60000,
   "messages": [
     {
@@ -53,7 +53,7 @@
         "authority_scope": "test",
         "reason": "done",
         "mode_version": "1.0.0",
-        "policy_version": "policy-1",
+        "policy_version": "",
         "configuration_version": "cfg-1"
       },
       "expect": "accept"

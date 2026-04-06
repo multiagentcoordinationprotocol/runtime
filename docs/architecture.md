@@ -108,6 +108,29 @@ Responsibilities:
 - enforce session-start policy
 - enforce per-sender rate limits
 
+## 7. Policy layer (`src/policy/`)
+
+Responsibilities:
+
+- store and resolve governance policy definitions
+- validate policy rules against mode-specific JSON schemas at registration
+- evaluate governance constraints at commitment time
+- provide default policy (`policy.default`) with no additional constraints
+
+Components:
+
+- `PolicyRegistry` — in-memory CRUD store with broadcast change notifications (mirrors `ModeRegistry` pattern)
+- `PolicyDefinition` — canonical policy representation: id, mode target, rules (JSON), schema version
+- Evaluators — per-mode commitment evaluation: decision (voting/quorum/veto threshold), proposal (counter-proposal round limits), task (output requirements), handoff (implicit accept timeout), quorum (abstention/threshold rules). Rule schemas aligned to RFC-MACP-0012 JSON schemas.
+- Default policy — ships pre-registered, applies to all modes via wildcard `"*"`, imposes zero additional constraints
+
+Policy lifecycle:
+
+1. Registered via `RegisterPolicy` RPC or pre-loaded at startup
+2. Resolved at `SessionStart` — bound to session as `policy_definition`
+3. Evaluated at `Commitment` — mode-specific evaluator checks rules against session state
+4. Persisted with session — replay uses stored definition, never re-resolves
+
 ## Architecture diagram
 
 ```
@@ -116,6 +139,8 @@ Client Request
   [Transport/gRPC] -- server.rs, security.rs
        |
   [Coordination Kernel] -- runtime.rs
+       |
+  [Policy Layer] -- policy/
        |
   [Mode Registry] -- mode_registry.rs
        |            \

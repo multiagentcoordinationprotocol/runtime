@@ -1,6 +1,7 @@
 use crate::error::MacpError;
 use crate::mode::ModeResponse;
 use crate::pb::SessionStartPayload;
+use crate::policy::PolicyDefinition;
 use prost::Message;
 use std::collections::{HashMap, HashSet};
 
@@ -34,6 +35,7 @@ pub struct Session {
     pub initiator_sender: String,
     pub participant_message_counts: HashMap<String, u32>,
     pub participant_last_seen: HashMap<String, i64>,
+    pub policy_definition: Option<PolicyDefinition>,
 }
 
 impl Session {

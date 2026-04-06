@@ -32,6 +32,8 @@ pub(crate) struct PersistedSession {
     pub context: Vec<u8>,
     pub roots: Vec<PersistedRoot>,
     pub initiator_sender: String,
+    #[serde(default)]
+    pub policy_definition: Option<crate::policy::PolicyDefinition>,
 }
 
 fn default_schema_version() -> u32 {
@@ -66,6 +68,7 @@ impl From<&Session> for PersistedSession {
                 })
                 .collect(),
             initiator_sender: session.initiator_sender.clone(),
+            policy_definition: session.policy_definition.clone(),
         }
     }
 }
@@ -107,6 +110,7 @@ impl From<PersistedSession> for Session {
             initiator_sender: session.initiator_sender,
             participant_message_counts: std::collections::HashMap::new(),
             participant_last_seen: std::collections::HashMap::new(),
+            policy_definition: session.policy_definition,
         }
     }
 }
@@ -246,6 +250,7 @@ mod tests {
             initiator_sender: "alice".into(),
             participant_message_counts: std::collections::HashMap::new(),
             participant_last_seen: std::collections::HashMap::new(),
+            policy_definition: None,
         }
     }
 

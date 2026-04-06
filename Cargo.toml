@@ -33,6 +33,10 @@ opentelemetry-otlp = { version = "0.15", features = ["tonic"], optional = true }
 tracing-opentelemetry = { version = "0.23", optional = true }
 rocksdb = { version = "0.22", optional = true }
 redis = { version = "0.27", features = ["tokio-comp", "aio"], optional = true }
+# Proto definitions from the spec repo (exposes DEP_MACP_PROTO_PROTO_DIR to build.rs via links metadata).
+# For CI/production, switch to git dependency:
+# macp-proto = { git = "https://github.com/multiagentcoordinationprotocol/multiagentcoordinationprotocol.git", tag = "proto-v0.1.0" }
+macp-proto = { path = "../multiagentcoordinationprotocol/packages/proto-rust" }
 
 [dev-dependencies]
 tempfile = "3"

@@ -2,7 +2,9 @@ use crate::error::MacpError;
 use crate::handoff_pb::{
     HandoffAcceptPayload, HandoffContextPayload, HandoffDeclinePayload, HandoffOfferPayload,
 };
-use crate::mode::util::{is_declared_participant, validate_commitment_payload_for_session};
+use crate::mode::util::{
+    check_commitment_authority, is_declared_participant, validate_commitment_payload_for_session,
+};
 use crate::mode::{Mode, ModeResponse};
 use crate::pb::Envelope;
 use crate::session::Session;
@@ -28,6 +30,8 @@ pub struct HandoffOfferRecord {
     pub accepted_by: Option<String>,
     pub declined_by: Option<String>,
     pub outcome_reason: Option<String>,
+    #[serde(default)]
+    pub offered_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,8 +69,7 @@ impl HandoffMode {
 impl Mode for HandoffMode {
     fn authorize_sender(&self, session: &Session, env: &Envelope) -> Result<(), MacpError> {
         match env.message_type.as_str() {
-            "Commitment" if env.sender == session.initiator_sender => Ok(()),
-            "Commitment" => Err(MacpError::Forbidden),
+            "Commitment" => check_commitment_authority(session, &env.sender),
             "HandoffOffer" | "HandoffContext" if env.sender == session.initiator_sender => Ok(()),
             _ if is_declared_participant(&session.participants, &env.sender) => Ok(()),
             _ => Err(MacpError::Forbidden),
@@ -128,6 +131,7 @@ impl Mode for HandoffMode {
                         accepted_by: None,
                         declined_by: None,
                         outcome_reason: None,
+                        offered_at_ms: 0,
                     },
                 );
                 Ok(ModeResponse::PersistState(Self::encode_state(&state)))
@@ -199,12 +203,41 @@ impl Mode for HandoffMode {
                 Ok(ModeResponse::PersistState(Self::encode_state(&state)))
             }
             "Commitment" => {
-                if env.sender != session.initiator_sender {
-                    return Err(MacpError::Forbidden);
-                }
                 validate_commitment_payload_for_session(session, &env.payload)?;
+                // RFC-MACP-0012: lazy implicit_accept_timeout_ms check
+                if let Some(ref policy) = session.policy_definition {
+                    let rules: crate::policy::rules::HandoffPolicyRules =
+                        serde_json::from_value(policy.rules.clone()).unwrap_or_default();
+                    if rules.acceptance.implicit_accept_timeout_ms > 0 {
+                        let now_ms = chrono::Utc::now().timestamp_millis();
+                        let timeout = rules.acceptance.implicit_accept_timeout_ms as i64;
+                        for offer in state.offers.values_mut() {
+                            if offer.disposition == HandoffDisposition::Offered
+                                && offer.offered_at_ms > 0
+                                && (now_ms - offer.offered_at_ms) >= timeout
+                            {
+                                offer.disposition = HandoffDisposition::Accepted;
+                                offer.accepted_by = Some(offer.target_participant.clone());
+                                offer.outcome_reason = Some("implicit accept (timeout)".into());
+                            }
+                        }
+                    }
+                }
                 if !Self::commitment_ready(&state) {
                     return Err(MacpError::InvalidPayload);
+                }
+                // Evaluate governance policy if one is bound to the session.
+                if let Some(ref policy) = session.policy_definition {
+                    let decision = crate::policy::evaluator::evaluate_handoff_commitment(policy);
+                    if let crate::policy::PolicyDecision::Deny { reasons } = decision {
+                        tracing::warn!(
+                            session_id = %session.session_id,
+                            policy_id = %policy.policy_id,
+                            reasons = ?reasons,
+                            "policy denied commitment"
+                        );
+                        return Err(MacpError::PolicyDenied);
+                    }
                 }
                 Ok(ModeResponse::PersistAndResolve {
                     state: Self::encode_state(&state),
@@ -244,6 +277,7 @@ mod tests {
             initiator_sender: "owner".into(),
             participant_message_counts: std::collections::HashMap::new(),
             participant_last_seen: std::collections::HashMap::new(),
+            policy_definition: None,
         }
     }
 
@@ -919,5 +953,46 @@ mod tests {
             .to_string(),
             "InvalidPayload"
         );
+    }
+
+    // --- Policy ---
+
+    #[test]
+    fn handoff_policy_evaluator_always_allows() {
+        let mode = HandoffMode;
+        let mut session = base_session();
+        session.policy_definition = Some(crate::policy::PolicyDefinition {
+            policy_id: "test-handoff".into(),
+            mode: "macp.mode.handoff.v1".into(),
+            description: "handoff policy".into(),
+            rules: serde_json::json!({
+                "acceptance": { "implicit_accept_timeout_ms": 0 },
+                "commitment": { "authority": "initiator_only" }
+            }),
+            schema_version: 1,
+        });
+        let result = mode
+            .on_session_start(&session, &env("owner", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("owner", "HandoffOffer", make_offer("h1", "target")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("target", "HandoffAccept", make_accept("h1", "target")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        // Handoff policy evaluator always allows — commitment should succeed
+        let result = mode
+            .on_message(&session, &env("owner", "Commitment", commitment_payload()))
+            .unwrap();
+        assert!(matches!(result, ModeResponse::PersistAndResolve { .. }));
     }
 }

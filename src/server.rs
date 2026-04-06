@@ -2,16 +2,19 @@ use macp_runtime::error::MacpError;
 use macp_runtime::pb::macp_runtime_service_server::MacpRuntimeService;
 use macp_runtime::pb::{
     Ack, CancelSessionRequest, CancelSessionResponse, CancellationCapability, Capabilities,
-    Envelope, GetManifestRequest, GetManifestResponse, GetSessionRequest, GetSessionResponse,
-    InitializeRequest, InitializeResponse, ListExtModesRequest, ListExtModesResponse,
-    ListModesRequest, ListModesResponse, ListRootsRequest, ListRootsResponse,
+    Envelope, GetManifestRequest, GetManifestResponse, GetPolicyRequest, GetPolicyResponse,
+    GetSessionRequest, GetSessionResponse, InitializeRequest, InitializeResponse,
+    ListExtModesRequest, ListExtModesResponse, ListModesRequest, ListModesResponse,
+    ListPoliciesRequest, ListPoliciesResponse, ListRootsRequest, ListRootsResponse,
     MacpError as PbMacpError, ManifestCapability, ModeRegistryCapability, ParticipantActivity,
-    ProgressCapability, PromoteModeRequest, PromoteModeResponse, RegisterExtModeRequest,
-    RegisterExtModeResponse, RootsCapability, RuntimeInfo, SendRequest, SendResponse,
+    PolicyDescriptor, PolicyRegistryCapability, ProgressCapability, PromoteModeRequest,
+    PromoteModeResponse, RegisterExtModeRequest, RegisterExtModeResponse, RegisterPolicyRequest,
+    RegisterPolicyResponse, RootsCapability, RuntimeInfo, SendRequest, SendResponse,
     SessionMetadata, SessionState as PbSessionState, SessionsCapability, StreamSessionRequest,
     StreamSessionResponse, UnregisterExtModeRequest, UnregisterExtModeResponse,
-    WatchModeRegistryRequest, WatchModeRegistryResponse, WatchRootsRequest, WatchRootsResponse,
-    WatchSignalsRequest, WatchSignalsResponse,
+    UnregisterPolicyRequest, UnregisterPolicyResponse, WatchModeRegistryRequest,
+    WatchModeRegistryResponse, WatchPoliciesRequest, WatchPoliciesResponse, WatchRootsRequest,
+    WatchRootsResponse, WatchSignalsRequest, WatchSignalsResponse,
 };
 use macp_runtime::runtime::Runtime;
 use macp_runtime::security::{AuthIdentity, SecurityLayer};
@@ -371,6 +374,7 @@ impl MacpServer {
             MacpError::RateLimited => Status::resource_exhausted(err.to_string()),
             MacpError::StorageFailed => Status::internal(err.to_string()),
             MacpError::InvalidSessionId => Status::invalid_argument(err.to_string()),
+            MacpError::InvalidPolicyDefinition => Status::invalid_argument(err.to_string()),
             _ => Status::failed_precondition(err.to_string()),
         }
     }
@@ -412,6 +416,11 @@ impl MacpRuntimeService for MacpServer {
                 }),
                 roots: Some(RootsCapability {
                     list_roots: true,
+                    list_changed: true,
+                }),
+                policy_registry: Some(PolicyRegistryCapability {
+                    register_policy: true,
+                    list_policies: true,
                     list_changed: true,
                 }),
                 experimental: Some(macp_runtime::pb::ExperimentalCapabilities {
@@ -782,6 +791,171 @@ impl MacpRuntimeService for MacpServer {
             })),
         }
     }
+
+    // ── Governance policy lifecycle RPCs (RFC-MACP-0012) ────────────
+
+    async fn register_policy(
+        &self,
+        request: Request<RegisterPolicyRequest>,
+    ) -> Result<Response<RegisterPolicyResponse>, Status> {
+        let identity = self
+            .security
+            .authenticate_metadata(request.metadata())
+            .map_err(Self::status_from_error)?;
+        self.security
+            .authorize_mode_registry(&identity)
+            .map_err(Self::status_from_error)?;
+        let req = request.into_inner();
+        let descriptor = req
+            .descriptor
+            .ok_or_else(|| Status::invalid_argument("descriptor required"))?;
+        let definition = Self::policy_descriptor_to_definition(&descriptor);
+        match self.runtime.register_policy(definition) {
+            Ok(()) => Ok(Response::new(RegisterPolicyResponse {
+                ok: true,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(RegisterPolicyResponse {
+                ok: false,
+                error: e,
+            })),
+        }
+    }
+
+    async fn unregister_policy(
+        &self,
+        request: Request<UnregisterPolicyRequest>,
+    ) -> Result<Response<UnregisterPolicyResponse>, Status> {
+        let identity = self
+            .security
+            .authenticate_metadata(request.metadata())
+            .map_err(Self::status_from_error)?;
+        self.security
+            .authorize_mode_registry(&identity)
+            .map_err(Self::status_from_error)?;
+        let req = request.into_inner();
+        match self.runtime.unregister_policy(&req.policy_id) {
+            Ok(()) => Ok(Response::new(UnregisterPolicyResponse {
+                ok: true,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(UnregisterPolicyResponse {
+                ok: false,
+                error: e,
+            })),
+        }
+    }
+
+    async fn get_policy(
+        &self,
+        request: Request<GetPolicyRequest>,
+    ) -> Result<Response<GetPolicyResponse>, Status> {
+        let _identity = self
+            .security
+            .authenticate_metadata(request.metadata())
+            .map_err(Self::status_from_error)?;
+        let req = request.into_inner();
+        let policy = self
+            .runtime
+            .get_policy(&req.policy_id)
+            .ok_or_else(|| Status::not_found(format!("Policy '{}' not found", req.policy_id)))?;
+        Ok(Response::new(GetPolicyResponse {
+            descriptor: Some(Self::policy_definition_to_descriptor(&policy)),
+        }))
+    }
+
+    async fn list_policies(
+        &self,
+        request: Request<ListPoliciesRequest>,
+    ) -> Result<Response<ListPoliciesResponse>, Status> {
+        let _identity = self
+            .security
+            .authenticate_metadata(request.metadata())
+            .map_err(Self::status_from_error)?;
+        let req = request.into_inner();
+        let mode_filter = if req.mode.is_empty() {
+            None
+        } else {
+            Some(req.mode.as_str())
+        };
+        let policies = self.runtime.list_policies(mode_filter);
+        let descriptors = policies
+            .iter()
+            .map(Self::policy_definition_to_descriptor)
+            .collect();
+        Ok(Response::new(ListPoliciesResponse { descriptors }))
+    }
+
+    type WatchPoliciesStream = std::pin::Pin<
+        Box<dyn futures_core::Stream<Item = Result<WatchPoliciesResponse, Status>> + Send>,
+    >;
+
+    async fn watch_policies(
+        &self,
+        _request: Request<WatchPoliciesRequest>,
+    ) -> Result<Response<Self::WatchPoliciesStream>, Status> {
+        let mut rx = self.runtime.subscribe_policy_changes();
+        let runtime = Arc::clone(&self.runtime);
+        let stream = async_stream::try_stream! {
+            // Send initial state
+            let policies = runtime.list_policies(None);
+            let descriptors: Vec<PolicyDescriptor> = policies
+                .iter()
+                .map(|p| MacpServer::policy_definition_to_descriptor(p))
+                .collect();
+            yield WatchPoliciesResponse {
+                descriptors,
+                observed_at_unix_ms: chrono::Utc::now().timestamp_millis() as u64,
+            };
+            // Wait for changes
+            while rx.recv().await.is_ok() {
+                let policies = runtime.list_policies(None);
+                let descriptors: Vec<PolicyDescriptor> = policies
+                    .iter()
+                    .map(|p| MacpServer::policy_definition_to_descriptor(p))
+                    .collect();
+                yield WatchPoliciesResponse {
+                    descriptors,
+                    observed_at_unix_ms: chrono::Utc::now().timestamp_millis() as u64,
+                };
+            }
+        };
+        Ok(Response::new(Box::pin(stream)))
+    }
+}
+
+// ── Policy type conversion helpers ──────────────────────────────────
+
+impl MacpServer {
+    fn policy_descriptor_to_definition(
+        descriptor: &PolicyDescriptor,
+    ) -> macp_runtime::policy::PolicyDefinition {
+        let rules: serde_json::Value = if descriptor.rules.is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_slice(&descriptor.rules).unwrap_or_else(|_| serde_json::json!({}))
+        };
+        macp_runtime::policy::PolicyDefinition {
+            policy_id: descriptor.policy_id.clone(),
+            mode: descriptor.mode.clone(),
+            description: descriptor.description.clone(),
+            rules,
+            schema_version: descriptor.schema_version,
+        }
+    }
+
+    fn policy_definition_to_descriptor(
+        definition: &macp_runtime::policy::PolicyDefinition,
+    ) -> PolicyDescriptor {
+        PolicyDescriptor {
+            policy_id: definition.policy_id.clone(),
+            mode: definition.mode.clone(),
+            description: definition.description.clone(),
+            rules: serde_json::to_vec(&definition.rules).unwrap_or_default(),
+            schema_version: definition.schema_version,
+            registered_at: String::new(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -827,7 +1001,7 @@ mod tests {
             participants: vec!["agent://fraud".into()],
             mode_version: "1.0.0".into(),
             configuration_version: "cfg-1".into(),
-            policy_version: "policy-1".into(),
+            policy_version: String::new(),
             ttl_ms: 1000,
             context: vec![],
             roots: vec![],

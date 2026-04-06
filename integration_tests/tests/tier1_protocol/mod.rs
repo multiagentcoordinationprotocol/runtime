@@ -13,3 +13,4 @@ mod test_concurrent_sessions;
 mod test_session_lifecycle;
 mod test_reject_paths;
 mod test_rfc_cross_cutting;
+mod test_policy_registry;

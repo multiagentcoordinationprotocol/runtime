@@ -39,6 +39,12 @@ pub enum MacpError {
     StorageFailed,
     #[error("InvalidSessionId")]
     InvalidSessionId,
+    #[error("UnknownPolicyVersion")]
+    UnknownPolicyVersion,
+    #[error("PolicyDenied")]
+    PolicyDenied,
+    #[error("InvalidPolicyDefinition")]
+    InvalidPolicyDefinition,
 }
 
 impl MacpError {
@@ -62,6 +68,9 @@ impl MacpError {
             MacpError::RateLimited => "RATE_LIMITED",
             MacpError::StorageFailed => "INTERNAL_ERROR",
             MacpError::InvalidSessionId => "INVALID_SESSION_ID",
+            MacpError::UnknownPolicyVersion => "UNKNOWN_POLICY_VERSION",
+            MacpError::PolicyDenied => "POLICY_DENIED",
+            MacpError::InvalidPolicyDefinition => "INVALID_POLICY_DEFINITION",
         }
     }
 }
@@ -93,6 +102,12 @@ mod tests {
             (MacpError::RateLimited, "RATE_LIMITED"),
             (MacpError::StorageFailed, "INTERNAL_ERROR"),
             (MacpError::InvalidSessionId, "INVALID_SESSION_ID"),
+            (MacpError::UnknownPolicyVersion, "UNKNOWN_POLICY_VERSION"),
+            (MacpError::PolicyDenied, "POLICY_DENIED"),
+            (
+                MacpError::InvalidPolicyDefinition,
+                "INVALID_POLICY_DEFINITION",
+            ),
         ];
 
         for (error, expected_code) in cases {
@@ -120,5 +135,10 @@ mod tests {
         assert_eq!(MacpError::RateLimited.to_string(), "RateLimited");
         assert_eq!(MacpError::StorageFailed.to_string(), "StorageFailed");
         assert_eq!(MacpError::InvalidSessionId.to_string(), "InvalidSessionId");
+        assert_eq!(
+            MacpError::UnknownPolicyVersion.to_string(),
+            "UnknownPolicyVersion"
+        );
+        assert_eq!(MacpError::PolicyDenied.to_string(), "PolicyDenied");
     }
 }

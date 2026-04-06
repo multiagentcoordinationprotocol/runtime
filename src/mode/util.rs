@@ -38,6 +38,58 @@ pub fn is_declared_participant(participants: &[String], sender: &str) -> bool {
     participants.iter().any(|participant| participant == sender)
 }
 
+/// Check whether the sender is authorized to commit per the policy's `commitment.authority` rule.
+///
+/// If no policy is bound, defaults to initiator-only. Per RFC-MACP-0012 Section 4,
+/// the `commitment` rule group controls who can emit a Commitment envelope.
+pub fn check_commitment_authority(session: &Session, sender: &str) -> Result<(), MacpError> {
+    if let Some(ref policy) = session.policy_definition {
+        let rules: crate::policy::rules::CommitmentRules = extract_commitment_rules(&policy.rules);
+        match rules.authority.as_str() {
+            "any_participant" => {
+                if sender == session.initiator_sender
+                    || is_declared_participant(&session.participants, sender)
+                {
+                    Ok(())
+                } else {
+                    Err(MacpError::Forbidden)
+                }
+            }
+            "designated_role" => {
+                if rules.designated_roles.iter().any(|r| r == sender) {
+                    Ok(())
+                } else {
+                    Err(MacpError::Forbidden)
+                }
+            }
+            _ => {
+                // "initiator_only" (default)
+                if sender == session.initiator_sender {
+                    Ok(())
+                } else {
+                    Err(MacpError::Forbidden)
+                }
+            }
+        }
+    } else {
+        // No policy bound — default to initiator-only
+        if sender == session.initiator_sender {
+            Ok(())
+        } else {
+            Err(MacpError::Forbidden)
+        }
+    }
+}
+
+/// Extract the `commitment` section from any mode's policy rules JSON.
+/// All RFC mode schemas include a `commitment` sub-object with `authority` and `designated_roles`.
+fn extract_commitment_rules(rules: &serde_json::Value) -> crate::policy::rules::CommitmentRules {
+    rules
+        .get("commitment")
+        .and_then(|c| serde_json::from_value(c.clone()).ok())
+        .unwrap_or_default()
+}
+
 pub fn participants_all_accept(
     participants: &[String],
     accepts: &std::collections::BTreeMap<String, String>,

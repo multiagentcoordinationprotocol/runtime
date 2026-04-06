@@ -1,5 +1,7 @@
 use crate::error::MacpError;
-use crate::mode::util::{is_declared_participant, validate_commitment_payload_for_session};
+use crate::mode::util::{
+    check_commitment_authority, is_declared_participant, validate_commitment_payload_for_session,
+};
 use crate::mode::{Mode, ModeResponse};
 use crate::pb::Envelope;
 use crate::session::Session;
@@ -101,8 +103,9 @@ impl TaskMode {
 impl Mode for TaskMode {
     fn authorize_sender(&self, session: &Session, env: &Envelope) -> Result<(), MacpError> {
         match env.message_type.as_str() {
-            "TaskRequest" | "Commitment" if env.sender == session.initiator_sender => Ok(()),
-            "TaskRequest" | "Commitment" => Err(MacpError::Forbidden),
+            "TaskRequest" if env.sender == session.initiator_sender => Ok(()),
+            "TaskRequest" => Err(MacpError::Forbidden),
+            "Commitment" => check_commitment_authority(session, &env.sender),
             _ if is_declared_participant(&session.participants, &env.sender) => Ok(()),
             _ => Err(MacpError::Forbidden),
         }
@@ -168,6 +171,20 @@ impl Mode for TaskMode {
                 Self::ensure_task_matches(&payload.task_id, &task.task_id)?;
                 if state.active_assignee.is_some() {
                     return Err(MacpError::InvalidPayload);
+                }
+                // RFC-MACP-0012: check allow_reassignment_on_reject if prior rejections exist
+                if !state.rejections.is_empty() {
+                    let allow = session.policy_definition.as_ref().is_some_and(|p| {
+                        serde_json::from_value::<crate::policy::rules::TaskPolicyRules>(
+                            p.rules.clone(),
+                        )
+                        .unwrap_or_default()
+                        .assignment
+                        .allow_reassignment_on_reject
+                    });
+                    if !allow {
+                        return Err(MacpError::PolicyDenied);
+                    }
                 }
                 if !payload.assignee.is_empty() && payload.assignee != env.sender {
                     return Err(MacpError::InvalidPayload);
@@ -266,12 +283,27 @@ impl Mode for TaskMode {
                 Ok(ModeResponse::PersistState(Self::encode_state(&state)))
             }
             "Commitment" => {
-                if env.sender != session.initiator_sender {
-                    return Err(MacpError::Forbidden);
-                }
                 validate_commitment_payload_for_session(session, &env.payload)?;
                 if state.terminal_report.is_none() {
                     return Err(MacpError::InvalidPayload);
+                }
+                // Evaluate governance policy if one is bound to the session.
+                if let Some(ref policy) = session.policy_definition {
+                    let has_output = matches!(
+                        &state.terminal_report,
+                        Some(TaskTerminalReport::Complete(record)) if !record.output.is_empty()
+                    );
+                    let decision =
+                        crate::policy::evaluator::evaluate_task_commitment(policy, has_output);
+                    if let crate::policy::PolicyDecision::Deny { reasons } = decision {
+                        tracing::warn!(
+                            session_id = %session.session_id,
+                            policy_id = %policy.policy_id,
+                            reasons = ?reasons,
+                            "policy denied commitment"
+                        );
+                        return Err(MacpError::PolicyDenied);
+                    }
                 }
                 Ok(ModeResponse::PersistAndResolve {
                     state: Self::encode_state(&state),
@@ -311,6 +343,7 @@ mod tests {
             initiator_sender: "planner".into(),
             participant_message_counts: std::collections::HashMap::new(),
             participant_last_seen: std::collections::HashMap::new(),
+            policy_definition: None,
         }
     }
 
@@ -906,9 +939,8 @@ mod tests {
             )
             .unwrap();
         apply(&mut session, result);
-        let err = mode
-            .on_message(&session, &env("worker", "Commitment", commitment_payload()))
-            .unwrap_err();
+        let commit_env = env("worker", "Commitment", commitment_payload());
+        let err = mode.authorize_sender(&session, &commit_env).unwrap_err();
         assert_eq!(err.to_string(), "Forbidden");
     }
 
@@ -1092,5 +1124,99 @@ mod tests {
             .on_message(&session, &env("worker", "CustomType", vec![]))
             .unwrap_err();
         assert_eq!(err.to_string(), "InvalidPayload");
+    }
+
+    // --- Policy ---
+
+    #[test]
+    fn policy_allows_commitment_when_output_present() {
+        let mode = TaskMode;
+        let mut session = base_session();
+        session.policy_definition = Some(crate::policy::PolicyDefinition {
+            policy_id: "test-strict".into(),
+            mode: "macp.mode.task.v1".into(),
+            description: "strict".into(),
+            rules: serde_json::json!({ "completion": { "require_output": true } }),
+            schema_version: 1,
+        });
+        let result = mode
+            .on_session_start(&session, &env("planner", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("planner", "TaskRequest", make_task_request("t1", "worker")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("worker", "TaskAccept", make_task_accept("t1", "worker")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("worker", "TaskComplete", make_task_complete("t1", "worker")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        // Commitment should succeed: output is required and task completion has output
+        let result = mode
+            .on_message(
+                &session,
+                &env("planner", "Commitment", commitment_payload()),
+            )
+            .unwrap();
+        assert!(matches!(result, ModeResponse::PersistAndResolve { .. }));
+    }
+
+    #[test]
+    fn policy_with_no_output_requirement_allows_commitment() {
+        let mode = TaskMode;
+        let mut session = base_session();
+        session.policy_definition = Some(crate::policy::PolicyDefinition {
+            policy_id: "test-permissive".into(),
+            mode: "macp.mode.task.v1".into(),
+            description: "permissive".into(),
+            rules: serde_json::json!({ "completion": { "require_output": false } }),
+            schema_version: 1,
+        });
+        let result = mode
+            .on_session_start(&session, &env("planner", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("planner", "TaskRequest", make_task_request("t1", "worker")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("worker", "TaskAccept", make_task_accept("t1", "worker")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("worker", "TaskComplete", make_task_complete("t1", "worker")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        // Commitment should succeed: require_output is false
+        let result = mode
+            .on_message(
+                &session,
+                &env("planner", "Commitment", commitment_payload()),
+            )
+            .unwrap();
+        assert!(matches!(result, ModeResponse::PersistAndResolve { .. }));
     }
 }

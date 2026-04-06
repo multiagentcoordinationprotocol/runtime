@@ -1,5 +1,7 @@
 use crate::error::MacpError;
-use crate::mode::util::{is_declared_participant, validate_commitment_payload_for_session};
+use crate::mode::util::{
+    check_commitment_authority, is_declared_participant, validate_commitment_payload_for_session,
+};
 use crate::mode::{Mode, ModeResponse};
 use crate::pb::Envelope;
 use crate::quorum_pb::{AbstainPayload, ApprovalRequestPayload, ApprovePayload, RejectPayload};
@@ -72,8 +74,9 @@ impl QuorumMode {
 impl Mode for QuorumMode {
     fn authorize_sender(&self, session: &Session, env: &Envelope) -> Result<(), MacpError> {
         match env.message_type.as_str() {
-            "ApprovalRequest" | "Commitment" if env.sender == session.initiator_sender => Ok(()),
-            "ApprovalRequest" | "Commitment" => Err(MacpError::Forbidden),
+            "ApprovalRequest" if env.sender == session.initiator_sender => Ok(()),
+            "ApprovalRequest" => Err(MacpError::Forbidden),
+            "Commitment" => check_commitment_authority(session, &env.sender),
             _ if is_declared_participant(&session.participants, &env.sender) => Ok(()),
             _ => Err(MacpError::Forbidden),
         }
@@ -184,12 +187,43 @@ impl Mode for QuorumMode {
                 Ok(ModeResponse::PersistState(Self::encode_state(&state)))
             }
             "Commitment" => {
-                if env.sender != session.initiator_sender {
-                    return Err(MacpError::Forbidden);
-                }
                 validate_commitment_payload_for_session(session, &env.payload)?;
                 if !Self::commitment_ready(session, &state) {
                     return Err(MacpError::InvalidPayload);
+                }
+                // Evaluate governance policy if one is bound to the session.
+                if let Some(ref policy) = session.policy_definition {
+                    let approve_count = state
+                        .ballots
+                        .values()
+                        .filter(|b| b.choice == BallotChoice::Approve)
+                        .count();
+                    let reject_count = state
+                        .ballots
+                        .values()
+                        .filter(|b| b.choice == BallotChoice::Reject)
+                        .count();
+                    let abstain_count = state
+                        .ballots
+                        .values()
+                        .filter(|b| b.choice == BallotChoice::Abstain)
+                        .count();
+                    let decision = crate::policy::evaluator::evaluate_quorum_commitment(
+                        policy,
+                        approve_count,
+                        reject_count,
+                        abstain_count,
+                        session.participants.len(),
+                    );
+                    if let crate::policy::PolicyDecision::Deny { reasons } = decision {
+                        tracing::warn!(
+                            session_id = %session.session_id,
+                            policy_id = %policy.policy_id,
+                            reasons = ?reasons,
+                            "policy denied commitment"
+                        );
+                        return Err(MacpError::PolicyDenied);
+                    }
                 }
                 Ok(ModeResponse::PersistAndResolve {
                     state: Self::encode_state(&state),
@@ -229,6 +263,7 @@ mod tests {
             initiator_sender: "coordinator".into(),
             participant_message_counts: std::collections::HashMap::new(),
             participant_last_seen: std::collections::HashMap::new(),
+            policy_definition: None,
         }
     }
 
@@ -778,9 +813,8 @@ mod tests {
             .on_message(&session, &env("bob", "Approve", make_approve("r1", "yes")))
             .unwrap();
         apply(&mut session, result);
-        let err = mode
-            .on_message(&session, &env("alice", "Commitment", commitment_payload()))
-            .unwrap_err();
+        let commit_env = env("alice", "Commitment", commitment_payload());
+        let err = mode.authorize_sender(&session, &commit_env).unwrap_err();
         assert_eq!(err.to_string(), "Forbidden");
     }
 
@@ -926,5 +960,66 @@ mod tests {
             .on_message(&session, &env("alice", "CustomType", vec![]))
             .unwrap_err();
         assert_eq!(err.to_string(), "InvalidPayload");
+    }
+
+    // --- Policy ---
+
+    #[test]
+    fn policy_denies_commitment_when_quorum_not_met_due_to_abstentions() {
+        let mode = QuorumMode;
+        let mut session = base_session();
+        // Require all 3 participants as voters, but abstentions don't count toward quorum
+        session.policy_definition = Some(crate::policy::PolicyDefinition {
+            policy_id: "test-strict-quorum".into(),
+            mode: "macp.mode.quorum.v1".into(),
+            description: "strict quorum".into(),
+            rules: serde_json::json!({
+                "threshold": { "type": "n_of_m", "value": 3 },
+                "abstention": { "counts_toward_quorum": false, "interpretation": "neutral" }
+            }),
+            schema_version: 1,
+        });
+        let result = mode
+            .on_session_start(&session, &env("coordinator", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env(
+                    "coordinator",
+                    "ApprovalRequest",
+                    make_approval_request("r1", 2),
+                ),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("alice", "Approve", make_approve("r1", "yes")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(&session, &env("bob", "Approve", make_approve("r1", "yes")))
+            .unwrap();
+        apply(&mut session, result);
+        // carol abstains — with counts_toward_quorum=false, effective voters = 2 < 3
+        let result = mode
+            .on_message(
+                &session,
+                &env("carol", "Abstain", make_abstain("r1", "no opinion")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        // Commitment should be denied (quorum not met: 2 effective voters < 3 required)
+        let err = mode
+            .on_message(
+                &session,
+                &env("coordinator", "Commitment", commitment_payload()),
+            )
+            .unwrap_err();
+        assert_eq!(err.to_string(), "PolicyDenied");
     }
 }

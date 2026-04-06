@@ -1,6 +1,8 @@
 use crate::decision_pb::{EvaluationPayload, ObjectionPayload, ProposalPayload, VotePayload};
 use crate::error::MacpError;
-use crate::mode::util::{is_declared_participant, validate_commitment_payload_for_session};
+use crate::mode::util::{
+    check_commitment_authority, is_declared_participant, validate_commitment_payload_for_session,
+};
 use crate::mode::{Mode, ModeResponse};
 use crate::pb::Envelope;
 use crate::session::Session;
@@ -137,13 +139,13 @@ impl Mode for DecisionMode {
     /// `Commitment`.
     fn authorize_sender(&self, session: &Session, env: &Envelope) -> Result<(), MacpError> {
         match env.message_type.as_str() {
-            "Proposal" | "Commitment" if env.sender == session.initiator_sender => Ok(()),
+            "Proposal" if env.sender == session.initiator_sender => Ok(()),
+            "Commitment" => check_commitment_authority(session, &env.sender),
             "Proposal" | "Evaluation" | "Objection" | "Vote"
                 if is_declared_participant(&session.participants, &env.sender) =>
             {
                 Ok(())
             }
-            "Commitment" => Err(MacpError::Forbidden),
             _ => Err(MacpError::Forbidden),
         }
     }
@@ -250,6 +252,23 @@ impl Mode for DecisionMode {
                 if !Self::commitment_ready(&state) {
                     return Err(MacpError::InvalidPayload);
                 }
+                // Evaluate governance policy if one is bound to the session.
+                if let Some(ref policy) = session.policy_definition {
+                    let decision = crate::policy::evaluator::evaluate_decision_commitment(
+                        policy,
+                        &state,
+                        &session.participants,
+                    );
+                    if let crate::policy::PolicyDecision::Deny { reasons } = decision {
+                        tracing::warn!(
+                            session_id = %session.session_id,
+                            policy_id = %policy.policy_id,
+                            reasons = ?reasons,
+                            "policy denied commitment"
+                        );
+                        return Err(MacpError::PolicyDenied);
+                    }
+                }
                 state.phase = DecisionPhase::Committed;
                 Ok(ModeResponse::PersistAndResolve {
                     state: Self::encode_state(&state),
@@ -289,6 +308,7 @@ mod tests {
             initiator_sender: "agent://orchestrator".into(),
             participant_message_counts: std::collections::HashMap::new(),
             participant_last_seen: std::collections::HashMap::new(),
+            policy_definition: None,
         }
     }
 
@@ -810,5 +830,50 @@ mod tests {
         bad = commitment(&session);
         mode.on_message(&session, &env("agent://orchestrator", "Commitment", bad))
             .unwrap();
+    }
+
+    #[test]
+    fn policy_denies_commitment_when_vote_threshold_not_met() {
+        let mode = DecisionMode;
+        let mut session = test_session();
+        session.policy_definition = Some(crate::policy::PolicyDefinition {
+            policy_id: "test-strict".into(),
+            mode: "macp.mode.decision.v1".into(),
+            description: "strict".into(),
+            rules: serde_json::json!({
+                "voting": { "algorithm": "unanimous" }
+            }),
+            schema_version: 1,
+        });
+        let resp = mode
+            .on_session_start(
+                &session,
+                &env("agent://orchestrator", "SessionStart", vec![]),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://orchestrator", "Proposal", proposal("p1")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        // Only one of the participants votes approve
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://fraud", "Vote", vote("p1", "approve")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        // Commitment should be denied by policy (unanimous requires all participants)
+        let err = mode
+            .on_message(
+                &session,
+                &env("agent://orchestrator", "Commitment", commitment(&session)),
+            )
+            .unwrap_err();
+        assert_eq!(err.to_string(), "PolicyDenied");
     }
 }

@@ -27,6 +27,7 @@ pub mod log_store;
 pub mod metrics;
 pub mod mode;
 pub mod mode_registry;
+pub mod policy;
 pub mod registry;
 pub mod replay;
 pub mod runtime;

@@ -110,7 +110,7 @@ fn replay_decision_session() {
         ),
     ];
 
-    let session = replay_session("s1", &entries, &registry).unwrap();
+    let session = replay_session("s1", &entries, &registry, None).unwrap();
     assert_eq!(session.state, SessionState::Resolved);
     assert!(session.resolution.is_some());
     assert_eq!(session.seen_message_ids.len(), 4);
@@ -184,7 +184,7 @@ fn replay_proposal_session() {
         ),
     ];
 
-    let session = replay_session("s1", &entries, &registry).unwrap();
+    let session = replay_session("s1", &entries, &registry, None).unwrap();
     assert_eq!(session.state, SessionState::Resolved);
     assert!(session.resolution.is_some());
     assert_eq!(session.seen_message_ids.len(), 5);
@@ -259,7 +259,7 @@ fn replay_task_session() {
         ),
     ];
 
-    let session = replay_session("s1", &entries, &registry).unwrap();
+    let session = replay_session("s1", &entries, &registry, None).unwrap();
     assert_eq!(session.state, SessionState::Resolved);
     assert!(session.resolution.is_some());
 }
@@ -317,7 +317,7 @@ fn replay_handoff_session() {
         ),
     ];
 
-    let session = replay_session("s1", &entries, &registry).unwrap();
+    let session = replay_session("s1", &entries, &registry, None).unwrap();
     assert_eq!(session.state, SessionState::Resolved);
     assert!(session.resolution.is_some());
 }
@@ -387,7 +387,7 @@ fn replay_quorum_session() {
         ),
     ];
 
-    let session = replay_session("s1", &entries, &registry).unwrap();
+    let session = replay_session("s1", &entries, &registry, None).unwrap();
     assert_eq!(session.state, SessionState::Resolved);
     assert!(session.resolution.is_some());
     assert_eq!(session.seen_message_ids.len(), 5);
@@ -433,7 +433,7 @@ fn replay_multi_round_session() {
         ),
     ];
 
-    let session = replay_session("s1", &entries, &registry).unwrap();
+    let session = replay_session("s1", &entries, &registry, None).unwrap();
     assert_eq!(session.state, SessionState::Resolved);
     assert!(session.resolution.is_some());
     assert_eq!(session.seen_message_ids.len(), 4);

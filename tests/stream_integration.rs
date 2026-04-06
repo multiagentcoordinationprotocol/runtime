@@ -23,7 +23,7 @@ fn session_start(participants: Vec<String>) -> Vec<u8> {
         participants,
         mode_version: "1.0.0".into(),
         configuration_version: "cfg-1".into(),
-        policy_version: "policy-1".into(),
+        policy_version: String::new(),
         ttl_ms: 60_000,
         context: vec![],
         roots: vec![],

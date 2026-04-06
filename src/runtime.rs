@@ -6,6 +6,8 @@ use crate::log_store::{EntryKind, LogEntry, LogStore};
 use crate::metrics::RuntimeMetrics;
 use crate::mode_registry::ModeRegistry;
 use crate::pb::{Envelope, ModeDescriptor};
+use crate::policy::registry::PolicyRegistry;
+use crate::policy::PolicyDefinition;
 use crate::registry::SessionRegistry;
 use crate::session::{
     extract_ttl_ms, parse_session_start_payload, validate_canonical_session_start_payload,
@@ -27,6 +29,7 @@ pub struct Runtime {
     stream_bus: Arc<SessionStreamBus>,
     signal_bus: tokio::sync::broadcast::Sender<Envelope>,
     mode_registry: Arc<ModeRegistry>,
+    policy_registry: Arc<PolicyRegistry>,
     metrics: Arc<RuntimeMetrics>,
     checkpoint_interval: usize,
 }
@@ -51,6 +54,22 @@ impl Runtime {
         log_store: Arc<LogStore>,
         mode_registry: Arc<ModeRegistry>,
     ) -> Self {
+        Self::with_registries(
+            storage,
+            registry,
+            log_store,
+            mode_registry,
+            Arc::new(PolicyRegistry::new()),
+        )
+    }
+
+    pub fn with_registries(
+        storage: Arc<dyn StorageBackend>,
+        registry: Arc<SessionRegistry>,
+        log_store: Arc<LogStore>,
+        mode_registry: Arc<ModeRegistry>,
+        policy_registry: Arc<PolicyRegistry>,
+    ) -> Self {
         let checkpoint_interval = std::env::var("MACP_CHECKPOINT_INTERVAL")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -63,6 +82,7 @@ impl Runtime {
             stream_bus: Arc::new(SessionStreamBus::default()),
             signal_bus: signal_tx,
             mode_registry,
+            policy_registry,
             metrics: Arc::new(RuntimeMetrics::new()),
             checkpoint_interval,
         }
@@ -102,6 +122,32 @@ impl Runtime {
 
     pub fn mode_registry(&self) -> &Arc<ModeRegistry> {
         &self.mode_registry
+    }
+
+    // ── Policy registry delegation ──────────────────────────────────
+
+    pub fn register_policy(&self, definition: PolicyDefinition) -> Result<(), String> {
+        self.policy_registry.register(definition)
+    }
+
+    pub fn unregister_policy(&self, policy_id: &str) -> Result<(), String> {
+        self.policy_registry.unregister(policy_id)
+    }
+
+    pub fn get_policy(&self, policy_id: &str) -> Option<PolicyDefinition> {
+        self.policy_registry.get(policy_id)
+    }
+
+    pub fn list_policies(&self, mode_filter: Option<&str>) -> Vec<PolicyDefinition> {
+        self.policy_registry.list(mode_filter)
+    }
+
+    pub fn subscribe_policy_changes(&self) -> tokio::sync::broadcast::Receiver<()> {
+        self.policy_registry.subscribe_changes()
+    }
+
+    pub fn policy_registry(&self) -> &Arc<PolicyRegistry> {
+        &self.policy_registry
     }
 
     pub fn metrics(&self) -> &Arc<RuntimeMetrics> {
@@ -252,6 +298,24 @@ impl Runtime {
             }
         }
 
+        // Resolve the governance policy for this session (if policy_version is bound).
+        let policy_definition = if start_payload.policy_version.is_empty() {
+            None
+        } else {
+            match self.policy_registry.resolve(&start_payload.policy_version) {
+                Ok(policy) => {
+                    // RFC 6.1: reject if policy mode doesn't match session mode
+                    if policy.mode != "*" && policy.mode != mode_name {
+                        return Err(MacpError::InvalidPolicyDefinition);
+                    }
+                    Some(policy)
+                }
+                Err(_) => {
+                    return Err(MacpError::UnknownPolicyVersion);
+                }
+            }
+        };
+
         let accepted_at = Utc::now().timestamp_millis();
         let ttl_expiry = accepted_at.saturating_add(ttl_ms);
         let session = Session {
@@ -274,6 +338,7 @@ impl Runtime {
             initiator_sender: env.sender.clone(),
             participant_message_counts: std::collections::HashMap::new(),
             participant_last_seen: std::collections::HashMap::new(),
+            policy_definition,
         };
 
         let response = mode.on_session_start(&session, env)?;
@@ -555,7 +620,7 @@ mod tests {
             participants,
             mode_version: "1.0.0".into(),
             configuration_version: "cfg-1".into(),
-            policy_version: "policy-1".into(),
+            policy_version: String::new(),
             ttl_ms: 1_000,
             context: vec![],
             roots: vec![],
@@ -700,7 +765,7 @@ mod tests {
             participants: vec!["agent://fraud".into()],
             mode_version: "1.0.0".into(),
             configuration_version: "cfg-1".into(),
-            policy_version: "policy-1".into(),
+            policy_version: String::new(),
             ttl_ms: 1,
             context: vec![],
             roots: vec![],
@@ -864,7 +929,7 @@ mod tests {
             participants: vec!["agent://fraud".into()],
             mode_version: "1.0.0".into(),
             configuration_version: "cfg-1".into(),
-            policy_version: "policy-1".into(),
+            policy_version: String::new(),
             ttl_ms: 1,
             context: vec![],
             roots: vec![],
@@ -1004,7 +1069,7 @@ mod tests {
             authority_scope: "commercial".into(),
             reason: "bound".into(),
             mode_version: "1.0.0".into(),
-            policy_version: "policy-1".into(),
+            policy_version: String::new(),
             configuration_version: "cfg-1".into(),
         }
         .encode_to_vec();

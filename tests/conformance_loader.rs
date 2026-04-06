@@ -320,7 +320,7 @@ async fn assert_replay_equivalence(rt: &Runtime, sid: &str, live_session: &Sessi
         .get_log(sid)
         .await
         .unwrap_or_else(|| panic!("missing log entries for {sid}"));
-    let replayed = replay_session(sid, &log, rt.mode_registry().as_ref())
+    let replayed = replay_session(sid, &log, rt.mode_registry().as_ref(), None)
         .unwrap_or_else(|e| panic!("replay failed for {sid}: {e}"));
     assert_eq!(replayed.state, live_session.state, "replay state mismatch");
     assert_eq!(

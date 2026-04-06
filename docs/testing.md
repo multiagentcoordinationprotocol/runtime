@@ -129,3 +129,12 @@ Actions → "Integration Tests" → Run workflow → optionally check "Run Tier 
 ```
 
 Tier 3 E2E requires the `OPENAI_API_KEY` repository secret.
+
+## Policy tests
+
+Policy engine coverage spans multiple test layers:
+
+- **Unit tests** (`src/policy/`): ~80 tests covering evaluator algorithms (all 5 voting types, quorum, veto, evaluation requirements), registry CRUD, schema validation, default policy, and rule deserialization
+- **Mode unit tests** (`src/mode/*.rs`): Policy denial paths in all 5 standard modes — verify that governance policies block commitment when rules aren't satisfied
+- **Conformance tests**: JSON fixtures exercise mode lifecycles with policy_version binding
+- **Integration tests** (`integration_tests/`): gRPC round-trip tests for RegisterPolicy, GetPolicy, ListPolicies, UnregisterPolicy, WatchPolicies RPCs, plus end-to-end policy enforcement (register policy → start session → verify commitment blocked)

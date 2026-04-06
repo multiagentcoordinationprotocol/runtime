@@ -1,4 +1,6 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let proto_dir =
+        std::env::var("DEP_MACP_PROTO_PROTO_DIR").expect("macp-proto crate must set proto_dir");
     tonic_prost_build::configure()
         .build_server(true)
         .compile_protos(
@@ -11,7 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "macp/modes/handoff/v1/handoff.proto",
                 "macp/modes/quorum/v1/quorum.proto",
             ],
-            &["proto"],
+            &[&proto_dir],
         )?;
     Ok(())
 }

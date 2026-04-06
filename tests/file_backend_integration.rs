@@ -19,7 +19,7 @@ fn session_start(participants: Vec<String>) -> Vec<u8> {
         participants,
         mode_version: "1.0.0".into(),
         configuration_version: "cfg-1".into(),
-        policy_version: "policy-1".into(),
+        policy_version: String::new(),
         ttl_ms: 60_000,
         context: vec![],
         roots: vec![],
@@ -54,7 +54,7 @@ fn commitment(action: &str) -> Vec<u8> {
         authority_scope: "test".into(),
         reason: "done".into(),
         mode_version: "1.0.0".into(),
-        policy_version: "policy-1".into(),
+        policy_version: String::new(),
         configuration_version: "cfg-1".into(),
     }
     .encode_to_vec()
@@ -144,6 +144,7 @@ async fn file_backend_full_lifecycle() {
         &sid,
         &log,
         &macp_runtime::mode_registry::ModeRegistry::build_default(),
+        None,
     )
     .unwrap();
     assert_eq!(replayed.state, SessionState::Resolved);
@@ -203,7 +204,7 @@ async fn file_backend_crash_recovery_via_replay() {
     assert_eq!(log_entries.len(), 2);
 
     let mode_registry = ModeRegistry::build_default();
-    let session = replay_session(&sid, &log_entries, &mode_registry).unwrap();
+    let session = replay_session(&sid, &log_entries, &mode_registry, None).unwrap();
     assert_eq!(session.state, SessionState::Open);
     assert_eq!(session.seen_message_ids.len(), 2);
     assert!(session.seen_message_ids.contains("m1"));

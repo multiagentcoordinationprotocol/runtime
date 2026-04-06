@@ -1036,6 +1036,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "macp-proto"
+version = "0.1.0"
+
+[[package]]
 name = "macp-runtime"
 version = "0.4.0"
 dependencies = [
@@ -1043,6 +1047,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures-core",
+ "macp-proto",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
