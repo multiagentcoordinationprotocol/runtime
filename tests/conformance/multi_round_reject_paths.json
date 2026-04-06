@@ -17,8 +17,9 @@
         "authority_scope": "test",
         "reason": "done",
         "mode_version": "1.0.0",
-        "policy_version": "",
-        "configuration_version": "cfg-1"
+        "policy_version": "policy.default",
+        "configuration_version": "cfg-1",
+        "outcome_positive": true
       },
       "expect": "reject"
     },
@@ -46,8 +47,9 @@
         "authority_scope": "test",
         "reason": "done",
         "mode_version": "1.0.0",
-        "policy_version": "",
-        "configuration_version": "cfg-1"
+        "policy_version": "policy.default",
+        "configuration_version": "cfg-1",
+        "outcome_positive": true
       },
       "expect": "reject"
     }

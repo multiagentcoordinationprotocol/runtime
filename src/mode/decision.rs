@@ -132,14 +132,11 @@ impl DecisionMode {
 impl Mode for DecisionMode {
     /// Authorize the sender for decision mode messages.
     ///
-    /// Implements the coordinator authority model reflected in the Decision RFC:
-    /// the session initiator may emit `Proposal` and `Commitment` regardless of
-    /// declared participants. Declared participants may emit `Proposal`,
-    /// `Evaluation`, `Objection`, and `Vote`. Only the initiator may emit
-    /// `Commitment`.
+    /// Authority matrix (RFC-MACP-0004):
+    /// - Proposal, Evaluation, Objection, Vote → declared participant only
+    /// - Commitment → initiator or policy-delegated role
     fn authorize_sender(&self, session: &Session, env: &Envelope) -> Result<(), MacpError> {
         match env.message_type.as_str() {
-            "Proposal" if env.sender == session.initiator_sender => Ok(()),
             "Commitment" => check_commitment_authority(session, &env.sender),
             "Proposal" | "Evaluation" | "Objection" | "Vote"
                 if is_declared_participant(&session.participants, &env.sender) =>
@@ -198,6 +195,11 @@ impl Mode for DecisionMode {
             "Evaluation" => {
                 let payload = EvaluationPayload::decode(&*env.payload)
                     .map_err(|_| MacpError::InvalidPayload)?;
+                // RFC-MACP-0004: valid recommendation values
+                match payload.recommendation.to_uppercase().as_str() {
+                    "APPROVE" | "REVIEW" | "BLOCK" | "REJECT" => {}
+                    _ => return Err(MacpError::InvalidPayload),
+                }
                 Self::ensure_can_deliberate(&state)?;
                 Self::ensure_known_proposal(&state, &payload.proposal_id)?;
                 state.evaluations.push(Evaluation {
@@ -229,6 +231,11 @@ impl Mode for DecisionMode {
             "Vote" => {
                 let payload =
                     VotePayload::decode(&*env.payload).map_err(|_| MacpError::InvalidPayload)?;
+                // RFC-MACP-0004: valid vote values
+                match payload.vote.as_str() {
+                    "approve" | "reject" | "abstain" => {}
+                    _ => return Err(MacpError::InvalidPayload),
+                }
                 Self::ensure_can_vote(&state)?;
                 Self::ensure_known_proposal(&state, &payload.proposal_id)?;
                 let proposal_votes = state.votes.entry(payload.proposal_id.clone()).or_default();
@@ -297,7 +304,11 @@ mod tests {
             resolution: None,
             mode: "macp.mode.decision.v1".into(),
             mode_state: vec![],
-            participants: vec!["agent://fraud".into(), "agent://growth".into()],
+            participants: vec![
+                "agent://orchestrator".into(),
+                "agent://fraud".into(),
+                "agent://growth".into(),
+            ],
             seen_message_ids: HashSet::new(),
             intent: String::new(),
             mode_version: "1.0.0".into(),
@@ -347,7 +358,7 @@ mod tests {
     fn evaluation(proposal_id: &str) -> Vec<u8> {
         EvaluationPayload {
             proposal_id: proposal_id.into(),
-            recommendation: "proceed".into(),
+            recommendation: "APPROVE".into(),
             confidence: 0.9,
             reason: "good".into(),
         }
@@ -372,6 +383,7 @@ mod tests {
             mode_version: session.mode_version.clone(),
             policy_version: session.policy_version.clone(),
             configuration_version: session.configuration_version.clone(),
+            outcome_positive: true,
         }
         .encode_to_vec()
     }
@@ -405,14 +417,112 @@ mod tests {
     }
 
     #[test]
-    fn initiator_can_propose_without_being_declared_participant() {
+    fn initiator_not_in_participants_cannot_propose() {
         let mode = DecisionMode;
-        let session = test_session();
-        mode.authorize_sender(
+        let mut session = test_session();
+        session.participants.retain(|p| p != "agent://orchestrator");
+        let err = mode
+            .authorize_sender(
+                &session,
+                &env("agent://orchestrator", "Proposal", proposal("p1")),
+            )
+            .unwrap_err();
+        assert_eq!(err.to_string(), "Forbidden");
+    }
+
+    #[test]
+    fn vote_with_invalid_value_rejected() {
+        let mode = DecisionMode;
+        let mut session = test_session();
+        session
+            .participants
+            .push("agent://orchestrator".to_string());
+        let resp = mode
+            .on_session_start(
+                &session,
+                &env("agent://orchestrator", "SessionStart", vec![]),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://orchestrator", "Proposal", proposal("p1")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        let bad_vote = VotePayload {
+            proposal_id: "p1".into(),
+            vote: "maybe".into(),
+            reason: String::new(),
+        }
+        .encode_to_vec();
+        let err = mode
+            .on_message(&session, &env("agent://fraud", "Vote", bad_vote))
+            .unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
+    }
+
+    #[test]
+    fn abstain_vote_accepted() {
+        let mode = DecisionMode;
+        let mut session = test_session();
+        session
+            .participants
+            .push("agent://orchestrator".to_string());
+        let resp = mode
+            .on_session_start(
+                &session,
+                &env("agent://orchestrator", "SessionStart", vec![]),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://orchestrator", "Proposal", proposal("p1")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        mode.on_message(
             &session,
-            &env("agent://orchestrator", "Proposal", proposal("p1")),
+            &env("agent://fraud", "Vote", vote("p1", "abstain")),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn evaluation_with_invalid_recommendation_rejected() {
+        let mode = DecisionMode;
+        let mut session = test_session();
+        session
+            .participants
+            .push("agent://orchestrator".to_string());
+        let resp = mode
+            .on_session_start(
+                &session,
+                &env("agent://orchestrator", "SessionStart", vec![]),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://orchestrator", "Proposal", proposal("p1")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        let bad_eval = EvaluationPayload {
+            proposal_id: "p1".into(),
+            recommendation: "meh".into(),
+            confidence: 0.5,
+            reason: "unclear".into(),
+        }
+        .encode_to_vec();
+        let err = mode
+            .on_message(&session, &env("agent://fraud", "Evaluation", bad_eval))
+            .unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
     }
 
     #[test]
@@ -814,6 +924,7 @@ mod tests {
             mode_version: "wrong".into(),
             policy_version: session.policy_version.clone(),
             configuration_version: session.configuration_version.clone(),
+            outcome_positive: true,
         }
         .encode_to_vec();
 

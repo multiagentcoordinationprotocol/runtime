@@ -113,7 +113,7 @@ async fn multi_round_happy_path() {
             &new_message_id(),
             &sid,
             agent_a,
-            commitment_payload("c1", "converged", "group", "all agreed"),
+            commitment_payload("c1", "converged", "group", "all agreed", true),
         ),
     )
     .await

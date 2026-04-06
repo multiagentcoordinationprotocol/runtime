@@ -2,8 +2,8 @@ use crate::common;
 use macp_integration_tests::helpers::*;
 use macp_integration_tests::macp_tools::{self, task::*};
 use rig::completion::Prompt;
-use rig::providers::openai;
 use rig::prelude::*;
+use rig::providers::openai;
 
 /// Realistic task delegation: planner (plain code) delegates to worker (LLM).
 ///
@@ -162,6 +162,7 @@ async fn real_llm_agents_delegate_task() {
                     "task-completed",
                     "planner",
                     "Data analyst delivered Q4 revenue analysis with regional breakdown",
+                    true,
                 ),
             ),
         )

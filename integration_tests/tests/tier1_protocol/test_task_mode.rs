@@ -103,7 +103,7 @@ async fn task_happy_path() {
             &new_message_id(),
             &sid,
             planner,
-            commitment_payload("c1", "task-completed", "planner", "worker delivered"),
+            commitment_payload("c1", "task-completed", "planner", "worker delivered", true),
         ),
     )
     .await

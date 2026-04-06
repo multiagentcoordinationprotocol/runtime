@@ -5,8 +5,8 @@
 use crate::common;
 use macp_integration_tests::helpers::*;
 use macp_runtime::pb::{
-    CommitmentPayload, Envelope, GetManifestRequest, InitializeRequest, SendRequest,
-    SignalPayload, WatchSignalsRequest,
+    CommitmentPayload, Envelope, GetManifestRequest, InitializeRequest, SendRequest, SignalPayload,
+    WatchSignalsRequest,
 };
 use prost::Message;
 use tonic::Request;
@@ -62,10 +62,10 @@ async fn signal_with_empty_session_and_mode_accepted() {
     let mid = new_message_id();
     let env = Envelope {
         macp_version: "1.0".into(),
-        mode: String::new(),          // empty — required for Signals
+        mode: String::new(), // empty — required for Signals
         message_type: "Signal".into(),
         message_id: mid.clone(),
-        session_id: String::new(),    // empty — required for Signals
+        session_id: String::new(), // empty — required for Signals
         sender: String::new(),
         timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
         payload: signal_payload.encode_to_vec(),
@@ -106,11 +106,18 @@ async fn signal_with_empty_session_and_mode_accepted() {
         .into_inner();
     let ack = resp.ack.expect("ack present");
 
-    let err_code = ack.error.as_ref().map(|e| e.code.as_str()).unwrap_or("(none)");
+    let err_code = ack
+        .error
+        .as_ref()
+        .map(|e| e.code.as_str())
+        .unwrap_or("(none)");
     eprintln!("   Runtime Response:");
     eprintln!("     ack.ok:            {}", ack.ok);
     eprintln!("     ack.duplicate:     {}", ack.duplicate);
-    eprintln!("     ack.session_state: {} (no session affected)", ack.session_state);
+    eprintln!(
+        "     ack.session_state: {} (no session affected)",
+        ack.session_state
+    );
     eprintln!("     ack.error:         {err_code}");
     eprintln!();
 
@@ -126,8 +133,14 @@ async fn signal_with_empty_session_and_mode_accepted() {
     eprintln!("   Session history was NOT modified. Session state unchanged.");
     eprintln!("─────────────────────────────────────────────────────────────");
 
-    assert!(ack.ok, "Signal with empty session_id and mode should be accepted");
-    assert_eq!(meta.state, 1, "Session should remain OPEN — Signal must not mutate state");
+    assert!(
+        ack.ok,
+        "Signal with empty session_id and mode should be accepted"
+    );
+    assert_eq!(
+        meta.state, 1,
+        "Session should remain OPEN — Signal must not mutate state"
+    );
 }
 
 #[tokio::test]
@@ -168,7 +181,11 @@ async fn signal_with_non_empty_session_rejected() {
         .into_inner();
     let ack = resp.ack.expect("ack present");
 
-    let err_code = ack.error.as_ref().map(|e| e.code.as_str()).unwrap_or("(none)");
+    let err_code = ack
+        .error
+        .as_ref()
+        .map(|e| e.code.as_str())
+        .unwrap_or("(none)");
     eprintln!("   Response:");
     eprintln!("     ack.ok:    {}", ack.ok);
     eprintln!("     ack.error: {err_code}");
@@ -217,7 +234,11 @@ async fn signal_with_non_empty_mode_rejected() {
         .into_inner();
     let ack = resp.ack.expect("ack present");
 
-    let err_code = ack.error.as_ref().map(|e| e.code.as_str()).unwrap_or("(none)");
+    let err_code = ack
+        .error
+        .as_ref()
+        .map(|e| e.code.as_str())
+        .unwrap_or("(none)");
     eprintln!("   Response:");
     eprintln!("     ack.ok:    {}", ack.ok);
     eprintln!("     ack.error: {err_code}");
@@ -249,7 +270,11 @@ async fn watch_signals_receives_broadcast_signal() {
             &new_message_id(),
             &sid,
             "agent://coordinator",
-            session_start_payload("signal demo", &["agent://coordinator", "agent://worker"], 30_000),
+            session_start_payload(
+                "signal demo",
+                &["agent://coordinator", "agent://worker"],
+                30_000,
+            ),
         ),
     )
     .await
@@ -305,14 +330,11 @@ async fn watch_signals_receives_broadcast_signal() {
     eprintln!("   Send RPC ack: ok={}", ack.ok);
 
     // Agent A receives the Signal on the WatchSignals stream
-    let received = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        signal_stream.message(),
-    )
-    .await
-    .expect("should not timeout")
-    .expect("stream should not error")
-    .expect("should receive a message");
+    let received = tokio::time::timeout(std::time::Duration::from_secs(5), signal_stream.message())
+        .await
+        .expect("should not timeout")
+        .expect("stream should not error")
+        .expect("should receive a message");
 
     let received_env = received.envelope.expect("envelope present");
     let received_payload =
@@ -321,15 +343,27 @@ async fn watch_signals_receives_broadcast_signal() {
     eprintln!();
     eprintln!("   Agent A received Signal on WatchSignals stream:");
     eprintln!("     sender:                  \"{}\"", received_env.sender);
-    eprintln!("     message_type:            \"{}\"", received_env.message_type);
-    eprintln!("     message_id:              \"{}\"", received_env.message_id);
+    eprintln!(
+        "     message_type:            \"{}\"",
+        received_env.message_type
+    );
+    eprintln!(
+        "     message_id:              \"{}\"",
+        received_env.message_id
+    );
     eprintln!("     SignalPayload:");
-    eprintln!("       signal_type:           \"{}\"", received_payload.signal_type);
+    eprintln!(
+        "       signal_type:           \"{}\"",
+        received_payload.signal_type
+    );
     eprintln!(
         "       data:                 \"{}\"",
         String::from_utf8_lossy(&received_payload.data)
     );
-    eprintln!("       confidence:            {}", received_payload.confidence);
+    eprintln!(
+        "       confidence:            {}",
+        received_payload.confidence
+    );
     eprintln!(
         "       correlation_session:  \"{}\"",
         received_payload.correlation_session_id
@@ -400,6 +434,7 @@ async fn commitment_with_wrong_mode_version_rejected() {
         mode_version: "2.0.0".into(), // WRONG — session bound "1.0.0"
         policy_version: POLICY_VERSION.into(),
         configuration_version: CONFIG_VERSION.into(),
+        outcome_positive: true,
     }
     .encode_to_vec();
 
@@ -469,6 +504,7 @@ async fn commitment_with_wrong_config_version_rejected() {
         mode_version: MODE_VERSION.into(),
         policy_version: POLICY_VERSION.into(),
         configuration_version: "wrong-config-version".into(), // WRONG
+        outcome_positive: true,
     }
     .encode_to_vec();
 
@@ -567,7 +603,10 @@ async fn rejected_message_does_not_consume_dedup_slot() {
     )
     .await
     .unwrap();
-    assert!(ack.ok, "Reused message_id from rejected message should be accepted");
+    assert!(
+        ack.ok,
+        "Reused message_id from rejected message should be accepted"
+    );
     assert!(!ack.duplicate, "Should NOT be flagged as duplicate");
 }
 
@@ -610,7 +649,10 @@ async fn duplicate_session_start_same_session_id_rejected() {
     )
     .await
     .unwrap();
-    assert!(!ack.ok, "Duplicate SessionStart for same session_id must be rejected");
+    assert!(
+        !ack.ok,
+        "Duplicate SessionStart for same session_id must be rejected"
+    );
 }
 
 // ── CancelSession Authorization (RFC-MACP-0001 §7.3) ───────────────────
@@ -669,7 +711,10 @@ async fn get_manifest_returns_all_modes_including_extensions() {
 
     let manifest = resp.manifest.expect("manifest present");
     assert!(!manifest.agent_id.is_empty(), "agent_id should be set");
-    assert!(!manifest.description.is_empty(), "description should be set");
+    assert!(
+        !manifest.description.is_empty(),
+        "description should be set"
+    );
 
     // Should include all 5 standard modes + extensions
     assert!(
@@ -677,8 +722,12 @@ async fn get_manifest_returns_all_modes_including_extensions() {
         "GetManifest should include standard + extension modes, got {}",
         manifest.supported_modes.len()
     );
-    assert!(manifest.supported_modes.contains(&"macp.mode.decision.v1".to_string()));
-    assert!(manifest.supported_modes.contains(&"ext.multi_round.v1".to_string()));
+    assert!(manifest
+        .supported_modes
+        .contains(&"macp.mode.decision.v1".to_string()));
+    assert!(manifest
+        .supported_modes
+        .contains(&"ext.multi_round.v1".to_string()));
 }
 
 #[tokio::test]
@@ -693,7 +742,10 @@ async fn initialize_rejects_unsupported_protocol_version() {
         })
         .await;
 
-    assert!(result.is_err(), "Initialize with unsupported version must fail");
+    assert!(
+        result.is_err(),
+        "Initialize with unsupported version must fail"
+    );
     let status = result.unwrap_err();
     assert_eq!(
         status.code(),

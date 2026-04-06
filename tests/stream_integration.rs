@@ -66,7 +66,7 @@ async fn stream_receives_accepted_envelopes() {
             "m1",
             &sid,
             "agent://orchestrator",
-            session_start(vec!["agent://a".into()]),
+            session_start(vec!["agent://orchestrator".into(), "agent://a".into()]),
         ),
         None,
     )
@@ -93,7 +93,7 @@ async fn stream_ordering_matches_processing_order() {
             "m1",
             &sid,
             "agent://orchestrator",
-            session_start(vec!["agent://a".into()]),
+            session_start(vec!["agent://orchestrator".into(), "agent://a".into()]),
         ),
         None,
     )
@@ -143,7 +143,7 @@ async fn concurrent_subscribers_both_receive_events() {
             "m1",
             &sid,
             "agent://orchestrator",
-            session_start(vec!["agent://a".into()]),
+            session_start(vec!["agent://orchestrator".into(), "agent://a".into()]),
         ),
         None,
     )

@@ -311,13 +311,17 @@ impl MacpServer {
                                 .await?;
                             while let Some(envelope) = Self::try_next_stream_event(&mut session_events)? {
                                 yield StreamSessionResponse {
-                                    envelope: Some(envelope),
+                                    response: Some(
+                                        macp_runtime::pb::stream_session_response::Response::Envelope(envelope),
+                                    ),
                                 };
                             }
                         }
                         StreamAction::EmitEnvelope(envelope) => {
                             yield StreamSessionResponse {
-                                envelope: Some(envelope),
+                                response: Some(
+                                    macp_runtime::pb::stream_session_response::Response::Envelope(envelope),
+                                ),
                             };
                         }
                         StreamAction::ClientError(status) => {
@@ -326,7 +330,9 @@ impl MacpServer {
                         StreamAction::ClientDone => {
                             while let Some(envelope) = Self::try_next_stream_event(&mut session_events)? {
                                 yield StreamSessionResponse {
-                                    envelope: Some(envelope),
+                                    response: Some(
+                                        macp_runtime::pb::stream_session_response::Response::Envelope(envelope),
+                                    ),
                                 };
                             }
                             break;
@@ -353,7 +359,9 @@ impl MacpServer {
                                 .await?;
                             while let Some(envelope) = Self::try_next_stream_event(&mut session_events)? {
                                 yield StreamSessionResponse {
-                                    envelope: Some(envelope),
+                                    response: Some(
+                                        macp_runtime::pb::stream_session_response::Response::Envelope(envelope),
+                                    ),
                                 };
                             }
                         }
@@ -375,6 +383,7 @@ impl MacpServer {
             MacpError::StorageFailed => Status::internal(err.to_string()),
             MacpError::InvalidSessionId => Status::invalid_argument(err.to_string()),
             MacpError::InvalidPolicyDefinition => Status::invalid_argument(err.to_string()),
+            MacpError::SessionAlreadyExists => Status::already_exists(err.to_string()),
             _ => Status::failed_precondition(err.to_string()),
         }
     }
@@ -510,6 +519,7 @@ impl MacpRuntimeService for MacpServer {
                 policy_version: session.policy_version.clone(),
                 participants: session.participants.clone(),
                 participant_activity,
+                initiator: session.initiator_sender.clone(),
             }),
         }))
     }
@@ -723,7 +733,7 @@ impl MacpRuntimeService for MacpServer {
             .map_err(Self::status_from_error)?;
         let req = request.into_inner();
         let descriptor = req
-            .descriptor
+            .mode_descriptor
             .ok_or_else(|| Status::invalid_argument("descriptor required"))?;
         match self.runtime.register_extension(descriptor) {
             Ok(()) => Ok(Response::new(RegisterExtModeResponse {
@@ -807,7 +817,7 @@ impl MacpRuntimeService for MacpServer {
             .map_err(Self::status_from_error)?;
         let req = request.into_inner();
         let descriptor = req
-            .descriptor
+            .policy_descriptor
             .ok_or_else(|| Status::invalid_argument("descriptor required"))?;
         let definition = Self::policy_descriptor_to_definition(&descriptor);
         match self.runtime.register_policy(definition) {
@@ -860,7 +870,7 @@ impl MacpRuntimeService for MacpServer {
             .get_policy(&req.policy_id)
             .ok_or_else(|| Status::not_found(format!("Policy '{}' not found", req.policy_id)))?;
         Ok(Response::new(GetPolicyResponse {
-            descriptor: Some(Self::policy_definition_to_descriptor(&policy)),
+            policy_descriptor: Some(Self::policy_definition_to_descriptor(&policy)),
         }))
     }
 
@@ -901,22 +911,22 @@ impl MacpRuntimeService for MacpServer {
             let policies = runtime.list_policies(None);
             let descriptors: Vec<PolicyDescriptor> = policies
                 .iter()
-                .map(|p| MacpServer::policy_definition_to_descriptor(p))
+                .map(MacpServer::policy_definition_to_descriptor)
                 .collect();
             yield WatchPoliciesResponse {
                 descriptors,
-                observed_at_unix_ms: chrono::Utc::now().timestamp_millis() as u64,
+                observed_at_unix_ms: chrono::Utc::now().timestamp_millis(),
             };
             // Wait for changes
             while rx.recv().await.is_ok() {
                 let policies = runtime.list_policies(None);
                 let descriptors: Vec<PolicyDescriptor> = policies
                     .iter()
-                    .map(|p| MacpServer::policy_definition_to_descriptor(p))
+                    .map(MacpServer::policy_definition_to_descriptor)
                     .collect();
                 yield WatchPoliciesResponse {
                     descriptors,
-                    observed_at_unix_ms: chrono::Utc::now().timestamp_millis() as u64,
+                    observed_at_unix_ms: chrono::Utc::now().timestamp_millis(),
                 };
             }
         };
@@ -953,7 +963,7 @@ impl MacpServer {
             description: definition.description.clone(),
             rules: serde_json::to_vec(&definition.rules).unwrap_or_default(),
             schema_version: definition.schema_version,
-            registered_at: String::new(),
+            registered_at_unix_ms: 0,
         }
     }
 }
@@ -1095,7 +1105,7 @@ mod tests {
         let server = MacpServer::new(runtime, security);
 
         let req = Request::new(RegisterExtModeRequest {
-            descriptor: Some(macp_runtime::pb::ModeDescriptor {
+            mode_descriptor: Some(macp_runtime::pb::ModeDescriptor {
                 mode: "ext.custom.v1".into(),
                 mode_version: "1.0.0".into(),
                 message_types: vec!["SessionStart".into(), "Commitment".into()],
@@ -1139,7 +1149,10 @@ mod tests {
             server.build_stream_session_stream(stream_identity("agent://orchestrator"), requests);
 
         let response = stream.next().await.unwrap().unwrap();
-        let envelope = response.envelope.unwrap();
+        let envelope = match response.response.unwrap() {
+            macp_runtime::pb::stream_session_response::Response::Envelope(e) => e,
+            _ => panic!("expected envelope"),
+        };
         assert_eq!(envelope.message_type, "SessionStart");
         assert_eq!(envelope.message_id, "m1");
         assert!(stream.next().await.is_none());
@@ -1183,7 +1196,11 @@ mod tests {
             server.build_stream_session_stream(stream_identity("agent://orchestrator"), requests);
 
         let first = stream.next().await.unwrap().unwrap();
-        assert_eq!(first.envelope.unwrap().session_id, sid1);
+        let first_env = match first.response.unwrap() {
+            macp_runtime::pb::stream_session_response::Response::Envelope(e) => e,
+            _ => panic!("expected envelope"),
+        };
+        assert_eq!(first_env.session_id, sid1);
         let err = stream.next().await.unwrap().unwrap_err();
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     }

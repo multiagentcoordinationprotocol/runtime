@@ -53,8 +53,9 @@
         "authority_scope": "test",
         "reason": "done",
         "mode_version": "1.0.0",
-        "policy_version": "",
-        "configuration_version": "cfg-1"
+        "policy_version": "policy.default",
+        "configuration_version": "cfg-1",
+        "outcome_positive": true
       },
       "expect": "accept"
     }
@@ -64,7 +65,8 @@
   "expected_resolution": {
     "action": "proposal.accepted",
     "mode_version": "1.0.0",
-    "configuration_version": "cfg-1"
+    "configuration_version": "cfg-1",
+    "outcome_positive": true
   },
   "expected_mode_state": {
     "phase": "Committed",

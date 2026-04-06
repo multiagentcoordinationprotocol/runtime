@@ -103,7 +103,7 @@ async fn proposal_happy_path() {
             &new_message_id(),
             &sid,
             buyer,
-            commitment_payload("c1", "accept-counter", "negotiation", "both accepted"),
+            commitment_payload("c1", "accept-counter", "negotiation", "both accepted", true),
         ),
     )
     .await

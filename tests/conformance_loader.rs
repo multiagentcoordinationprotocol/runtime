@@ -74,6 +74,7 @@ fn encode_payload(fixture: &ConformanceFixture, msg: &ConformanceMessage) -> Vec
                     .as_str()
                     .unwrap_or_default()
                     .into(),
+                outcome_positive: p["outcome_positive"].as_bool().unwrap_or(true),
             }
             .encode_to_vec()
         }
@@ -280,6 +281,7 @@ fn resolution_to_json(resolution: &[u8]) -> Option<Value> {
                 "mode_version": commitment.mode_version,
                 "policy_version": commitment.policy_version,
                 "configuration_version": commitment.configuration_version,
+                "outcome_positive": commitment.outcome_positive,
             })
         })
 }

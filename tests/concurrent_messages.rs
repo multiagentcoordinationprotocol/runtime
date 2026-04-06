@@ -129,7 +129,7 @@ async fn concurrent_duplicate_messages_handled() {
             "m0",
             &sid,
             "agent://orchestrator",
-            session_start(vec!["agent://a".into()]),
+            session_start(vec!["agent://orchestrator".into(), "agent://a".into()]),
         ),
         None,
     )

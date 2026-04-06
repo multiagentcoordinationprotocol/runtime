@@ -31,7 +31,34 @@ pub fn validate_commitment_payload_for_session(
         return Err(MacpError::InvalidPayload);
     }
 
+    // Validate outcome_positive consistency with action (RFC-0001 §7.3)
+    validate_outcome_positive(&commitment)?;
+
     Ok(commitment)
+}
+
+/// Validate that `outcome_positive` is consistent with the `action` field.
+/// Actions ending in `rejected`, `failed`, or `declined` must have `outcome_positive = false`.
+/// Actions ending in `selected`, `accepted`, `completed`, or `approved` must have `outcome_positive = true`.
+fn validate_outcome_positive(commitment: &CommitmentPayload) -> Result<(), MacpError> {
+    let action = commitment.action.as_str();
+    let negative_actions = ["rejected", "failed", "declined"];
+    let positive_actions = ["selected", "accepted", "completed", "approved"];
+
+    let is_negative = negative_actions
+        .iter()
+        .any(|suffix| action.ends_with(suffix));
+    let is_positive = positive_actions
+        .iter()
+        .any(|suffix| action.ends_with(suffix));
+
+    if is_negative && commitment.outcome_positive {
+        return Err(MacpError::InvalidPayload);
+    }
+    if is_positive && !commitment.outcome_positive {
+        return Err(MacpError::InvalidPayload);
+    }
+    Ok(())
 }
 
 pub fn is_declared_participant(participants: &[String], sender: &str) -> bool {

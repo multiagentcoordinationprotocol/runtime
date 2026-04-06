@@ -127,9 +127,17 @@ Components:
 Policy lifecycle:
 
 1. Registered via `RegisterPolicy` RPC or pre-loaded at startup
-2. Resolved at `SessionStart` — bound to session as `policy_definition`
-3. Evaluated at `Commitment` — mode-specific evaluator checks rules against session state
+2. Resolved at `SessionStart` — bound to session as `policy_definition`. Sessions always bind `policy_version` (defaults to `"policy.default"` when empty).
+3. Evaluated at `Commitment` — mode-specific evaluator checks rules against session state. `CommitmentPayload.outcome_positive` must be consistent with the `action` field.
 4. Persisted with session — replay uses stored definition, never re-resolves
+
+Registration validates conditional constraints: `weighted` algorithm requires non-empty `weights`, `supermajority` requires `threshold > 0.5`, `designated_role` authority requires non-empty `designated_roles`.
+
+## Key protocol fields
+
+- `CommitmentPayload.outcome_positive` (bool) — indicates whether the commitment outcome is positive or negative. Must match the action suffix (e.g. `*.rejected` → `false`, `*.selected` → `true`).
+- `SessionMetadata.initiator` (string) — the authenticated sender who created the session. Populated in `GetSession` responses.
+- `SessionAlreadyExists` error — returned when a `SessionStart` is received for a `session_id` that already has an accepted `SessionStart` (maps to gRPC `ALREADY_EXISTS`).
 
 ## Architecture diagram
 

@@ -140,6 +140,7 @@ mod tests {
             mode_version: "1.0.0".into(),
             policy_version: String::new(),
             configuration_version: "cfg-1".into(),
+            outcome_positive: true,
         }
         .encode_to_vec();
         let env = make_env("alice", "Commitment", payload);

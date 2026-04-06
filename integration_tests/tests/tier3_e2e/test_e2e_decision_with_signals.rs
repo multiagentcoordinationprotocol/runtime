@@ -1,13 +1,11 @@
 use crate::common;
 use macp_integration_tests::helpers::*;
 use macp_integration_tests::macp_tools::{self, decision::*};
-use macp_runtime::pb::{
-    Envelope, SendRequest, SignalPayload, WatchSignalsRequest,
-};
+use macp_runtime::pb::{Envelope, SendRequest, SignalPayload, WatchSignalsRequest};
 use prost::Message;
 use rig::completion::Prompt;
-use rig::providers::openai;
 use rig::prelude::*;
+use rig::providers::openai;
 use tonic::Request;
 
 fn with_sender<T>(sender: &str, inner: T) -> Request<T> {
@@ -47,7 +45,12 @@ async fn send_signal(
         payload: payload.encode_to_vec(),
     };
     let resp = client
-        .send(with_sender(sender_id, SendRequest { envelope: Some(env) }))
+        .send(with_sender(
+            sender_id,
+            SendRequest {
+                envelope: Some(env),
+            },
+        ))
         .await
         .unwrap()
         .into_inner();
@@ -97,7 +100,10 @@ async fn decision_with_signals_full_flow() {
     // Orchestrator subscribes to WatchSignals BEFORE session starts
     // ═══════════════════════════════════════════════════════════════════
     eprintln!("── Orchestrator subscribes to WatchSignals stream ───────────");
-    let mut signal_watcher = macp_runtime::pb::macp_runtime_service_client::MacpRuntimeServiceClient::connect(ep.to_string())
+    let mut signal_watcher =
+        macp_runtime::pb::macp_runtime_service_client::MacpRuntimeServiceClient::connect(
+            ep.to_string(),
+        )
         .await
         .unwrap();
     let mut signal_stream = signal_watcher
@@ -114,25 +120,45 @@ async fn decision_with_signals_full_flow() {
     eprintln!("   (Coordination Plane — these enter session history)");
     {
         let mut client = orch_client.lock().await;
-        let ack = send_as(&mut client, orch_id, envelope(
-            MODE_DECISION, "SessionStart", &new_message_id(), &sid, orch_id,
-            session_start_payload(
-                "Review suspicious $4,800 wire transfer",
-                &[fraud_id, growth_id, compliance_id],
-                60_000,
+        let ack = send_as(
+            &mut client,
+            orch_id,
+            envelope(
+                MODE_DECISION,
+                "SessionStart",
+                &new_message_id(),
+                &sid,
+                orch_id,
+                session_start_payload(
+                    "Review suspicious $4,800 wire transfer",
+                    &[fraud_id, growth_id, compliance_id],
+                    60_000,
+                ),
             ),
-        )).await.unwrap();
+        )
+        .await
+        .unwrap();
         assert!(ack.ok);
         eprintln!("   → [Session History #1] SessionStart from orchestrator");
 
-        let ack = send_as(&mut client, orch_id, envelope(
-            MODE_DECISION, "Proposal", &new_message_id(), &sid, orch_id,
-            proposal_payload(
-                "transfer-review",
-                "Require step-up verification for $4,800 wire transfer",
-                "Fraud detection threshold triggered",
+        let ack = send_as(
+            &mut client,
+            orch_id,
+            envelope(
+                MODE_DECISION,
+                "Proposal",
+                &new_message_id(),
+                &sid,
+                orch_id,
+                proposal_payload(
+                    "transfer-review",
+                    "Require step-up verification for $4,800 wire transfer",
+                    "Fraud detection threshold triggered",
+                ),
             ),
-        )).await.unwrap();
+        )
+        .await
+        .unwrap();
         assert!(ack.ok);
         eprintln!("   → [Session History #2] Proposal from orchestrator");
     }
@@ -145,7 +171,8 @@ async fn decision_with_signals_full_flow() {
     eprintln!("   Each agent: Signal(starting) → LLM reasons → Evaluation → Signal(done)\n");
 
     let openai_client = openai::Client::from_env();
-    let scenario = "A $4,800 wire transfer triggered fraud alerts. Proposal: require step-up verification.";
+    let scenario =
+        "A $4,800 wire transfer triggered fraud alerts. Proposal: require step-up verification.";
 
     // Build specialist agents
     let fraud_grpc = macp_tools::shared_client(ep).await;
@@ -188,26 +215,93 @@ async fn decision_with_signals_full_flow() {
     let (fraud_res, growth_res, compliance_res) = tokio::join!(
         // Fraud agent flow
         async {
-            let mut sig_client = macp_runtime::pb::macp_runtime_service_client::MacpRuntimeServiceClient::connect(ep_str.clone()).await.unwrap();
-            send_signal(&mut sig_client, fraud_id, "progress", "starting fraud risk analysis", 0.0, &sid_clone).await;
+            let mut sig_client =
+                macp_runtime::pb::macp_runtime_service_client::MacpRuntimeServiceClient::connect(
+                    ep_str.clone(),
+                )
+                .await
+                .unwrap();
+            send_signal(
+                &mut sig_client,
+                fraud_id,
+                "progress",
+                "starting fraud risk analysis",
+                0.0,
+                &sid_clone,
+            )
+            .await;
             let result = fraud_agent.prompt(&eval_prompt("fraud-risk")).await;
-            send_signal(&mut sig_client, fraud_id, "completed", "fraud evaluation submitted", 1.0, &sid_clone).await;
+            send_signal(
+                &mut sig_client,
+                fraud_id,
+                "completed",
+                "fraud evaluation submitted",
+                1.0,
+                &sid_clone,
+            )
+            .await;
             result
         },
         // Growth agent flow
         async {
-            let mut sig_client = macp_runtime::pb::macp_runtime_service_client::MacpRuntimeServiceClient::connect(ep_str.clone()).await.unwrap();
-            send_signal(&mut sig_client, growth_id, "progress", "starting customer impact analysis", 0.0, &sid_clone).await;
-            let result = growth_agent.prompt(&eval_prompt("customer-experience")).await;
-            send_signal(&mut sig_client, growth_id, "completed", "growth evaluation submitted", 1.0, &sid_clone).await;
+            let mut sig_client =
+                macp_runtime::pb::macp_runtime_service_client::MacpRuntimeServiceClient::connect(
+                    ep_str.clone(),
+                )
+                .await
+                .unwrap();
+            send_signal(
+                &mut sig_client,
+                growth_id,
+                "progress",
+                "starting customer impact analysis",
+                0.0,
+                &sid_clone,
+            )
+            .await;
+            let result = growth_agent
+                .prompt(&eval_prompt("customer-experience"))
+                .await;
+            send_signal(
+                &mut sig_client,
+                growth_id,
+                "completed",
+                "growth evaluation submitted",
+                1.0,
+                &sid_clone,
+            )
+            .await;
             result
         },
         // Compliance agent flow
         async {
-            let mut sig_client = macp_runtime::pb::macp_runtime_service_client::MacpRuntimeServiceClient::connect(ep_str.clone()).await.unwrap();
-            send_signal(&mut sig_client, compliance_id, "progress", "starting regulatory review", 0.0, &sid_clone).await;
-            let result = compliance_agent.prompt(&eval_prompt("regulatory-compliance")).await;
-            send_signal(&mut sig_client, compliance_id, "completed", "compliance evaluation submitted", 1.0, &sid_clone).await;
+            let mut sig_client =
+                macp_runtime::pb::macp_runtime_service_client::MacpRuntimeServiceClient::connect(
+                    ep_str.clone(),
+                )
+                .await
+                .unwrap();
+            send_signal(
+                &mut sig_client,
+                compliance_id,
+                "progress",
+                "starting regulatory review",
+                0.0,
+                &sid_clone,
+            )
+            .await;
+            let result = compliance_agent
+                .prompt(&eval_prompt("regulatory-compliance"))
+                .await;
+            send_signal(
+                &mut sig_client,
+                compliance_id,
+                "completed",
+                "compliance evaluation submitted",
+                1.0,
+                &sid_clone,
+            )
+            .await;
             result
         },
     );
@@ -228,7 +322,10 @@ async fn decision_with_signals_full_flow() {
         Err(e) => panic!("Compliance agent failed: {e}"),
     }
     eprintln!();
-    eprintln!("   All 3 specialists completed in {:.1}s (parallel)\n", parallel_duration.as_secs_f64());
+    eprintln!(
+        "   All 3 specialists completed in {:.1}s (parallel)\n",
+        parallel_duration.as_secs_f64()
+    );
 
     // ═══════════════════════════════════════════════════════════════════
     // STEP 3: Drain the signal stream — show what orchestrator observed
@@ -264,15 +361,26 @@ async fn decision_with_signals_full_flow() {
     eprintln!("── STEP 4: Orchestrator commits (Coordination Plane) ────────");
     {
         let mut client = orch_client.lock().await;
-        let ack = send_as(&mut client, orch_id, envelope(
-            MODE_DECISION, "Commitment", &new_message_id(), &sid, orch_id,
-            commitment_payload(
-                "cmt-001",
-                "transfer.step-up-verification",
-                "checkout-payments",
-                "All specialists evaluated — proceeding with step-up verification",
+        let ack = send_as(
+            &mut client,
+            orch_id,
+            envelope(
+                MODE_DECISION,
+                "Commitment",
+                &new_message_id(),
+                &sid,
+                orch_id,
+                commitment_payload(
+                    "cmt-001",
+                    "transfer.step-up-verification",
+                    "checkout-payments",
+                    "All specialists evaluated — proceeding with step-up verification",
+                    true,
+                ),
             ),
-        )).await.unwrap();
+        )
+        .await
+        .unwrap();
         assert!(ack.ok);
         assert_eq!(ack.session_state, 2);
         eprintln!("   → [Session History #6] Commitment from orchestrator");
@@ -308,6 +416,9 @@ async fn decision_with_signals_full_flow() {
     eprintln!("║    {signal_count} signals observed (progress + completed from each agent)  ║");
     eprintln!("║    Signals correlate with session but do NOT enter history    ║");
     eprintln!("║                                                              ║");
-    eprintln!("║  Agents: {:.1}s parallel | LLM used only for evaluations     ║", parallel_duration.as_secs_f64());
+    eprintln!(
+        "║  Agents: {:.1}s parallel | LLM used only for evaluations     ║",
+        parallel_duration.as_secs_f64()
+    );
     eprintln!("╚══════════════════════════════════════════════════════════════╝");
 }

@@ -2,8 +2,8 @@ use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
 
-use crate::helpers;
 use super::SharedClient;
+use crate::helpers;
 
 // ── ProposeTool ─────────────────────────────────────────────────────────
 
@@ -51,19 +51,28 @@ impl Tool for ProposeTool {
                 },
                 "required": ["session_id", "proposal_id", "option", "rationale"]
             }
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let payload = helpers::proposal_payload(&args.proposal_id, &args.option, &args.rationale);
         let env = helpers::envelope(
-            helpers::MODE_DECISION, "Proposal",
-            &helpers::new_message_id(), &args.session_id, &self.agent_id, payload,
+            helpers::MODE_DECISION,
+            "Proposal",
+            &helpers::new_message_id(),
+            &args.session_id,
+            &self.agent_id,
+            payload,
         );
         let mut client = self.client.lock().await;
         let ack = helpers::send_as(&mut client, &self.agent_id, env)
-            .await.map_err(|e| MacpToolError(e.to_string()))?;
-        Ok(ToolResult { ok: ack.ok, session_state: ack.session_state })
+            .await
+            .map_err(|e| MacpToolError(e.to_string()))?;
+        Ok(ToolResult {
+            ok: ack.ok,
+            session_state: ack.session_state,
+        })
     }
 }
 
@@ -105,21 +114,33 @@ impl Tool for EvaluateTool {
                 },
                 "required": ["session_id", "proposal_id", "recommendation", "confidence", "reason"]
             }
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let payload = helpers::evaluation_payload(
-            &args.proposal_id, &args.recommendation, args.confidence, &args.reason,
+            &args.proposal_id,
+            &args.recommendation,
+            args.confidence,
+            &args.reason,
         );
         let env = helpers::envelope(
-            helpers::MODE_DECISION, "Evaluation",
-            &helpers::new_message_id(), &args.session_id, &self.agent_id, payload,
+            helpers::MODE_DECISION,
+            "Evaluation",
+            &helpers::new_message_id(),
+            &args.session_id,
+            &self.agent_id,
+            payload,
         );
         let mut client = self.client.lock().await;
         let ack = helpers::send_as(&mut client, &self.agent_id, env)
-            .await.map_err(|e| MacpToolError(e.to_string()))?;
-        Ok(ToolResult { ok: ack.ok, session_state: ack.session_state })
+            .await
+            .map_err(|e| MacpToolError(e.to_string()))?;
+        Ok(ToolResult {
+            ok: ack.ok,
+            session_state: ack.session_state,
+        })
     }
 }
 
@@ -159,18 +180,27 @@ impl Tool for VoteTool {
                 },
                 "required": ["session_id", "proposal_id", "vote", "reason"]
             }
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let payload = helpers::vote_payload(&args.proposal_id, &args.vote, &args.reason);
         let env = helpers::envelope(
-            helpers::MODE_DECISION, "Vote",
-            &helpers::new_message_id(), &args.session_id, &self.agent_id, payload,
+            helpers::MODE_DECISION,
+            "Vote",
+            &helpers::new_message_id(),
+            &args.session_id,
+            &self.agent_id,
+            payload,
         );
         let mut client = self.client.lock().await;
         let ack = helpers::send_as(&mut client, &self.agent_id, env)
-            .await.map_err(|e| MacpToolError(e.to_string()))?;
-        Ok(ToolResult { ok: ack.ok, session_state: ack.session_state })
+            .await
+            .map_err(|e| MacpToolError(e.to_string()))?;
+        Ok(ToolResult {
+            ok: ack.ok,
+            session_state: ack.session_state,
+        })
     }
 }

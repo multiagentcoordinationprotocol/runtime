@@ -389,6 +389,9 @@ mod tests {
     }
 
     fn commitment(session: &Session, action: &str) -> Vec<u8> {
+        let outcome_positive = !action.contains("rejected")
+            && !action.contains("failed")
+            && !action.contains("declined");
         CommitmentPayload {
             commitment_id: "c1".into(),
             action: action.into(),
@@ -397,6 +400,7 @@ mod tests {
             mode_version: session.mode_version.clone(),
             policy_version: session.policy_version.clone(),
             configuration_version: session.configuration_version.clone(),
+            outcome_positive,
         }
         .encode_to_vec()
     }
@@ -783,6 +787,7 @@ mod tests {
             mode_version: "wrong".into(),
             policy_version: session.policy_version.clone(),
             configuration_version: session.configuration_version.clone(),
+            outcome_positive: true,
         }
         .encode_to_vec();
         assert_eq!(

@@ -6,8 +6,8 @@ pub enum MacpError {
     InvalidMacpVersion,
     #[error("InvalidEnvelope")]
     InvalidEnvelope,
-    #[error("DuplicateSession")]
-    DuplicateSession,
+    #[error("SessionAlreadyExists")]
+    SessionAlreadyExists,
     #[error("UnknownSession")]
     UnknownSession,
     #[error("SessionNotOpen")]
@@ -53,7 +53,7 @@ impl MacpError {
         match self {
             MacpError::InvalidMacpVersion => "UNSUPPORTED_PROTOCOL_VERSION",
             MacpError::InvalidEnvelope => "INVALID_ENVELOPE",
-            MacpError::DuplicateSession => "INVALID_ENVELOPE",
+            MacpError::SessionAlreadyExists => "SESSION_ALREADY_EXISTS",
             MacpError::UnknownSession => "SESSION_NOT_FOUND",
             MacpError::SessionNotOpen => "SESSION_NOT_OPEN",
             MacpError::TtlExpired => "SESSION_NOT_OPEN",
@@ -87,7 +87,7 @@ mod tests {
                 "UNSUPPORTED_PROTOCOL_VERSION",
             ),
             (MacpError::InvalidEnvelope, "INVALID_ENVELOPE"),
-            (MacpError::DuplicateSession, "INVALID_ENVELOPE"),
+            (MacpError::SessionAlreadyExists, "SESSION_ALREADY_EXISTS"),
             (MacpError::UnknownSession, "SESSION_NOT_FOUND"),
             (MacpError::SessionNotOpen, "SESSION_NOT_OPEN"),
             (MacpError::TtlExpired, "SESSION_NOT_OPEN"),

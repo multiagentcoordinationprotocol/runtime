@@ -55,7 +55,7 @@ async fn register_and_unregister_ext_mode() {
         .register_ext_mode(with_sender(
             agent,
             RegisterExtModeRequest {
-                descriptor: Some(descriptor),
+                mode_descriptor: Some(descriptor),
             },
         ))
         .await

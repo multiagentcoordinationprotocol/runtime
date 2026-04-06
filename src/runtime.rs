@@ -277,7 +277,7 @@ impl Runtime {
                     duplicate: true,
                 });
             }
-            return Err(MacpError::DuplicateSession);
+            return Err(MacpError::SessionAlreadyExists);
         }
 
         // Enforce max_open_sessions atomically under the write lock to
@@ -298,21 +298,23 @@ impl Runtime {
             }
         }
 
-        // Resolve the governance policy for this session (if policy_version is bound).
-        let policy_definition = if start_payload.policy_version.is_empty() {
-            None
+        // Resolve the governance policy for this session.
+        // RFC-0003 §3: sessions MUST bind policy_version; default to "policy.default".
+        let effective_policy_version = if start_payload.policy_version.is_empty() {
+            crate::policy::defaults::DEFAULT_POLICY_ID.to_string()
         } else {
-            match self.policy_registry.resolve(&start_payload.policy_version) {
-                Ok(policy) => {
-                    // RFC 6.1: reject if policy mode doesn't match session mode
-                    if policy.mode != "*" && policy.mode != mode_name {
-                        return Err(MacpError::InvalidPolicyDefinition);
-                    }
-                    Some(policy)
+            start_payload.policy_version.clone()
+        };
+        let policy_definition = match self.policy_registry.resolve(&effective_policy_version) {
+            Ok(policy) => {
+                // RFC 6.1: reject if policy mode doesn't match session mode
+                if policy.mode != "*" && policy.mode != mode_name {
+                    return Err(MacpError::InvalidPolicyDefinition);
                 }
-                Err(_) => {
-                    return Err(MacpError::UnknownPolicyVersion);
-                }
+                Some(policy)
+            }
+            Err(_) => {
+                return Err(MacpError::UnknownPolicyVersion);
             }
         };
 
@@ -332,7 +334,7 @@ impl Runtime {
             intent: start_payload.intent.clone(),
             mode_version: start_payload.mode_version.clone(),
             configuration_version: start_payload.configuration_version.clone(),
-            policy_version: start_payload.policy_version.clone(),
+            policy_version: effective_policy_version,
             context: start_payload.context.clone(),
             roots: start_payload.roots.clone(),
             initiator_sender: env.sender.clone(),
@@ -709,7 +711,7 @@ mod tests {
                 "m1",
                 &sid,
                 "agent://orchestrator",
-                session_start(vec!["agent://fraud".into()]),
+                session_start(vec!["agent://orchestrator".into(), "agent://fraud".into()]),
             ),
             None,
         )
@@ -965,7 +967,7 @@ mod tests {
             "m1",
             &sid,
             "agent://orchestrator",
-            session_start(vec!["agent://fraud".into()]),
+            session_start(vec!["agent://orchestrator".into(), "agent://fraud".into()]),
         );
         rt.process(&start, None).await.unwrap();
         let first = events.recv().await.unwrap();
@@ -1069,8 +1071,9 @@ mod tests {
             authority_scope: "commercial".into(),
             reason: "bound".into(),
             mode_version: "1.0.0".into(),
-            policy_version: String::new(),
+            policy_version: "policy.default".into(),
             configuration_version: "cfg-1".into(),
+            outcome_positive: true,
         }
         .encode_to_vec();
         let result = rt
@@ -1273,7 +1276,7 @@ mod tests {
                 "m1",
                 &sid,
                 "agent://orchestrator",
-                session_start(vec!["agent://fraud".into()]),
+                session_start(vec!["agent://orchestrator".into(), "agent://fraud".into()]),
             ),
             None,
         )

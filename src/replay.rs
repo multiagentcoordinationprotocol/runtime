@@ -244,7 +244,7 @@ mod tests {
     fn start_payload_bytes() -> Vec<u8> {
         SessionStartPayload {
             intent: "test".into(),
-            participants: vec!["agent://fraud".into()],
+            participants: vec!["agent://orchestrator".into(), "agent://fraud".into()],
             mode_version: "1.0.0".into(),
             configuration_version: "cfg-1".into(),
             policy_version: "policy-1".into(),
@@ -313,6 +313,7 @@ mod tests {
             mode_version: "1.0.0".into(),
             policy_version: "policy-1".into(),
             configuration_version: "cfg-1".into(),
+            outcome_positive: true,
         }
         .encode_to_vec();
 

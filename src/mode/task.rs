@@ -369,6 +369,7 @@ mod tests {
             mode_version: "1.0.0".into(),
             policy_version: "policy".into(),
             configuration_version: "config".into(),
+            outcome_positive: true,
         }
         .encode_to_vec()
     }
@@ -1102,6 +1103,7 @@ mod tests {
             mode_version: "wrong".into(),
             policy_version: "policy".into(),
             configuration_version: "config".into(),
+            outcome_positive: true,
         }
         .encode_to_vec();
         let err = mode

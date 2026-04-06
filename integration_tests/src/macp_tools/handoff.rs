@@ -2,9 +2,9 @@ use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
 
-use crate::helpers;
-use super::SharedClient;
 use super::decision::MacpToolError;
+use super::SharedClient;
+use crate::helpers;
 
 #[derive(Serialize)]
 pub struct ToolResult {
@@ -48,19 +48,33 @@ impl Tool for HandoffOfferTool {
                 },
                 "required": ["session_id", "handoff_id", "target", "scope", "reason"]
             }
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let payload = helpers::handoff_offer_payload(&args.handoff_id, &args.target, &args.scope, &args.reason);
+        let payload = helpers::handoff_offer_payload(
+            &args.handoff_id,
+            &args.target,
+            &args.scope,
+            &args.reason,
+        );
         let env = helpers::envelope(
-            helpers::MODE_HANDOFF, "HandoffOffer",
-            &helpers::new_message_id(), &args.session_id, &self.agent_id, payload,
+            helpers::MODE_HANDOFF,
+            "HandoffOffer",
+            &helpers::new_message_id(),
+            &args.session_id,
+            &self.agent_id,
+            payload,
         );
         let mut client = self.client.lock().await;
         let ack = helpers::send_as(&mut client, &self.agent_id, env)
-            .await.map_err(|e| MacpToolError(e.to_string()))?;
-        Ok(ToolResult { ok: ack.ok, session_state: ack.session_state })
+            .await
+            .map_err(|e| MacpToolError(e.to_string()))?;
+        Ok(ToolResult {
+            ok: ack.ok,
+            session_state: ack.session_state,
+        })
     }
 }
 
@@ -96,18 +110,28 @@ impl Tool for HandoffAcceptTool {
                 },
                 "required": ["session_id", "handoff_id", "reason"]
             }
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let payload = helpers::handoff_accept_payload(&args.handoff_id, &self.agent_id, &args.reason);
+        let payload =
+            helpers::handoff_accept_payload(&args.handoff_id, &self.agent_id, &args.reason);
         let env = helpers::envelope(
-            helpers::MODE_HANDOFF, "HandoffAccept",
-            &helpers::new_message_id(), &args.session_id, &self.agent_id, payload,
+            helpers::MODE_HANDOFF,
+            "HandoffAccept",
+            &helpers::new_message_id(),
+            &args.session_id,
+            &self.agent_id,
+            payload,
         );
         let mut client = self.client.lock().await;
         let ack = helpers::send_as(&mut client, &self.agent_id, env)
-            .await.map_err(|e| MacpToolError(e.to_string()))?;
-        Ok(ToolResult { ok: ack.ok, session_state: ack.session_state })
+            .await
+            .map_err(|e| MacpToolError(e.to_string()))?;
+        Ok(ToolResult {
+            ok: ack.ok,
+            session_state: ack.session_state,
+        })
     }
 }

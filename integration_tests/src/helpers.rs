@@ -75,6 +75,7 @@ pub fn commitment_payload(
     action: &str,
     authority_scope: &str,
     reason: &str,
+    outcome_positive: bool,
 ) -> Vec<u8> {
     CommitmentPayload {
         commitment_id: commitment_id.into(),
@@ -84,6 +85,7 @@ pub fn commitment_payload(
         mode_version: MODE_VERSION.into(),
         policy_version: POLICY_VERSION.into(),
         configuration_version: CONFIG_VERSION.into(),
+        outcome_positive,
     }
     .encode_to_vec()
 }
@@ -244,7 +246,12 @@ pub fn accept_proposal_payload(proposal_id: &str, reason: &str) -> Vec<u8> {
 
 // ── Task mode payload helpers ───────────────────────────────────────────
 
-pub fn task_request_payload(task_id: &str, title: &str, instructions: &str, assignee: &str) -> Vec<u8> {
+pub fn task_request_payload(
+    task_id: &str,
+    title: &str,
+    instructions: &str,
+    assignee: &str,
+) -> Vec<u8> {
     macp_runtime::task_pb::TaskRequestPayload {
         task_id: task_id.into(),
         title: title.into(),

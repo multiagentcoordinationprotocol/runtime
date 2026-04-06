@@ -2,8 +2,8 @@ use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
 
-use crate::helpers;
 use super::SharedClient;
+use crate::helpers;
 
 #[derive(Clone)]
 pub struct StartSessionTool {

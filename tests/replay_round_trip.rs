@@ -53,6 +53,7 @@ fn commitment(action: &str) -> Vec<u8> {
         mode_version: "1.0.0".into(),
         policy_version: "policy-1".into(),
         configuration_version: "cfg-1".into(),
+        outcome_positive: true,
     }
     .encode_to_vec()
 }
@@ -69,7 +70,7 @@ fn replay_decision_session() {
             "m1",
             "SessionStart",
             "agent://orchestrator",
-            start_payload(vec!["agent://a", "agent://b"]),
+            start_payload(vec!["agent://orchestrator", "agent://a", "agent://b"]),
             mode,
             1000,
         ),

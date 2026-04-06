@@ -92,7 +92,7 @@ async fn quorum_happy_path() {
             &new_message_id(),
             &sid,
             requester,
-            commitment_payload("c1", "deploy-prod", "ops-team", "quorum reached"),
+            commitment_payload("c1", "deploy-prod", "ops-team", "quorum reached", true),
         ),
     )
     .await

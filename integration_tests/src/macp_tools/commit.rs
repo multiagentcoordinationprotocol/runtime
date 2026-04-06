@@ -2,9 +2,9 @@ use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
 
-use crate::helpers;
-use super::SharedClient;
 use super::decision::MacpToolError;
+use super::SharedClient;
+use crate::helpers;
 
 #[derive(Clone)]
 pub struct CommitTool {
@@ -47,7 +47,8 @@ impl Tool for CommitTool {
                 },
                 "required": ["session_id", "action", "authority_scope", "reason"]
             }
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -56,14 +57,23 @@ impl Tool for CommitTool {
             &args.action,
             &args.authority_scope,
             &args.reason,
+            true,
         );
         let env = helpers::envelope(
-            &self.mode, "Commitment",
-            &helpers::new_message_id(), &args.session_id, &self.agent_id, payload,
+            &self.mode,
+            "Commitment",
+            &helpers::new_message_id(),
+            &args.session_id,
+            &self.agent_id,
+            payload,
         );
         let mut client = self.client.lock().await;
         let ack = helpers::send_as(&mut client, &self.agent_id, env)
-            .await.map_err(|e| MacpToolError(e.to_string()))?;
-        Ok(CommitResult { ok: ack.ok, session_state: ack.session_state })
+            .await
+            .map_err(|e| MacpToolError(e.to_string()))?;
+        Ok(CommitResult {
+            ok: ack.ok,
+            session_state: ack.session_state,
+        })
     }
 }

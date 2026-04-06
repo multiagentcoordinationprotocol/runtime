@@ -54,8 +54,9 @@ fn commitment(action: &str) -> Vec<u8> {
         authority_scope: "test".into(),
         reason: "done".into(),
         mode_version: "1.0.0".into(),
-        policy_version: String::new(),
+        policy_version: "policy.default".into(),
         configuration_version: "cfg-1".into(),
+        outcome_positive: true,
     }
     .encode_to_vec()
 }
@@ -79,7 +80,7 @@ async fn file_backend_full_lifecycle() {
             "m1",
             &sid,
             "agent://orchestrator",
-            session_start(vec!["agent://a".into()]),
+            session_start(vec!["agent://orchestrator".into(), "agent://a".into()]),
         ),
         None,
     )
@@ -169,7 +170,7 @@ async fn file_backend_crash_recovery_via_replay() {
             "m1",
             &sid,
             "agent://orchestrator",
-            session_start(vec!["agent://a".into()]),
+            session_start(vec!["agent://orchestrator".into(), "agent://a".into()]),
         ),
         None,
     )

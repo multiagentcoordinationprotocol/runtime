@@ -86,7 +86,7 @@ async fn handoff_happy_path() {
             &new_message_id(),
             &sid,
             source,
-            commitment_payload("c1", "handoff-complete", "support", "transferred"),
+            commitment_payload("c1", "handoff-complete", "support", "transferred", true),
         ),
     )
     .await
