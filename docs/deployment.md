@@ -1,48 +1,84 @@
 # Deployment Guide
 
+This guide covers everything you need to run the MACP Runtime in production: configuration, storage backends, crash recovery, monitoring, and container deployment. For protocol-level deployment topologies and security requirements, see the [protocol deployment](https://www.multiagentcoordinationprotocol.io/docs/deployment) and [protocol security](https://www.multiagentcoordinationprotocol.io/docs/security) documentation.
+
 ## Production checklist
 
-1. **TLS certificates** — Set `MACP_TLS_CERT_PATH` and `MACP_TLS_KEY_PATH` to valid PEM files
-2. **Auth tokens** — Create a `tokens.json` file mapping bearer tokens to agent identities and set `MACP_AUTH_TOKENS_FILE`
-3. **Data directory** — Ensure `MACP_DATA_DIR` points to a directory with write permissions
-4. **Bind address** — Set `MACP_BIND_ADDR` to the desired listen address (default: `127.0.0.1:50051`)
+Before exposing the runtime to production traffic, ensure these four items are configured:
 
-## Environment variable reference
+1. **TLS certificates** -- Set `MACP_TLS_CERT_PATH` and `MACP_TLS_KEY_PATH` to valid PEM files. The runtime refuses to start without TLS unless `MACP_ALLOW_INSECURE=1` is set.
 
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `MACP_BIND_ADDR` | No | `127.0.0.1:50051` | gRPC listen address |
-| `MACP_TLS_CERT_PATH` | Yes* | — | Path to TLS certificate PEM |
-| `MACP_TLS_KEY_PATH` | Yes* | — | Path to TLS private key PEM |
-| `MACP_AUTH_TOKENS_FILE` | No | — | Path to `tokens.json` for bearer token auth |
-| `MACP_DATA_DIR` | No | `.macp-data` | Directory for session persistence |
-| `MACP_MEMORY_ONLY` | No | — | Set to `1` to disable persistence |
-| `MACP_ALLOW_INSECURE` | No | — | Set to `1` to allow plaintext (dev only) |
-| `MACP_ALLOW_DEV_SENDER_HEADER` | No | — | Set to `1` to trust `x-macp-sender` header (dev only) |
-| `MACP_MAX_OPEN_SESSIONS` | No | — | Per-initiator open session limit |
-| `MACP_MAX_PAYLOAD_BYTES` | No | `1048576` | Maximum envelope payload size |
+2. **Authentication tokens** -- Create a `tokens.json` mapping bearer tokens to agent identities and set `MACP_AUTH_TOKENS_FILE`. See the [Getting Started guide](getting-started.md) for the token format.
 
-*TLS is required unless `MACP_ALLOW_INSECURE=1`.
+3. **Data directory** -- Ensure `MACP_DATA_DIR` points to a directory with write permissions. This is where session logs and snapshots are stored.
 
-## Persistence and crash recovery
+4. **Bind address** -- Set `MACP_BIND_ADDR` to the desired listen address. The default `127.0.0.1:50051` only accepts local connections.
 
-When `MACP_MEMORY_ONLY` is not set:
+## Environment variables
 
-- Each session gets a directory under `MACP_DATA_DIR/sessions/<session_id>/`
-- An append-only `log.jsonl` records every accepted message and internal event
-- A `session.json` snapshot is written on each state change (best-effort)
-- On startup, all sessions are rebuilt from their `log.jsonl` files via `replay_session()`
-- Log append failures are **fatal** — the runtime rejects the message rather than acknowledging without a durable record
-- Atomic writes (tmp file + rename) prevent partial-write corruption
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MACP_BIND_ADDR` | `127.0.0.1:50051` | gRPC listen address |
+| `MACP_TLS_CERT_PATH` | -- | TLS certificate PEM (required unless insecure) |
+| `MACP_TLS_KEY_PATH` | -- | TLS private key PEM (required unless insecure) |
+| `MACP_AUTH_TOKENS_FILE` | -- | Path to bearer token configuration file |
+| `MACP_AUTH_TOKENS_JSON` | -- | Inline bearer token config as JSON string |
+| `MACP_DATA_DIR` | `.macp-data` | Directory for session persistence |
+| `MACP_STORAGE_BACKEND` | `file` | Backend: `file`, `rocksdb`, `redis` |
+| `MACP_ROCKSDB_PATH` | `.macp-data/rocksdb` | RocksDB database path |
+| `MACP_REDIS_URL` | `redis://127.0.0.1:6379` | Redis connection URL |
+| `MACP_MEMORY_ONLY` | off | Set to `1` to disable persistence entirely |
+| `MACP_ALLOW_INSECURE` | off | Allow plaintext connections (development only) |
+| `MACP_ALLOW_DEV_SENDER_HEADER` | off | Trust `x-macp-agent-id` header (development only) |
+| `MACP_MAX_PAYLOAD_BYTES` | `1048576` | Maximum envelope payload size in bytes |
+| `MACP_SESSION_START_LIMIT_PER_MINUTE` | `60` | Per-sender session creation rate limit |
+| `MACP_MESSAGE_LIMIT_PER_MINUTE` | `600` | Per-sender message rate limit |
+| `MACP_CHECKPOINT_INTERVAL` | `0` (disabled) | Log entries between checkpoints |
+| `MACP_CLEANUP_INTERVAL_SECS` | `60` | Background TTL cleanup interval in seconds |
+| `MACP_SESSION_RETENTION_SECS` | `3600` | How long terminal sessions stay in memory |
+| `MACP_STRICT_RECOVERY` | off | Set to `1` to fail on any recovery error |
+| `RUST_LOG` | `info` | Log level filter |
+
+## Storage backends
+
+The runtime supports four storage configurations, selected via `MACP_STORAGE_BACKEND`:
+
+**File backend** (default) stores each session in its own directory under `MACP_DATA_DIR/sessions/<session_id>/`. An append-only `log.jsonl` records every accepted message, and a `session.json` snapshot is written on each state change. Writes use an atomic tmp-file-then-rename pattern to prevent partial-write corruption.
+
+**RocksDB backend** uses an embedded key-value store for higher throughput. Enable it by building with the `rocksdb-backend` Cargo feature and setting `MACP_STORAGE_BACKEND=rocksdb`. The database path defaults to `MACP_ROCKSDB_PATH`.
+
+**Redis backend** stores session data in a remote Redis instance, useful for shared-nothing deployments. Enable it with the `redis-backend` feature and set `MACP_STORAGE_BACKEND=redis` with `MACP_REDIS_URL` pointing to your Redis instance.
+
+**Memory-only mode** disables persistence entirely. Set `MACP_MEMORY_ONLY=1` for testing or ephemeral workloads. All session data is lost when the process exits.
+
+## Crash recovery
+
+When persistence is enabled, the runtime rebuilds all sessions from their append-only logs on startup. This process is fully automatic:
+
+- Each session's `log.jsonl` is replayed through the mode engine to reconstruct the session state.
+- If a checkpoint exists, replay starts from the checkpoint and only processes subsequent entries.
+- Temporary files (`.tmp` suffixes) left by interrupted atomic writes are cleaned up.
+- The number of recovered sessions is logged at startup.
+
+Log append failures are treated as fatal: the runtime rejects the message rather than acknowledging it without a durable record. This ensures the log is always the authoritative source of truth.
+
+If `MACP_STRICT_RECOVERY=1` is set, the runtime exits on any recovery error. Without it, individual session recovery failures are logged as warnings and the remaining sessions are loaded normally.
 
 ## Monitoring
 
-- **stderr warnings** — Failed persistence operations, replay errors, and recovered session counts are logged to stderr
-- **Session counts** — On startup, the runtime prints the number of replayed sessions
-- **TTL expiry** — Sessions are lazily expired on next read or write; no background reaper
-- **Rate limiting** — Per-sender rate limits for `SessionStart` and in-session messages
+The runtime provides operational visibility through several mechanisms:
+
+**Logging** -- All significant events are logged to stderr: session creation, resolution, expiration, recovery results, persistence failures, and rate limit hits. Set `RUST_LOG` to `debug` for detailed request-level logging.
+
+**TTL enforcement** -- Sessions are expired both lazily (on next access) and proactively by a background task running every `MACP_CLEANUP_INTERVAL_SECS`. This ensures expired sessions are cleaned up even if no new messages arrive.
+
+**Session eviction** -- Terminal sessions (resolved or expired) are evicted from memory after `MACP_SESSION_RETENTION_SECS` to bound memory usage. Their data remains on disk and can be replayed if needed.
+
+**Log compaction** -- When a session reaches a terminal state, the runtime automatically compacts its log into a single checkpoint entry. This reduces storage footprint for completed sessions.
 
 ## Container deployment
+
+Here is a minimal multi-stage Dockerfile for building and running the runtime:
 
 ```dockerfile
 FROM rust:1.85 AS builder
@@ -60,17 +96,17 @@ ENV MACP_DATA_DIR=/data
 CMD ["macp-runtime"]
 ```
 
-Key considerations:
+When deploying in containers:
 
-- Mount a persistent volume at `MACP_DATA_DIR` for session durability
-- Expose port 50051 (or the configured `MACP_BIND_ADDR` port)
-- Provide TLS certificates via mounted secrets
-- Set `MACP_AUTH_TOKENS_FILE` to a mounted secrets file for production auth
+- Mount a persistent volume at `MACP_DATA_DIR` so session logs survive container restarts.
+- Expose port 50051 (or the port configured via `MACP_BIND_ADDR`).
+- Provide TLS certificates and auth tokens via mounted secrets.
+- Set `MACP_BIND_ADDR=0.0.0.0:50051` to accept connections from outside the container.
 
-## Dev tool prerequisites
+## Development tools
 
-For development, install these additional tools:
+For development and CI, these additional tools are useful:
 
-- `cargo-tarpaulin` — Coverage reporting (`cargo install cargo-tarpaulin`)
-- `cargo-audit` — Dependency security auditing (`cargo install cargo-audit`)
-- `buf` — Protocol buffer tooling (for proto sync and lint)
+- `cargo-tarpaulin` for coverage reporting
+- `cargo-audit` for dependency security auditing
+- `buf` for protocol buffer linting and management

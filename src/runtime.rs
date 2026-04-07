@@ -340,7 +340,15 @@ impl Runtime {
         };
 
         let accepted_at = Utc::now().timestamp_millis();
-        let ttl_expiry = accepted_at.saturating_add(ttl_ms);
+        // RFC-MACP-0003 §2: TTL deadline is computed from the SessionStart
+        // envelope's timestamp_unix_ms, not wall-clock time. This ensures
+        // deterministic replay. Fall back to accepted_at if envelope has no timestamp.
+        let ttl_base = if env.timestamp_unix_ms > 0 {
+            env.timestamp_unix_ms
+        } else {
+            accepted_at
+        };
+        let ttl_expiry = ttl_base.saturating_add(ttl_ms);
         let session = Session {
             session_id: env.session_id.clone(),
             state: SessionState::Open,

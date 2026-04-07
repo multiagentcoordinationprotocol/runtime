@@ -131,7 +131,7 @@ async fn decision_with_signals_full_flow() {
                 orch_id,
                 session_start_payload(
                     "Review suspicious $4,800 wire transfer",
-                    &[fraud_id, growth_id, compliance_id],
+                    &[orch_id, fraud_id, growth_id, compliance_id],
                     60_000,
                 ),
             ),

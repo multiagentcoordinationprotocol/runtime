@@ -158,9 +158,8 @@ impl Mode for HandoffMode {
                 if offer.offered_by != env.sender {
                     return Err(MacpError::Forbidden);
                 }
-                if offer.disposition != HandoffDisposition::Offered {
-                    return Err(MacpError::InvalidPayload);
-                }
+                // RFC-MACP-0010 §2.1: Late context (sent after accept/decline) is
+                // permitted as supplementary documentation. No disposition check.
                 state
                     .contexts
                     .entry(payload.handoff_id)
@@ -517,6 +516,8 @@ mod tests {
             ModeResponse::PersistState(data) => {
                 let state: HandoffState = serde_json::from_slice(&data).unwrap();
                 assert_eq!(state.contexts["h1"].len(), 1);
+                assert_eq!(state.contexts["h1"][0].content_type, "text/plain");
+                assert_eq!(state.contexts["h1"][0].sender, "owner");
             }
             _ => panic!("Expected PersistState"),
         }
@@ -941,7 +942,9 @@ mod tests {
     }
 
     #[test]
-    fn context_after_accept_is_rejected() {
+    fn context_after_accept_is_permitted() {
+        // RFC-MACP-0010 §2.1: Late context after accept/decline is permitted
+        // as supplementary documentation.
         let mode = HandoffMode;
         let mut session = base_session();
         let resp = mode
@@ -962,14 +965,14 @@ mod tests {
             )
             .unwrap();
         apply(&mut session, resp);
-        assert_eq!(
-            mode.on_message(
-                &session,
-                &env("owner", "HandoffContext", make_context("h1"))
-            )
-            .unwrap_err()
-            .to_string(),
-            "InvalidPayload"
+        // Late context after accept should succeed
+        let result = mode.on_message(
+            &session,
+            &env("owner", "HandoffContext", make_context("h1")),
+        );
+        assert!(
+            result.is_ok(),
+            "late HandoffContext should be permitted per RFC"
         );
     }
 

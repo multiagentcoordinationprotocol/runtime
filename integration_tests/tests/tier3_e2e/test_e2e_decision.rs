@@ -60,7 +60,7 @@ async fn real_llm_agents_coordinate_decision() {
                 orchestrator_id,
                 session_start_payload(
                     "Review suspicious wire transfer requiring step-up verification",
-                    &[fraud_id, growth_id, compliance_id],
+                    &[orchestrator_id, fraud_id, growth_id, compliance_id],
                     60_000,
                 ),
             ),

@@ -206,9 +206,11 @@ impl Mode for DecisionMode {
                 }
                 Self::ensure_can_deliberate(&state)?;
                 Self::ensure_known_proposal(&state, &payload.proposal_id)?;
+                // RFC-MACP-0007 §4: all enum-like values MUST be stored in UPPER_CASE
+                let normalized_recommendation = payload.recommendation.to_uppercase();
                 state.evaluations.push(Evaluation {
                     proposal_id: payload.proposal_id,
-                    recommendation: payload.recommendation,
+                    recommendation: normalized_recommendation,
                     confidence: payload.confidence,
                     reason: payload.reason,
                     sender: env.sender.clone(),

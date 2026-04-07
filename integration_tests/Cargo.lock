@@ -1041,6 +1041,7 @@ dependencies = [
 [[package]]
 name = "macp-proto"
 version = "0.1.0"
+source = "git+https://github.com/multiagentcoordinationprotocol/multiagentcoordinationprotocol.git#07d80fc1052cc1c96eaf069a799889c1d204dc95"
 
 [[package]]
 name = "macp-runtime"

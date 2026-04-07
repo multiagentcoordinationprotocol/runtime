@@ -1,8 +1,10 @@
-# Examples and local development guide
+# Examples
 
-These examples target `macp-runtime v0.4.0` and the stream-capable freeze profile.
+The runtime ships with example clients in `src/bin` that demonstrate each coordination mode. This page walks through what each example does and highlights the runtime behavior you should pay attention to.
 
-They intentionally use the local-development security shortcut:
+For protocol-level example transcripts, see the [protocol examples documentation](https://www.multiagentcoordinationprotocol.io/docs/examples).
+
+All examples target `macp-runtime v0.4.0` and use the development security shortcut:
 
 ```bash
 export MACP_ALLOW_INSECURE=1
@@ -10,236 +12,97 @@ export MACP_ALLOW_DEV_SENDER_HEADER=1
 cargo run
 ```
 
-The example binaries in `src/bin` attach `x-macp-agent-id` metadata so the runtime can derive the authenticated sender.
+The example binaries attach `x-macp-agent-id` metadata so the runtime can derive the authenticated sender. Every example creates a session with the required fields: `participants`, `mode_version` (`"1.0.0"`), `configuration_version` (`"config.default"`), and a positive `ttl_ms`.
 
-## Ground rules for sessions with strict validation
-
-For these standards-track modes and built-in extensions:
-
-- `macp.mode.decision.v1`
-- `macp.mode.proposal.v1`
-- `macp.mode.task.v1`
-- `macp.mode.handoff.v1`
-- `macp.mode.quorum.v1`
-- `ext.multi_round.v1` (built-in extension)
-
-`SessionStartPayload` must include all of the following:
-
-- `participants`
-- `mode_version`
-- `configuration_version`
-- positive `ttl_ms`
-
-The example clients use:
-
-- `mode_version = "1.0.0"`
-- `configuration_version = "config.default"`
-- `policy_version = "policy.default"`
-
-## Example 1: Decision Mode
-
-Run:
+## Decision Mode
 
 ```bash
 cargo run --bin client
 ```
 
-Flow:
+The coordinator initializes the connection, lists available modes, starts a Decision session, submits a proposal, receives an evaluation and a vote from participants, then commits the outcome. After commitment, it queries the session with `GetSession` to confirm the terminal state.
 
-1. `Initialize`
-2. `ListModes`
-3. `SessionStart` by `coordinator`
-4. `Proposal` by `coordinator`
-5. `Evaluation` by a participant
-6. `Vote` by a participant
-7. `Commitment` by `coordinator`
-8. `GetSession`
+The runtime enforces automatic phase progression: the first evaluation moves the session from the Proposal phase to Evaluation, and the first vote moves it to Voting. Once in the Voting phase, new proposals are rejected. Commitment version fields must match the bound session versions.
 
-Important runtime behavior:
-
-- initiator/coordinator may emit `Proposal` and `Commitment`
-- declared participants may also emit `Proposal`, `Evaluation`, `Objection`, and `Vote`
-- duplicate proposal IDs are rejected
-- votes are tracked per proposal, per sender
-- `CommitmentPayload` version fields must match the bound session versions
-
-## Example 2: Proposal Mode
-
-Run:
+## Proposal Mode
 
 ```bash
 cargo run --bin proposal_client
 ```
 
-Flow:
+A buyer starts a session, the seller creates a proposal, the buyer counters with a different offer, both participants accept the same live proposal, and the buyer commits. The session does not resolve merely because a proposal exists -- convergence (all required parties accepting the same proposal) must be reached before a commitment is accepted.
 
-1. buyer starts the session
-2. seller creates a proposal
-3. buyer counters
-4. both required participants accept the same live proposal
-5. buyer emits `Commitment`
-
-Important runtime behavior:
-
-- a proposal session does **not** resolve merely because a proposal exists
-- `Commitment` is accepted only after acceptance convergence or a terminal rejection
-
-## Example 3: Task Mode
-
-Run:
+## Task Mode
 
 ```bash
 cargo run --bin task_client
 ```
 
-Flow:
+A planner starts a session, sends a task request, a worker accepts the task, sends a progress update, and reports completion. The planner then commits the result. Only the active assignee can send task updates -- this is enforced against the authenticated sender identity.
 
-1. planner starts the session
-2. planner sends `TaskRequest`
-3. worker sends `TaskAccept`
-4. worker sends `TaskUpdate`
-5. worker sends `TaskComplete`
-6. planner emits `Commitment`
-
-## Example 4: Handoff Mode
-
-Run:
+## Handoff Mode
 
 ```bash
 cargo run --bin handoff_client
 ```
 
-Flow:
+An owner starts a session, sends a handoff offer with context, and the target agent accepts the offer. The owner commits to finalize the responsibility transfer. Only one outstanding offer is allowed at a time, and once an offer is accepted, no further offers can be issued.
 
-1. owner starts the session
-2. owner sends `HandoffOffer`
-3. owner sends `HandoffContext`
-4. target sends `HandoffAccept`
-5. owner emits `Commitment`
-
-## Example 5: Quorum Mode
-
-Run:
+## Quorum Mode
 
 ```bash
 cargo run --bin quorum_client
 ```
 
-Flow:
+A coordinator starts a session, sends an approval request, participants submit their ballots, and the coordinator commits once the approval threshold is met. The runtime accepts a commitment either when enough approvals exist or when the threshold becomes mathematically unreachable.
 
-1. coordinator starts the session
-2. coordinator sends `ApprovalRequest`
-3. participants send ballots
-4. coordinator emits `Commitment` after threshold is satisfied
-
-## Example 6: Multi-round mode (built-in extension)
-
-Run:
+## Multi-Round Mode
 
 ```bash
 cargo run --bin multi_round_client
 ```
 
-Flow:
+A coordinator starts a session using `ext.multi_round.v1`, participants exchange contributions across multiple rounds, and the runtime tracks convergence (all participants contributing the same value). Convergence does not auto-resolve the session -- an explicit commitment is still required. This mode is discoverable via `ListExtModes`, not `ListModes`.
 
-1. coordinator starts the session with mode `ext.multi_round.v1` and strict `SessionStart` (participants, mode_version, configuration_version, ttl_ms)
-2. participants exchange contributions across multiple rounds
-3. convergence is tracked by the runtime
-4. coordinator emits `Commitment` after convergence
+## StreamSession
 
-Important runtime behavior:
+`StreamSession` provides per-session bidirectional streaming. A stream is bound to a session by sending the first session-scoped envelope. From that point, the client receives all accepted envelopes for that session in real time.
 
-- `ext.multi_round.v1` is a built-in extension mode, discoverable via `ListExtModes`
-- convergence is tracked but does not auto-resolve the session — an explicit `Commitment` is required
-- uses the same strict `SessionStart` contract as standards-track modes
+Key behaviors to note:
 
-## Example 7: StreamSession
+- The stream starts observing from the bind point -- there is no replay of earlier history.
+- Use `SessionStart` to create a new session over the stream, or send a session-scoped message to attach to an existing one.
+- Mixed-session streams (envelopes targeting different sessions) are rejected.
+- Application errors are delivered inline without closing the stream.
 
-`StreamSession` provides per-session bidirectional streaming. The `Initialize` response advertises `stream: true`.
+## Extension Mode Lifecycle
 
-`StreamSession` emits only accepted canonical MACP envelopes. A single gRPC stream binds to one session. If a client needs negative per-message acknowledgements, it should continue to use `Send`.
+The runtime supports dynamic extension management through four RPCs:
 
-Practical notes:
+1. **`ListExtModes`** discovers available extensions (including `ext.multi_round.v1`).
+2. **`RegisterExtMode`** registers a new extension with a mode descriptor. The runtime creates a passthrough handler for it.
+3. **`UnregisterExtMode`** removes a dynamic extension (built-in modes are protected).
+4. **`PromoteMode`** promotes an extension to standards-track, optionally renaming it.
 
-- bind a stream by sending a session-scoped envelope for the target session
-- use `SessionStart` to create a new session over the stream
-- stream attachment starts observing future accepted envelopes from the bind point; it does not replay earlier history
-- use a session-scoped `Signal` envelope with the correct `session_id` and `mode` to attach to an existing session without mutating it
-- mixed-session streams are rejected with `FAILED_PRECONDITION`
+Extension mode names must not use the reserved `macp.mode.*` namespace. All registry changes are broadcast to `WatchModeRegistry` subscribers, and both `GetManifest` and `Initialize` include all modes.
 
-## Example 8: Extension mode lifecycle
-
-The runtime supports dynamic extension mode management via gRPC:
-
-1. **`ListExtModes`** — discover available extension modes (e.g. `ext.multi_round.v1`)
-2. **`RegisterExtMode`** — register a new extension mode by providing a `ModeDescriptor` with the mode name, message types, and terminal message types; the runtime creates a passthrough handler
-3. **`UnregisterExtMode`** — remove a dynamically registered extension (built-in modes like `ext.multi_round.v1` cannot be removed)
-4. **`PromoteMode`** — promote an extension to standards-track, optionally renaming the identifier (e.g. `ext.foo.v1` to `macp.mode.foo.v1`)
-
-Important runtime behavior:
-
-- extension mode names must not use the reserved `macp.mode.*` namespace
-- dynamically registered modes use a passthrough handler that accepts any listed message type and requires explicit `Commitment` from the initiator to resolve
-- `WatchModeRegistry` subscribers receive `RegistryChanged` events on every register, unregister, or promote operation
-- `GetManifest` and `Initialize` always include all modes (standards-track + extensions); `ListModes` only returns standards-track
-
-## Example 9: Freeze-check / error-path client
-
-Run:
+## Error Path Testing
 
 ```bash
 cargo run --bin fuzz_client
 ```
 
-This client exercises common failure paths for the freeze profile, including:
+This client deliberately exercises failure paths: invalid protocol versions, empty modes, malformed payloads, duplicate messages, unauthorized sender spoofing, oversized payloads, and session access without membership. Use it to verify that the runtime rejects invalid requests correctly.
 
-- invalid protocol version
-- empty mode
-- invalid payloads
-- duplicate messages
-- unauthorized sender spoofing
-- payload too large
-- session access without membership
+## Troubleshooting
 
-## Session ID policy
+**`UNAUTHENTICATED`**: Start the runtime with `MACP_ALLOW_DEV_SENDER_HEADER=1` and ensure the client sets the `x-macp-agent-id` header.
 
-Session IDs must be either:
+**`INVALID_ENVELOPE` on SessionStart**: Verify that the mode name is canonical, the payload is not empty, and all four required fields (`mode_version`, `configuration_version`, `ttl_ms > 0`, `participants`) are present.
 
-- **UUID v4/v7** in hyphenated lowercase canonical form (36 characters, e.g. `550e8400-e29b-41d4-a716-446655440000`)
-- **Base64url token** of at least 22 characters using only `[A-Za-z0-9_-]`
+**`SESSION_NOT_OPEN`**: The session has already been resolved or expired. Use `GetSession` to confirm the terminal state.
 
-Human-readable or short IDs (e.g. `"my-session"`, `"s1"`) are rejected with `INVALID_SESSION_ID`. The example clients generate UUID v4 session IDs automatically.
-
-## Common troubleshooting
-
-### `UNAUTHENTICATED`
-
-Either send a bearer token that exists in the configured auth map, or start the runtime with:
-
-```bash
-export MACP_ALLOW_DEV_SENDER_HEADER=1
-```
-
-and ensure the client sets `x-macp-agent-id`.
-
-### `INVALID_ENVELOPE` on `SessionStart`
-
-For a standards-track mode or built-in extension, check that:
-
-- the mode name is canonical
-- the payload is not empty
-- `mode_version` is present
-- `configuration_version` is present
-- `ttl_ms > 0`
-- participants are present and unique
-
-### `SESSION_NOT_OPEN`
-
-The session is already resolved or expired. Use `GetSession` to confirm the terminal state.
-
-### `RATE_LIMITED`
-
-Increase the limits only if you understand the operational impact:
+**`RATE_LIMITED`**: Increase the limits if appropriate:
 
 ```bash
 export MACP_SESSION_START_LIMIT_PER_MINUTE=120
