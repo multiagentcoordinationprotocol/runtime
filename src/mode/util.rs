@@ -127,3 +127,121 @@ pub fn participants_all_accept(
             .iter()
             .all(|participant| accepts.get(participant).map(String::as_str) == Some(proposal_id))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pb::CommitmentPayload;
+
+    fn make_commitment(action: &str, outcome_positive: bool) -> CommitmentPayload {
+        CommitmentPayload {
+            commitment_id: "c1".into(),
+            action: action.into(),
+            authority_scope: "scope".into(),
+            reason: "reason".into(),
+            mode_version: "1.0.0".into(),
+            policy_version: String::new(),
+            configuration_version: "cfg-1".into(),
+            outcome_positive,
+        }
+    }
+
+    // --- outcome_positive validation: RFC-defined positive actions ---
+
+    #[test]
+    fn decision_selected_positive_ok() {
+        assert!(validate_outcome_positive(&make_commitment("decision.selected", true)).is_ok());
+    }
+
+    #[test]
+    fn decision_selected_negative_rejected() {
+        assert!(validate_outcome_positive(&make_commitment("decision.selected", false)).is_err());
+    }
+
+    #[test]
+    fn decision_rejected_negative_ok() {
+        assert!(validate_outcome_positive(&make_commitment("decision.rejected", false)).is_ok());
+    }
+
+    #[test]
+    fn decision_rejected_positive_rejected() {
+        assert!(validate_outcome_positive(&make_commitment("decision.rejected", true)).is_err());
+    }
+
+    #[test]
+    fn proposal_accepted_positive_ok() {
+        assert!(validate_outcome_positive(&make_commitment("proposal.accepted", true)).is_ok());
+    }
+
+    #[test]
+    fn proposal_accepted_negative_rejected() {
+        assert!(validate_outcome_positive(&make_commitment("proposal.accepted", false)).is_err());
+    }
+
+    #[test]
+    fn proposal_rejected_negative_ok() {
+        assert!(validate_outcome_positive(&make_commitment("proposal.rejected", false)).is_ok());
+    }
+
+    #[test]
+    fn proposal_rejected_positive_rejected() {
+        assert!(validate_outcome_positive(&make_commitment("proposal.rejected", true)).is_err());
+    }
+
+    #[test]
+    fn task_completed_positive_ok() {
+        assert!(validate_outcome_positive(&make_commitment("task.completed", true)).is_ok());
+    }
+
+    #[test]
+    fn task_completed_negative_rejected() {
+        assert!(validate_outcome_positive(&make_commitment("task.completed", false)).is_err());
+    }
+
+    #[test]
+    fn task_failed_negative_ok() {
+        assert!(validate_outcome_positive(&make_commitment("task.failed", false)).is_ok());
+    }
+
+    #[test]
+    fn task_failed_positive_rejected() {
+        assert!(validate_outcome_positive(&make_commitment("task.failed", true)).is_err());
+    }
+
+    #[test]
+    fn handoff_accepted_positive_ok() {
+        assert!(validate_outcome_positive(&make_commitment("handoff.accepted", true)).is_ok());
+    }
+
+    #[test]
+    fn handoff_declined_negative_ok() {
+        assert!(validate_outcome_positive(&make_commitment("handoff.declined", false)).is_ok());
+    }
+
+    #[test]
+    fn handoff_declined_positive_rejected() {
+        assert!(validate_outcome_positive(&make_commitment("handoff.declined", true)).is_err());
+    }
+
+    #[test]
+    fn quorum_approved_positive_ok() {
+        assert!(validate_outcome_positive(&make_commitment("quorum.approved", true)).is_ok());
+    }
+
+    #[test]
+    fn quorum_rejected_negative_ok() {
+        assert!(validate_outcome_positive(&make_commitment("quorum.rejected", false)).is_ok());
+    }
+
+    #[test]
+    fn quorum_rejected_positive_rejected() {
+        assert!(validate_outcome_positive(&make_commitment("quorum.rejected", true)).is_err());
+    }
+
+    #[test]
+    fn custom_action_no_known_suffix_any_outcome_ok() {
+        // Actions without recognized suffixes pass validation regardless of outcome_positive
+        assert!(validate_outcome_positive(&make_commitment("custom.action", true)).is_ok());
+        assert!(validate_outcome_positive(&make_commitment("custom.action", false)).is_ok());
+    }
+}

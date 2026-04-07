@@ -42,7 +42,7 @@ pub enum MacpError {
     #[error("UnknownPolicyVersion")]
     UnknownPolicyVersion,
     #[error("PolicyDenied")]
-    PolicyDenied,
+    PolicyDenied { reasons: Vec<String> },
     #[error("InvalidPolicyDefinition")]
     InvalidPolicyDefinition,
 }
@@ -69,7 +69,7 @@ impl MacpError {
             MacpError::StorageFailed => "INTERNAL_ERROR",
             MacpError::InvalidSessionId => "INVALID_SESSION_ID",
             MacpError::UnknownPolicyVersion => "UNKNOWN_POLICY_VERSION",
-            MacpError::PolicyDenied => "POLICY_DENIED",
+            MacpError::PolicyDenied { .. } => "POLICY_DENIED",
             MacpError::InvalidPolicyDefinition => "INVALID_POLICY_DEFINITION",
         }
     }
@@ -103,7 +103,12 @@ mod tests {
             (MacpError::StorageFailed, "INTERNAL_ERROR"),
             (MacpError::InvalidSessionId, "INVALID_SESSION_ID"),
             (MacpError::UnknownPolicyVersion, "UNKNOWN_POLICY_VERSION"),
-            (MacpError::PolicyDenied, "POLICY_DENIED"),
+            (
+                MacpError::PolicyDenied {
+                    reasons: vec!["test".into()],
+                },
+                "POLICY_DENIED",
+            ),
             (
                 MacpError::InvalidPolicyDefinition,
                 "INVALID_POLICY_DEFINITION",
@@ -139,6 +144,12 @@ mod tests {
             MacpError::UnknownPolicyVersion.to_string(),
             "UnknownPolicyVersion"
         );
-        assert_eq!(MacpError::PolicyDenied.to_string(), "PolicyDenied");
+        assert_eq!(
+            MacpError::PolicyDenied {
+                reasons: vec!["test".into()]
+            }
+            .to_string(),
+            "PolicyDenied"
+        );
     }
 }

@@ -45,6 +45,9 @@ impl MacpServer {
         if env.message_type.is_empty() || env.message_id.is_empty() {
             return Err(MacpError::InvalidEnvelope);
         }
+        // RFC-MACP-0001: Signals MUST have empty session_id and empty mode.
+        // Progress messages MAY be ambient (empty session_id/mode) or session-scoped.
+        let is_ambient_type = env.message_type == "Signal" || env.message_type == "Progress";
         if env.message_type == "Signal" {
             if !env.session_id.is_empty() {
                 return Err(MacpError::InvalidEnvelope);
@@ -53,12 +56,20 @@ impl MacpServer {
                 return Err(MacpError::InvalidEnvelope);
             }
         }
-        if env.message_type != "Signal" && env.session_id.is_empty() {
+        if env.message_type == "Progress" && env.session_id.is_empty() {
+            // Ambient Progress: mode must also be empty
+            if !env.mode.trim().is_empty() {
+                return Err(MacpError::InvalidEnvelope);
+            }
+        }
+        if !is_ambient_type && env.session_id.is_empty() {
             return Err(MacpError::InvalidEnvelope);
         }
-        if env.message_type != "Signal" && env.mode.trim().is_empty() {
+        if !is_ambient_type && env.mode.trim().is_empty() {
             return Err(MacpError::InvalidEnvelope);
         }
+        // Session-scoped Progress must have non-empty mode (enforced above for non-ambient types,
+        // and ambient Progress with non-empty session_id falls through to here naturally)
         if env.payload.len() > self.security.max_payload_bytes {
             return Err(MacpError::PayloadTooLarge);
         }
@@ -74,6 +85,7 @@ impl MacpServer {
     }
 
     fn make_error_ack(e: &MacpError, env: &Envelope) -> Ack {
+        let details = Self::error_details_bytes(e);
         Ack {
             ok: false,
             duplicate: false,
@@ -86,8 +98,19 @@ impl MacpServer {
                 message: e.to_string(),
                 session_id: env.session_id.clone(),
                 message_id: env.message_id.clone(),
-                details: vec![],
+                details,
             }),
+        }
+    }
+
+    /// Serialize structured error details as JSON bytes for the `details` field.
+    /// Currently only `PolicyDenied` carries additional detail (its reasons list).
+    fn error_details_bytes(e: &MacpError) -> Vec<u8> {
+        match e {
+            MacpError::PolicyDenied { reasons } => {
+                serde_json::to_vec(&serde_json::json!({ "reasons": reasons })).unwrap_or_default()
+            }
+            _ => vec![],
         }
     }
 
@@ -449,6 +472,23 @@ impl MacpServer {
             MacpError::InvalidSessionId => Status::invalid_argument(err.to_string()),
             MacpError::InvalidPolicyDefinition => Status::invalid_argument(err.to_string()),
             MacpError::SessionAlreadyExists => Status::already_exists(err.to_string()),
+            MacpError::PolicyDenied { ref reasons } => {
+                let details = Self::error_details_bytes(&err);
+                let msg = if reasons.is_empty() {
+                    "PolicyDenied".to_string()
+                } else {
+                    format!("PolicyDenied: {}", reasons.join("; "))
+                };
+                let mut status = Status::failed_precondition(msg);
+                if !details.is_empty() {
+                    // Attach JSON details as binary metadata so clients can parse structured reasons.
+                    let val = tonic::metadata::MetadataValue::from_bytes(&details);
+                    status
+                        .metadata_mut()
+                        .insert_bin("macp-error-details-bin", val);
+                }
+                status
+            }
             _ => Status::failed_precondition(err.to_string()),
         }
     }
@@ -1497,6 +1537,49 @@ mod tests {
                 mode: "macp.mode.decision.v1".into(),
                 message_type: "Signal".into(),
                 message_id: "sig-3".into(),
+                session_id: String::new(),
+                sender: String::new(),
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                payload: vec![],
+            },
+        )
+        .await;
+        assert!(!ack.ok);
+        assert_eq!(ack.error.as_ref().unwrap().code, "INVALID_ENVELOPE");
+    }
+
+    #[tokio::test]
+    async fn ambient_progress_accepted() {
+        let (server, _) = make_server();
+        let ack = do_send(
+            &server,
+            "agent://orchestrator",
+            Envelope {
+                macp_version: "1.0".into(),
+                mode: String::new(),
+                message_type: "Progress".into(),
+                message_id: "prog-1".into(),
+                session_id: String::new(),
+                sender: String::new(),
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                payload: vec![],
+            },
+        )
+        .await;
+        assert!(ack.ok);
+    }
+
+    #[tokio::test]
+    async fn ambient_progress_with_mode_rejected() {
+        let (server, _) = make_server();
+        let ack = do_send(
+            &server,
+            "agent://orchestrator",
+            Envelope {
+                macp_version: "1.0".into(),
+                mode: "macp.mode.decision.v1".into(),
+                message_type: "Progress".into(),
+                message_id: "prog-2".into(),
                 session_id: String::new(),
                 sender: String::new(),
                 timestamp_unix_ms: Utc::now().timestamp_millis(),

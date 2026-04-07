@@ -34,6 +34,11 @@ impl Default for ModeMetrics {
     }
 }
 
+/// Maximum number of distinct mode names tracked in metrics.
+/// Beyond this limit, metrics are aggregated into an "_overflow" bucket.
+const MAX_MODE_CARDINALITY: usize = 1000;
+const OVERFLOW_MODE: &str = "_overflow";
+
 pub struct RuntimeMetrics {
     per_mode: RwLock<HashMap<String, Arc<ModeMetrics>>>,
 }
@@ -95,13 +100,21 @@ impl RuntimeMetrics {
 
     fn get_or_create(&self, mode: &str) -> Arc<ModeMetrics> {
         {
-            let guard = self.per_mode.read().unwrap();
+            let guard = self.per_mode.read().unwrap_or_else(|e| e.into_inner());
             if let Some(metrics) = guard.get(mode) {
                 return Arc::clone(metrics);
             }
         }
 
-        let mut guard = self.per_mode.write().unwrap();
+        let mut guard = self.per_mode.write().unwrap_or_else(|e| e.into_inner());
+        // If at cardinality limit, aggregate into overflow bucket
+        if guard.len() >= MAX_MODE_CARDINALITY && !guard.contains_key(mode) {
+            return Arc::clone(
+                guard
+                    .entry(OVERFLOW_MODE.to_string())
+                    .or_insert_with(|| Arc::new(ModeMetrics::default())),
+            );
+        }
         Arc::clone(
             guard
                 .entry(mode.to_string())
@@ -110,7 +123,7 @@ impl RuntimeMetrics {
     }
 
     pub fn snapshot(&self) -> Vec<(String, MetricsSnapshot)> {
-        let guard = self.per_mode.read().unwrap();
+        let guard = self.per_mode.read().unwrap_or_else(|e| e.into_inner());
         guard
             .iter()
             .map(|(mode, m)| {

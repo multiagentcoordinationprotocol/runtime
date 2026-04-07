@@ -86,7 +86,7 @@ impl Mode for MultiRoundMode {
         match env.message_type.as_str() {
             "Contribute" => self.handle_contribute(session, env),
             "Commitment" => self.handle_commitment(session, env),
-            _ => Ok(ModeResponse::NoOp),
+            _ => Err(MacpError::InvalidPayload),
         }
     }
 
@@ -523,7 +523,7 @@ mod tests {
     }
 
     #[test]
-    fn non_contribute_message_returns_noop() {
+    fn non_contribute_message_rejected() {
         let mode = MultiRoundMode;
         let state = MultiRoundState {
             round: 0,
@@ -544,8 +544,8 @@ mod tests {
             payload: b"hello".to_vec(),
         };
 
-        let result = mode.on_message(&session, &env).unwrap();
-        assert!(matches!(result, ModeResponse::NoOp));
+        let err = mode.on_message(&session, &env).unwrap_err();
+        assert_eq!(err.error_code(), "INVALID_ENVELOPE");
     }
 
     #[test]
@@ -626,5 +626,30 @@ mod tests {
             }
             _ => panic!("Expected PersistState with converged=true"),
         }
+    }
+
+    #[test]
+    fn unknown_message_type_rejected() {
+        let mode = MultiRoundMode;
+        let state = MultiRoundState {
+            round: 0,
+            participants: vec!["alice".into(), "bob".into()],
+            contributions: BTreeMap::new(),
+            convergence_type: "all_equal".into(),
+            converged: false,
+        };
+        let session = session_with_state(&state);
+        let env = Envelope {
+            macp_version: "1.0".into(),
+            mode: "ext.multi_round.v1".into(),
+            message_type: "UnknownType".into(),
+            message_id: "msg-unknown".into(),
+            session_id: "s1".into(),
+            sender: "alice".into(),
+            timestamp_unix_ms: 0,
+            payload: vec![],
+        };
+        let err = mode.on_message(&session, &env).unwrap_err();
+        assert_eq!(err.error_code(), "INVALID_ENVELOPE");
     }
 }

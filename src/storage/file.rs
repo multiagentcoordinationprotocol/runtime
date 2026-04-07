@@ -203,6 +203,7 @@ mod tests {
             session_id: String::new(),
             mode: String::new(),
             macp_version: String::new(),
+            timestamp_unix_ms: 1_700_000_000_000,
         }
     }
 

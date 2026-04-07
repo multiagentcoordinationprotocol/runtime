@@ -54,8 +54,15 @@ fn try_replay_from_checkpoint(
     let mut session = Session::from(persisted);
     session.session_id = session_id.into();
 
-    // Re-resolve policy definition if policy_version is bound (RFC-MACP-0012 Section 8)
+    // Re-resolve policy definition if policy_version is bound but missing from checkpoint.
+    // This can happen with legacy checkpoints. The resolved definition may differ from the
+    // original if the policy was modified since the session started (RFC-MACP-0012 Section 8).
     if !session.policy_version.is_empty() && session.policy_definition.is_none() {
+        tracing::warn!(
+            session_id,
+            policy_version = %session.policy_version,
+            "checkpoint missing policy_definition; re-resolving from registry (may differ from original)"
+        );
         session.policy_definition =
             policy_registry.and_then(|pr| pr.resolve(&session.policy_version).ok());
     }
@@ -96,7 +103,13 @@ fn replay_entry(
                 message_id: entry.message_id.clone(),
                 session_id: session_id.into(),
                 sender: entry.sender.clone(),
-                timestamp_unix_ms: entry.received_at_ms,
+                // Use original envelope timestamp for replay determinism;
+                // fall back to received_at_ms for legacy log entries.
+                timestamp_unix_ms: if entry.timestamp_unix_ms != 0 {
+                    entry.timestamp_unix_ms
+                } else {
+                    entry.received_at_ms
+                },
                 payload: entry.raw_payload.clone(),
             };
 
@@ -184,7 +197,11 @@ fn replay_from_start(
         message_id: start_entry.message_id.clone(),
         session_id: session_id.into(),
         sender: start_entry.sender.clone(),
-        timestamp_unix_ms: start_entry.received_at_ms,
+        timestamp_unix_ms: if start_entry.timestamp_unix_ms != 0 {
+            start_entry.timestamp_unix_ms
+        } else {
+            start_entry.received_at_ms
+        },
         payload: start_entry.raw_payload.clone(),
     };
 
@@ -272,6 +289,7 @@ mod tests {
             session_id: "s1".into(),
             mode: "macp.mode.decision.v1".into(),
             macp_version: "1.0".into(),
+            timestamp_unix_ms: received_at_ms,
         }
     }
 
@@ -286,6 +304,7 @@ mod tests {
             session_id: "s1".into(),
             mode: "macp.mode.decision.v1".into(),
             macp_version: "1.0".into(),
+            timestamp_unix_ms: received_at_ms,
         }
     }
 
@@ -487,6 +506,7 @@ mod tests {
             session_id: "s1".into(),
             mode: "macp.mode.decision.v1".into(),
             macp_version: "1.0".into(),
+            timestamp_unix_ms: 3000,
         };
 
         // A vote after the checkpoint

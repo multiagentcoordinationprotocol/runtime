@@ -274,7 +274,7 @@ impl Mode for DecisionMode {
                             reasons = ?reasons,
                             "policy denied commitment"
                         );
-                        return Err(MacpError::PolicyDenied);
+                        return Err(MacpError::PolicyDenied { reasons });
                     }
                 }
                 state.phase = DecisionPhase::Committed;
@@ -942,6 +942,56 @@ mod tests {
         bad = commitment(&session);
         mode.on_message(&session, &env("agent://orchestrator", "Commitment", bad))
             .unwrap();
+    }
+
+    #[test]
+    fn negative_outcome_commitment_succeeds() {
+        let mode = DecisionMode;
+        let mut session = test_session();
+        let resp = mode
+            .on_session_start(
+                &session,
+                &env("agent://orchestrator", "SessionStart", vec![]),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        // Add a proposal
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://orchestrator", "Proposal", proposal("p1")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        // Add a vote (reject)
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://fraud", "Vote", vote("p1", "reject")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        // Commit with negative outcome
+        let negative_commitment = CommitmentPayload {
+            commitment_id: "c1".into(),
+            action: "decision.rejected".into(),
+            authority_scope: "payments".into(),
+            reason: "proposal rejected by voters".into(),
+            mode_version: session.mode_version.clone(),
+            policy_version: session.policy_version.clone(),
+            configuration_version: session.configuration_version.clone(),
+            outcome_positive: false,
+        }
+        .encode_to_vec();
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://orchestrator", "Commitment", negative_commitment),
+            )
+            .unwrap();
+        assert!(matches!(resp, ModeResponse::PersistAndResolve { .. }));
+        apply(&mut session, resp);
+        assert_eq!(decode(&session).phase, DecisionPhase::Committed);
     }
 
     #[test]

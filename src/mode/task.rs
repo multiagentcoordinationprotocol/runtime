@@ -183,7 +183,11 @@ impl Mode for TaskMode {
                         .allow_reassignment_on_reject
                     });
                     if !allow {
-                        return Err(MacpError::PolicyDenied);
+                        return Err(MacpError::PolicyDenied {
+                            reasons: vec![
+                                "reassignment after rejection not allowed by policy".into()
+                            ],
+                        });
                     }
                 }
                 if !payload.assignee.is_empty() && payload.assignee != env.sender {
@@ -302,7 +306,7 @@ impl Mode for TaskMode {
                             reasons = ?reasons,
                             "policy denied commitment"
                         );
-                        return Err(MacpError::PolicyDenied);
+                        return Err(MacpError::PolicyDenied { reasons });
                     }
                 }
                 Ok(ModeResponse::PersistAndResolve {
@@ -988,6 +992,58 @@ mod tests {
                 &session,
                 &env("planner", "Commitment", commitment_payload()),
             )
+            .unwrap();
+        assert!(matches!(result, ModeResponse::PersistAndResolve { .. }));
+    }
+
+    // --- Negative outcome commitment ---
+
+    #[test]
+    fn negative_outcome_task_failed() {
+        let mode = TaskMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("planner", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        // Send TaskRequest
+        let result = mode
+            .on_message(
+                &session,
+                &env("planner", "TaskRequest", make_task_request("t1", "worker")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        // Worker accepts
+        let result = mode
+            .on_message(
+                &session,
+                &env("worker", "TaskAccept", make_task_accept("t1", "worker")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        // Worker reports failure
+        let result = mode
+            .on_message(
+                &session,
+                &env("worker", "TaskFail", make_task_fail("t1", "worker")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        // Commit with negative outcome
+        let negative_commitment = CommitmentPayload {
+            commitment_id: "c1".into(),
+            action: "task.failed".into(),
+            authority_scope: "ops".into(),
+            reason: "task failed".into(),
+            mode_version: "1.0.0".into(),
+            policy_version: "policy".into(),
+            configuration_version: "config".into(),
+            outcome_positive: false,
+        }
+        .encode_to_vec();
+        let result = mode
+            .on_message(&session, &env("planner", "Commitment", negative_commitment))
             .unwrap();
         assert!(matches!(result, ModeResponse::PersistAndResolve { .. }));
     }

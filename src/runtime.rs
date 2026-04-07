@@ -182,6 +182,7 @@ impl Runtime {
             session_id: env.session_id.clone(),
             mode: env.mode.clone(),
             macp_version: env.macp_version.clone(),
+            timestamp_unix_ms: env.timestamp_unix_ms,
         }
     }
 
@@ -191,9 +192,10 @@ impl Runtime {
         session_id: &str,
         mode: &str,
     ) -> LogEntry {
+        let now = Utc::now().timestamp_millis();
         LogEntry {
             message_id: String::new(),
-            received_at_ms: Utc::now().timestamp_millis(),
+            received_at_ms: now,
             sender: "_runtime".into(),
             message_type: message_type.into(),
             raw_payload: payload.to_vec(),
@@ -201,6 +203,7 @@ impl Runtime {
             session_id: session_id.into(),
             mode: mode.into(),
             macp_version: "1.0".into(),
+            timestamp_unix_ms: now,
         }
     }
 
@@ -267,6 +270,22 @@ impl Runtime {
         if require_complete_start {
             validate_canonical_session_start_payload(&start_payload)?;
         }
+
+        // Validate mode_version matches the registered descriptor's version
+        if let Some(descriptor_version) = self.mode_registry.get_mode_version(mode_name) {
+            if !start_payload.mode_version.is_empty()
+                && start_payload.mode_version != descriptor_version
+            {
+                tracing::warn!(
+                    mode = mode_name,
+                    payload_version = %start_payload.mode_version,
+                    descriptor_version = %descriptor_version,
+                    "mode_version mismatch"
+                );
+                return Err(MacpError::InvalidEnvelope);
+            }
+        }
+
         let ttl_ms = extract_ttl_ms(&start_payload)?;
 
         let mut guard = self.registry.sessions.write().await;
@@ -612,9 +631,10 @@ impl Runtime {
                 return;
             }
         };
+        let now = Utc::now().timestamp_millis();
         let checkpoint = LogEntry {
             message_id: String::new(),
-            received_at_ms: Utc::now().timestamp_millis(),
+            received_at_ms: now,
             sender: "_runtime".into(),
             message_type: "Checkpoint".into(),
             raw_payload,
@@ -622,6 +642,7 @@ impl Runtime {
             session_id: session_id.into(),
             mode: session.mode.clone(),
             macp_version: String::new(),
+            timestamp_unix_ms: now,
         };
         if let Err(e) = self.storage.append_log_entry(session_id, &checkpoint).await {
             tracing::warn!(session_id, error = %e, "failed to write checkpoint");
@@ -629,6 +650,75 @@ impl Runtime {
         }
         self.log_store.append(session_id, checkpoint).await;
         tracing::debug!(session_id, log_len, "checkpoint inserted");
+    }
+
+    /// Expire all sessions that have exceeded their TTL.
+    /// Called by the background cleanup task to proactively transition
+    /// stale sessions without waiting for the next incoming message.
+    pub async fn cleanup_expired_sessions(&self) {
+        let now = Utc::now().timestamp_millis();
+        let mut guard = self.registry.sessions.write().await;
+        let expired_ids: Vec<String> = guard
+            .iter()
+            .filter(|(_, s)| s.state == SessionState::Open && now > s.ttl_expiry)
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        for session_id in &expired_ids {
+            if let Some(session) = guard.get_mut(session_id) {
+                if session.state != SessionState::Open || now <= session.ttl_expiry {
+                    continue;
+                }
+                let entry = Self::make_internal_entry("TtlExpired", b"", session_id, &session.mode);
+                if let Err(e) = self.storage.append_log_entry(session_id, &entry).await {
+                    tracing::warn!(
+                        session_id,
+                        error = %e,
+                        "failed to write TTL expiry during cleanup"
+                    );
+                    continue;
+                }
+                self.log_store.append(session_id, entry).await;
+                session.state = SessionState::Expired;
+                self.metrics.record_session_expired(&session.mode);
+                self.save_session_to_storage(session).await;
+                tracing::info!(session_id, "session expired via background cleanup");
+            }
+        }
+
+        if !expired_ids.is_empty() {
+            tracing::info!(
+                count = expired_ids.len(),
+                "background cleanup expired sessions"
+            );
+        }
+    }
+
+    /// Evict resolved/expired sessions older than `retention_secs` from memory.
+    /// Sessions remain queryable from durable storage even after eviction.
+    pub async fn evict_stale_sessions(&self, retention_secs: u64) {
+        let now = Utc::now().timestamp_millis();
+        let cutoff = now - (retention_secs as i64 * 1000);
+        let mut guard = self.registry.sessions.write().await;
+        let evict_ids: Vec<String> = guard
+            .iter()
+            .filter(|(_, s)| {
+                matches!(s.state, SessionState::Resolved | SessionState::Expired)
+                    && s.started_at_unix_ms < cutoff
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        for id in &evict_ids {
+            guard.remove(id);
+        }
+
+        if !evict_ids.is_empty() {
+            tracing::info!(
+                count = evict_ids.len(),
+                "evicted stale sessions from memory"
+            );
+        }
     }
 }
 
@@ -1417,5 +1507,199 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.to_string(), "StorageFailed");
+    }
+
+    #[tokio::test]
+    async fn ttl_expiration_rejects_message() {
+        let rt = make_runtime();
+        let sid = new_sid();
+        let payload = SessionStartPayload {
+            intent: "intent".into(),
+            participants: vec!["agent://orchestrator".into(), "agent://fraud".into()],
+            mode_version: "1.0.0".into(),
+            configuration_version: "cfg-1".into(),
+            policy_version: String::new(),
+            ttl_ms: 1,
+            context: vec![],
+            roots: vec![],
+        }
+        .encode_to_vec();
+        rt.process(
+            &env(
+                "macp.mode.decision.v1",
+                "SessionStart",
+                "m1",
+                &sid,
+                "agent://orchestrator",
+                payload,
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let proposal = ProposalPayload {
+            proposal_id: "p1".into(),
+            option: "step-up".into(),
+            rationale: "risk".into(),
+            supporting_data: vec![],
+        }
+        .encode_to_vec();
+        let err = rt
+            .process(
+                &env(
+                    "macp.mode.decision.v1",
+                    "Proposal",
+                    "m2",
+                    &sid,
+                    "agent://orchestrator",
+                    proposal,
+                ),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "TtlExpired");
+    }
+
+    #[tokio::test]
+    async fn cleanup_expired_sessions_marks_expired() {
+        let rt = make_runtime();
+        let sid = new_sid();
+        let payload = SessionStartPayload {
+            intent: "intent".into(),
+            participants: vec!["agent://fraud".into()],
+            mode_version: "1.0.0".into(),
+            configuration_version: "cfg-1".into(),
+            policy_version: String::new(),
+            ttl_ms: 1,
+            context: vec![],
+            roots: vec![],
+        }
+        .encode_to_vec();
+        rt.process(
+            &env(
+                "macp.mode.decision.v1",
+                "SessionStart",
+                "m1",
+                &sid,
+                "agent://orchestrator",
+                payload,
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        rt.cleanup_expired_sessions().await;
+        let session = rt.get_session_checked(&sid).await.unwrap();
+        assert_eq!(session.state, SessionState::Expired);
+    }
+
+    #[tokio::test]
+    async fn evict_stale_sessions_removes_resolved() {
+        let rt = make_runtime();
+        let sid = new_sid();
+        // Start a decision session
+        rt.process(
+            &env(
+                "macp.mode.decision.v1",
+                "SessionStart",
+                "m1",
+                &sid,
+                "agent://orchestrator",
+                session_start(vec!["agent://orchestrator".into(), "agent://fraud".into()]),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        // Send a Proposal
+        let proposal = ProposalPayload {
+            proposal_id: "p1".into(),
+            option: "step-up".into(),
+            rationale: "risk".into(),
+            supporting_data: vec![],
+        }
+        .encode_to_vec();
+        rt.process(
+            &env(
+                "macp.mode.decision.v1",
+                "Proposal",
+                "m2",
+                &sid,
+                "agent://orchestrator",
+                proposal,
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        // Commit to resolve the session
+        let commitment = CommitmentPayload {
+            commitment_id: "c1".into(),
+            action: "decision.selected".into(),
+            authority_scope: "payments".into(),
+            reason: "bound".into(),
+            mode_version: "1.0.0".into(),
+            policy_version: "policy.default".into(),
+            configuration_version: "cfg-1".into(),
+            outcome_positive: true,
+        }
+        .encode_to_vec();
+        let result = rt
+            .process(
+                &env(
+                    "macp.mode.decision.v1",
+                    "Commitment",
+                    "m3",
+                    &sid,
+                    "agent://orchestrator",
+                    commitment,
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.session_state, SessionState::Resolved);
+        // Wait a moment so the session's started_at_unix_ms is strictly in the past
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        // Evict with retention = 0 (evict immediately)
+        rt.evict_stale_sessions(0).await;
+        // Session should no longer be in the in-memory registry
+        assert!(rt.registry.get_session(&sid).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn session_start_with_wrong_mode_version_rejected() {
+        let rt = make_runtime();
+        let sid = new_sid();
+        let payload = SessionStartPayload {
+            intent: "test".into(),
+            participants: vec!["agent://orchestrator".into(), "agent://worker".into()],
+            mode_version: "99.0.0".into(), // wrong version
+            configuration_version: "cfg-1".into(),
+            policy_version: String::new(),
+            ttl_ms: 60_000,
+            context: vec![],
+            roots: vec![],
+        }
+        .encode_to_vec();
+
+        let err = rt
+            .process(
+                &env(
+                    "macp.mode.decision.v1",
+                    "SessionStart",
+                    "m1",
+                    &sid,
+                    "agent://orchestrator",
+                    payload,
+                ),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.error_code(), "INVALID_ENVELOPE");
     }
 }

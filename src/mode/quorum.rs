@@ -244,7 +244,7 @@ impl Mode for QuorumMode {
                             reasons = ?reasons,
                             "policy denied commitment"
                         );
-                        return Err(MacpError::PolicyDenied);
+                        return Err(MacpError::PolicyDenied { reasons });
                     }
                 }
                 Ok(ModeResponse::PersistAndResolve {
@@ -1049,6 +1049,55 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err.to_string(), "PolicyDenied");
+    }
+
+    // --- Negative outcome commitment ---
+
+    #[test]
+    fn negative_outcome_quorum_rejected() {
+        let mode = QuorumMode;
+        let mut session = base_session();
+        // 3 participants, required_approvals = 2
+        let result = mode
+            .on_session_start(&session, &env("coordinator", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env(
+                    "coordinator",
+                    "ApprovalRequest",
+                    make_approval_request("r1", 2),
+                ),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        // Two participants reject, making the threshold (2 approvals) unreachable
+        let result = mode
+            .on_message(
+                &session,
+                &env("alice", "Reject", make_reject("r1", "not ready")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("bob", "Reject", make_reject("r1", "disagree")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        // Threshold is unreachable: 0 approvals + 1 remaining < 2 required
+        // Commit with negative outcome
+        let negative_commitment = commitment("quorum.rejected", false);
+        let result = mode
+            .on_message(
+                &session,
+                &env("coordinator", "Commitment", negative_commitment),
+            )
+            .unwrap();
+        assert!(matches!(result, ModeResponse::PersistAndResolve { .. }));
     }
 
     // --- All participants abstain — eligible for negative commitment ---

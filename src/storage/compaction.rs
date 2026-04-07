@@ -19,9 +19,10 @@ pub async fn compact_session_log(
     let raw_payload = serde_json::to_vec(&persisted)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
+    let now = chrono::Utc::now().timestamp_millis();
     let checkpoint = LogEntry {
         message_id: String::new(),
-        received_at_ms: chrono::Utc::now().timestamp_millis(),
+        received_at_ms: now,
         sender: "_runtime".into(),
         message_type: "Checkpoint".into(),
         raw_payload,
@@ -29,6 +30,7 @@ pub async fn compact_session_log(
         session_id: session_id.into(),
         mode: session.mode.clone(),
         macp_version: String::new(),
+        timestamp_unix_ms: now,
     };
 
     storage.replace_log(session_id, &[checkpoint]).await

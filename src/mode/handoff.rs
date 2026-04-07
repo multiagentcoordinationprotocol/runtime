@@ -70,7 +70,13 @@ impl Mode for HandoffMode {
     fn authorize_sender(&self, session: &Session, env: &Envelope) -> Result<(), MacpError> {
         match env.message_type.as_str() {
             "Commitment" => check_commitment_authority(session, &env.sender),
-            "HandoffOffer" | "HandoffContext" if env.sender == session.initiator_sender => Ok(()),
+            // HandoffOffer: only initiator can offer
+            "HandoffOffer" if env.sender == session.initiator_sender => Ok(()),
+            "HandoffOffer" => Err(MacpError::Forbidden),
+            // HandoffContext: any declared participant (on_message enforces offerer match)
+            "HandoffContext" if is_declared_participant(&session.participants, &env.sender) => {
+                Ok(())
+            }
             _ if is_declared_participant(&session.participants, &env.sender) => Ok(()),
             _ => Err(MacpError::Forbidden),
         }
@@ -137,7 +143,7 @@ impl Mode for HandoffMode {
                         accepted_by: None,
                         declined_by: None,
                         outcome_reason: None,
-                        offered_at_ms: chrono::Utc::now().timestamp_millis(),
+                        offered_at_ms: env.timestamp_unix_ms,
                     },
                 );
                 Ok(ModeResponse::PersistState(Self::encode_state(&state)))
@@ -215,7 +221,8 @@ impl Mode for HandoffMode {
                     let rules: crate::policy::rules::HandoffPolicyRules =
                         serde_json::from_value(policy.rules.clone()).unwrap_or_default();
                     if rules.acceptance.implicit_accept_timeout_ms > 0 {
-                        let now_ms = chrono::Utc::now().timestamp_millis();
+                        // Use envelope timestamp for replay determinism
+                        let now_ms = env.timestamp_unix_ms;
                         let timeout = rules.acceptance.implicit_accept_timeout_ms as i64;
                         for offer in state.offers.values_mut() {
                             if offer.disposition == HandoffDisposition::Offered
@@ -242,7 +249,7 @@ impl Mode for HandoffMode {
                             reasons = ?reasons,
                             "policy denied commitment"
                         );
-                        return Err(MacpError::PolicyDenied);
+                        return Err(MacpError::PolicyDenied { reasons });
                     }
                 }
                 Ok(ModeResponse::PersistAndResolve {
@@ -295,7 +302,7 @@ mod tests {
             message_id: format!("{}-{}", sender, message_type),
             session_id: "s1".into(),
             sender: sender.into(),
-            timestamp_unix_ms: 0,
+            timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
             payload,
         }
     }
@@ -1111,7 +1118,7 @@ mod tests {
             mode: "macp.mode.handoff.v1".into(),
             description: "short timeout".into(),
             rules: serde_json::json!({
-                "acceptance": { "implicit_accept_timeout_ms": 1 },
+                "acceptance": { "implicit_accept_timeout_ms": 100 },
                 "commitment": { "authority": "initiator_only" }
             }),
             schema_version: 1,
@@ -1120,19 +1127,16 @@ mod tests {
             .on_session_start(&session, &env("owner", "SessionStart", vec![]))
             .unwrap();
         apply(&mut session, result);
-        let result = mode
-            .on_message(
-                &session,
-                &env("owner", "HandoffOffer", make_offer("h1", "target")),
-            )
-            .unwrap();
+        // Offer with a specific timestamp
+        let offer_time = 1000i64;
+        let mut offer_env = env("owner", "HandoffOffer", make_offer("h1", "target"));
+        offer_env.timestamp_unix_ms = offer_time;
+        let result = mode.on_message(&session, &offer_env).unwrap();
         apply(&mut session, result);
-        // Wait a tiny bit so the timeout elapses (offered_at_ms is now > 0)
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        // Commitment should succeed — implicit accept triggers
-        let commit = mode
-            .on_message(&session, &env("owner", "Commitment", commitment_payload()))
-            .unwrap();
+        // Commitment with timestamp past the timeout (offer_time + 100ms = 1100)
+        let mut commit_env = env("owner", "Commitment", commitment_payload());
+        commit_env.timestamp_unix_ms = offer_time + 200; // well past 100ms timeout
+        let commit = mode.on_message(&session, &commit_env).unwrap();
         assert!(matches!(commit, ModeResponse::PersistAndResolve { .. }));
     }
 }

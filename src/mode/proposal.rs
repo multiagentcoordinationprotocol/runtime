@@ -47,11 +47,22 @@ pub struct TerminalRejectRecord {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RejectRecord {
+    pub proposal_id: String,
+    pub sender: String,
+    pub reason: String,
+    pub terminal: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProposalState {
     pub proposals: BTreeMap<String, ProposalRecord>,
     pub accepts: BTreeMap<String, String>,
     pub terminal_rejections: Vec<TerminalRejectRecord>,
+    /// All rejections (terminal and non-terminal) for audit trail.
+    #[serde(default)]
+    pub rejections: Vec<RejectRecord>,
     #[serde(default)]
     pub phase: ProposalPhase,
 }
@@ -289,6 +300,13 @@ impl Mode for ProposalMode {
                         .rejection
                         .terminal_on_any_reject
                     });
+                // Always record the rejection for audit trail
+                state.rejections.push(RejectRecord {
+                    proposal_id: payload.proposal_id.clone(),
+                    sender: env.sender.clone(),
+                    reason: payload.reason.clone(),
+                    terminal: is_terminal,
+                });
                 if is_terminal {
                     state.terminal_rejections.push(TerminalRejectRecord {
                         proposal_id: payload.proposal_id,
@@ -344,7 +362,7 @@ impl Mode for ProposalMode {
                             reasons = ?reasons,
                             "policy denied commitment"
                         );
-                        return Err(MacpError::PolicyDenied);
+                        return Err(MacpError::PolicyDenied { reasons });
                     }
                 }
                 state.phase = ProposalPhase::Committed;
@@ -744,6 +762,13 @@ mod tests {
             )
             .unwrap();
         apply(&mut session, resp);
+        // Verify the rejection is still recorded in state for audit
+        let state = decode(&session);
+        assert_eq!(state.rejections.len(), 1);
+        assert_eq!(state.rejections[0].proposal_id, "p1");
+        assert!(!state.rejections[0].terminal);
+        assert!(state.terminal_rejections.is_empty());
+        // But commitment should still be blocked
         assert_eq!(
             mode.on_message(
                 &session,

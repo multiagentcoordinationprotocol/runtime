@@ -41,6 +41,7 @@ fn incoming(
         session_id: "s1".into(),
         mode: mode.into(),
         macp_version: "1.0".into(),
+        timestamp_unix_ms: ts,
     }
 }
 

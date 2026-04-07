@@ -42,7 +42,7 @@ impl PolicyRegistry {
     pub fn register(&self, definition: PolicyDefinition) -> Result<(), String> {
         Self::validate_definition(&definition)?;
 
-        let mut guard = self.entries.write().expect("policy registry lock poisoned");
+        let mut guard = self.entries.write().unwrap_or_else(|e| e.into_inner());
         if guard.contains_key(&definition.policy_id) {
             return Err(format!(
                 "policy '{}' is already registered",
@@ -65,7 +65,7 @@ impl PolicyRegistry {
             return Err("cannot unregister the built-in default policy".into());
         }
 
-        let mut guard = self.entries.write().expect("policy registry lock poisoned");
+        let mut guard = self.entries.write().unwrap_or_else(|e| e.into_inner());
         if guard.remove(policy_id).is_none() {
             return Err(format!("policy '{}' not found", policy_id));
         }
@@ -90,7 +90,7 @@ impl PolicyRegistry {
 
     /// Direct lookup by policy ID.
     pub fn get(&self, policy_id: &str) -> Option<PolicyDefinition> {
-        let guard = self.entries.read().expect("policy registry lock poisoned");
+        let guard = self.entries.read().unwrap_or_else(|e| e.into_inner());
         guard.get(policy_id).cloned()
     }
 
@@ -99,7 +99,7 @@ impl PolicyRegistry {
     /// If `mode_filter` is `Some(mode)`, returns only policies targeting that
     /// specific mode or the wildcard `"*"`. If `None`, returns all policies.
     pub fn list(&self, mode_filter: Option<&str>) -> Vec<PolicyDefinition> {
-        let guard = self.entries.read().expect("policy registry lock poisoned");
+        let guard = self.entries.read().unwrap_or_else(|e| e.into_inner());
         let mut policies: Vec<PolicyDefinition> = guard
             .values()
             .filter(|p| match mode_filter {
