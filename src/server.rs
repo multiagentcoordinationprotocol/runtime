@@ -164,9 +164,15 @@ impl MacpServer {
                 *receiver = None;
                 Ok(None)
             }
-            Err(TryRecvError::Lagged(skipped)) => Err(Status::resource_exhausted(format!(
-                "StreamSession receiver fell behind by {skipped} envelopes"
-            ))),
+            Err(TryRecvError::Lagged(skipped)) => {
+                // Instead of terminating the stream, log the lag and continue.
+                // The subscriber misses N messages but stays connected.
+                tracing::warn!(
+                    skipped,
+                    "StreamSession receiver fell behind; skipping envelopes"
+                );
+                Ok(None)
+            }
         }
     }
 
@@ -597,9 +603,14 @@ impl MacpRuntimeService for MacpServer {
             .get_session_checked(&session_id)
             .await
             .ok_or_else(|| Status::not_found(format!("Session '{}' not found", session_id)))?;
-        if identity.sender != session.initiator_sender {
+        // RFC-MACP-0001: "Only the initiator and policy-delegated roles may cancel."
+        // CancelSession is a Core control-plane message — mode authorization does not apply.
+        if identity.sender != session.initiator_sender
+            && macp_runtime::mode::util::check_commitment_authority(&session, &identity.sender)
+                .is_err()
+        {
             return Err(Status::permission_denied(
-                "FORBIDDEN: only the session initiator can cancel",
+                "FORBIDDEN: only the session initiator or policy-delegated roles can cancel",
             ));
         }
         let sender = identity.sender.clone();

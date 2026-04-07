@@ -226,6 +226,25 @@ impl Mode for ProposalMode {
                 {
                     return Err(MacpError::InvalidPayload);
                 }
+                // RFC-MACP-0012: enforce max_rounds at submission time to prevent
+                // unbounded state growth. The evaluator also checks at commitment.
+                if let Some(ref policy) = session.policy_definition {
+                    let rules =
+                        serde_json::from_value::<crate::policy::rules::ProposalPolicyRules>(
+                            policy.rules.clone(),
+                        )
+                        .unwrap_or_default();
+                    if rules.counter_proposal.max_rounds > 0 {
+                        let counter_count = state
+                            .proposals
+                            .values()
+                            .filter(|p| p.supersedes_proposal_id.is_some())
+                            .count();
+                        if counter_count >= rules.counter_proposal.max_rounds {
+                            return Err(MacpError::InvalidPayload);
+                        }
+                    }
+                }
                 state.proposals.insert(
                     payload.proposal_id.clone(),
                     ProposalRecord {
@@ -976,7 +995,8 @@ mod tests {
     }
 
     #[test]
-    fn policy_denies_commitment_when_counter_proposal_limit_exceeded() {
+    fn policy_blocks_counter_proposal_at_submission_when_limit_exceeded() {
+        // RFC-MACP-0012: max_rounds is enforced both at submission and commitment time.
         let mode = ProposalMode;
         let mut session = base_session();
         session.policy_definition = Some(crate::policy::PolicyDefinition {
@@ -1000,7 +1020,7 @@ mod tests {
             )
             .unwrap();
         apply(&mut session, resp);
-        // Buyer counter-proposes p2 (supersedes p1) -- 1st counter-proposal
+        // Buyer counter-proposes p2 (supersedes p1) -- 1st counter-proposal: allowed
         let resp = mode
             .on_message(
                 &session,
@@ -1012,8 +1032,9 @@ mod tests {
             )
             .unwrap();
         apply(&mut session, resp);
-        // Seller counter-proposes p3 (supersedes p2) -- 2nd counter-proposal
-        let resp = mode
+        // Seller counter-proposes p3 (supersedes p2) -- 2nd counter-proposal:
+        // REJECTED at submission time (max_rounds=1, already 1 counter-proposal)
+        let err = mode
             .on_message(
                 &session,
                 &env(
@@ -1022,32 +1043,8 @@ mod tests {
                     make_counter_proposal("p3", "p2"),
                 ),
             )
-            .unwrap();
-        apply(&mut session, resp);
-        // Both accept p3 to reach convergence
-        let resp = mode
-            .on_message(&session, &env("agent://buyer", "Accept", make_accept("p3")))
-            .unwrap();
-        apply(&mut session, resp);
-        let resp = mode
-            .on_message(
-                &session,
-                &env("agent://seller", "Accept", make_accept("p3")),
-            )
-            .unwrap();
-        apply(&mut session, resp);
-        // Commitment should be denied (2 counter-proposals exceeds limit of 1)
-        let err = mode
-            .on_message(
-                &session,
-                &env(
-                    "agent://buyer",
-                    "Commitment",
-                    commitment(&session, "proposal.accepted"),
-                ),
-            )
             .unwrap_err();
-        assert_eq!(err.to_string(), "PolicyDenied");
+        assert_eq!(err.to_string(), "InvalidPayload");
     }
 
     // --- CounterProposal does NOT retire original ---

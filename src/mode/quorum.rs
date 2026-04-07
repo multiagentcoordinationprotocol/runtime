@@ -52,11 +52,34 @@ impl QuorumMode {
         serde_json::from_slice(data).map_err(|_| MacpError::InvalidModeState)
     }
 
+    /// Resolve the effective approval threshold, considering policy overrides.
+    ///
+    /// RFC-MACP-0011: "When policy specifies a threshold override, it replaces
+    /// (not supplements) the required_approvals value from ApprovalRequest."
+    fn effective_threshold(session: &Session, request: &ApprovalRequestRecord) -> u32 {
+        if let Some(ref policy) = session.policy_definition {
+            let rules: crate::policy::rules::QuorumPolicyRules =
+                serde_json::from_value(policy.rules.clone()).unwrap_or_default();
+            if rules.threshold.value > 0.0 {
+                return match rules.threshold.threshold_type.as_str() {
+                    "percentage" => {
+                        let n = session.participants.len() as f64;
+                        (rules.threshold.value / 100.0 * n).ceil() as u32
+                    }
+                    // "n_of_m" or "count" — use value directly
+                    _ => rules.threshold.value as u32,
+                };
+            }
+        }
+        request.required_approvals
+    }
+
     fn commitment_ready(session: &Session, state: &QuorumState) -> bool {
         let request = match &state.request {
             Some(request) => request,
             None => return false,
         };
+        let required = Self::effective_threshold(session, request);
         let approvals = state
             .ballots
             .values()
@@ -66,8 +89,7 @@ impl QuorumMode {
         let counted = state.ballots.len() as u32;
         let remaining = total_eligible.saturating_sub(counted);
         // Commitment is ready if threshold reached OR threshold is mathematically unreachable
-        approvals >= request.required_approvals
-            || approvals + remaining < request.required_approvals
+        approvals >= required || approvals + remaining < required
     }
 }
 
@@ -281,15 +303,19 @@ mod tests {
     }
 
     fn commitment_payload() -> Vec<u8> {
+        commitment("quorum.approved", true)
+    }
+
+    fn commitment(action: &str, outcome_positive: bool) -> Vec<u8> {
         CommitmentPayload {
             commitment_id: "c1".into(),
-            action: "quorum.approved".into(),
+            action: action.into(),
             authority_scope: "deploy".into(),
             reason: "threshold met".into(),
             mode_version: "1.0.0".into(),
             policy_version: "policy".into(),
             configuration_version: "config".into(),
-            outcome_positive: true,
+            outcome_positive,
         }
         .encode_to_vec()
     }
@@ -1119,5 +1145,160 @@ mod tests {
         let approve_env = env("coordinator", "Approve", make_approve("r1", "yes"));
         let err = mode.authorize_sender(&session, &approve_env).unwrap_err();
         assert_eq!(err.to_string(), "Forbidden");
+    }
+
+    // ── Quorum policy threshold override (RFC-MACP-0011) ───────────
+
+    #[test]
+    fn policy_threshold_overrides_required_approvals() {
+        let mode = QuorumMode;
+        let mut session = base_session();
+        // Policy sets n_of_m threshold to 1, while ApprovalRequest requires 3
+        session.policy_definition = Some(crate::policy::PolicyDefinition {
+            policy_id: "threshold-override".into(),
+            mode: "macp.mode.quorum.v1".into(),
+            description: "low threshold".into(),
+            rules: serde_json::json!({
+                "threshold": { "type": "n_of_m", "value": 1.0 }
+            }),
+            schema_version: 1,
+        });
+        let result = mode
+            .on_session_start(&session, &env("coordinator", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env(
+                    "coordinator",
+                    "ApprovalRequest",
+                    make_approval_request("r1", 3), // requires 3, but policy overrides to 1
+                ),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        // Just 1 approval should make commitment ready (policy overrides to 1)
+        let result = mode
+            .on_message(
+                &session,
+                &env("alice", "Approve", make_approve("r1", "yes")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        // Commitment should succeed
+        let commit = mode
+            .on_message(
+                &session,
+                &env("coordinator", "Commitment", commitment_payload()),
+            )
+            .unwrap();
+        assert!(matches!(commit, ModeResponse::PersistAndResolve { .. }));
+    }
+
+    #[test]
+    fn policy_percentage_threshold() {
+        let mode = QuorumMode;
+        let mut session = base_session();
+        // 3 participants, 50% → ceil(1.5) = 2 required
+        session.policy_definition = Some(crate::policy::PolicyDefinition {
+            policy_id: "pct-override".into(),
+            mode: "macp.mode.quorum.v1".into(),
+            description: "percentage threshold".into(),
+            rules: serde_json::json!({
+                "threshold": { "type": "percentage", "value": 50.0 }
+            }),
+            schema_version: 1,
+        });
+        let result = mode
+            .on_session_start(&session, &env("coordinator", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env(
+                    "coordinator",
+                    "ApprovalRequest",
+                    make_approval_request("r1", 3),
+                ),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        // 1 approval is not enough (need 2 for 50% of 3)
+        let result = mode
+            .on_message(
+                &session,
+                &env("alice", "Approve", make_approve("r1", "yes")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let err = mode
+            .on_message(
+                &session,
+                &env("coordinator", "Commitment", commitment_payload()),
+            )
+            .unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
+        // 2nd approval makes it ready
+        let result = mode
+            .on_message(
+                &session,
+                &env("bob", "Approve", make_approve("r1", "agreed")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let commit = mode
+            .on_message(
+                &session,
+                &env("coordinator", "Commitment", commitment_payload()),
+            )
+            .unwrap();
+        assert!(matches!(commit, ModeResponse::PersistAndResolve { .. }));
+    }
+
+    #[test]
+    fn all_abstain_eligible_for_negative_commitment() {
+        // RFC-MACP-0011: "When all eligible participants have abstained, the Session
+        // becomes eligible for Commitment with a negative outcome."
+        let mode = QuorumMode;
+        let mut session = base_session();
+        let result = mode
+            .on_session_start(&session, &env("coordinator", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env(
+                    "coordinator",
+                    "ApprovalRequest",
+                    make_approval_request("r1", 2),
+                ),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        // All 3 participants abstain
+        for sender in &["alice", "bob", "carol"] {
+            let result = mode
+                .on_message(
+                    &session,
+                    &env(sender, "Abstain", make_abstain("r1", "neutral")),
+                )
+                .unwrap();
+            apply(&mut session, result);
+        }
+        // Commitment should be ready (0 approvals + 0 remaining < 2 required)
+        let commit = mode
+            .on_message(
+                &session,
+                &env(
+                    "coordinator",
+                    "Commitment",
+                    commitment("quorum.rejected", false),
+                ),
+            )
+            .unwrap();
+        assert!(matches!(commit, ModeResponse::PersistAndResolve { .. }));
     }
 }

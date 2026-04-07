@@ -194,16 +194,17 @@ fn check_voting_algorithm(
     votes: &BTreeMap<String, BTreeMap<String, Vote>>,
     participants: &[String],
 ) -> VotingResult {
-    // Aggregate approve/reject counts across all proposals
-    let (approve_count, reject_count, total_votes) = aggregate_votes(votes);
+    // Aggregate approve/reject counts across all proposals.
+    // RFC-MACP-0004: abstain votes are excluded from ratio denominators.
+    let (approve_count, reject_count, _abstain_count, non_abstain_total) = aggregate_votes(votes);
 
-    if total_votes == 0 {
+    if non_abstain_total == 0 {
         return VotingResult::NoVotes;
     }
 
     match algorithm {
         "majority" => {
-            let ratio = approve_count as f64 / total_votes as f64;
+            let ratio = approve_count as f64 / non_abstain_total as f64;
             if ratio >= threshold {
                 VotingResult::Passed(format!(
                     "majority vote passed: {:.1}% approve (threshold: {:.1}%)",
@@ -224,7 +225,7 @@ fn check_voting_algorithm(
             } else {
                 2.0 / 3.0
             };
-            let ratio = approve_count as f64 / total_votes as f64;
+            let ratio = approve_count as f64 / non_abstain_total as f64;
             if ratio >= effective_threshold {
                 VotingResult::Passed(format!(
                     "supermajority vote passed: {:.1}% approve (threshold: {:.1}%)",
@@ -305,27 +306,36 @@ fn check_voting_algorithm(
     }
 }
 
-/// Aggregate votes into approve/reject/total counts.
-fn aggregate_votes(votes: &BTreeMap<String, BTreeMap<String, Vote>>) -> (usize, usize, usize) {
+/// Aggregate votes into approve/reject/abstain counts.
+///
+/// RFC-MACP-0004: Abstain votes do NOT count toward approval or rejection
+/// thresholds by default. The fourth element (`non_abstain_total`) is the
+/// denominator for ratio-based algorithms (majority, supermajority, etc.).
+fn aggregate_votes(
+    votes: &BTreeMap<String, BTreeMap<String, Vote>>,
+) -> (usize, usize, usize, usize) {
     let mut approve = 0usize;
     let mut reject = 0usize;
-    let mut total = 0usize;
+    let mut abstain = 0usize;
 
     for proposal_votes in votes.values() {
         for vote in proposal_votes.values() {
-            total += 1;
             match vote.vote.as_str() {
                 "APPROVE" => approve += 1,
                 "REJECT" => reject += 1,
-                _ => {} // ABSTAIN or other values don't count for/against
+                _ => abstain += 1, // ABSTAIN or other values don't count for/against
             }
         }
     }
 
-    (approve, reject, total)
+    let non_abstain_total = approve + reject;
+    (approve, reject, abstain, non_abstain_total)
 }
 
 /// Compute weighted votes using the configured weight map.
+///
+/// RFC-MACP-0004: Abstain votes are excluded from the weighted total
+/// so they do not dilute the approval ratio.
 fn compute_weighted_votes(
     votes: &BTreeMap<String, BTreeMap<String, Vote>>,
     weights: &std::collections::HashMap<String, f64>,
@@ -335,6 +345,10 @@ fn compute_weighted_votes(
 
     for proposal_votes in votes.values() {
         for (voter, vote) in proposal_votes {
+            // Skip abstain votes — they don't count toward the threshold
+            if vote.vote != "APPROVE" && vote.vote != "REJECT" {
+                continue;
+            }
             let weight = weights.get(voter).copied().unwrap_or(1.0);
             weighted_total += weight;
             if vote.vote == "APPROVE" {
@@ -1379,6 +1393,117 @@ mod tests {
         // No objections in the objections list
         let result = evaluate_decision_commitment(&policy, &state, &participants());
         // BLOCK evaluation != critical objection, so veto logic is not triggered
+        assert!(matches!(result, PolicyDecision::Allow { .. }));
+    }
+
+    // ── Abstention excluded from voting ratio (RFC-MACP-0004) ──────
+
+    #[test]
+    fn abstain_excluded_from_majority_ratio() {
+        // 3 approve, 0 reject, 2 abstain → ratio = 3/3 = 100%, not 3/5 = 60%
+        let policy = make_policy(serde_json::json!({
+            "voting": {
+                "algorithm": "majority",
+                "threshold": 0.9
+            }
+        }));
+        let mut state = make_state_with_votes(vec![
+            ("p1", "agent://fraud", "APPROVE"),
+            ("p1", "agent://compliance", "APPROVE"),
+            ("p1", "agent://ops", "APPROVE"),
+            ("p1", "agent://abstainer1", "ABSTAIN"),
+            ("p1", "agent://abstainer2", "ABSTAIN"),
+        ]);
+        let participants = vec![
+            "agent://fraud".into(),
+            "agent://compliance".into(),
+            "agent://ops".into(),
+            "agent://abstainer1".into(),
+            "agent://abstainer2".into(),
+        ];
+        let result = evaluate_decision_commitment(&policy, &state, &participants);
+        // 3/3 = 100% >= 90% threshold → pass (abstentions excluded from denominator)
+        assert!(matches!(result, PolicyDecision::Allow { .. }));
+    }
+
+    #[test]
+    fn abstain_excluded_from_supermajority_ratio() {
+        // 1 approve, 1 reject, 3 abstain → ratio = 1/2 = 50%, which fails 2/3 supermajority
+        let policy = make_policy(serde_json::json!({
+            "voting": {
+                "algorithm": "supermajority",
+                "threshold": 0.67
+            }
+        }));
+        let state = make_state_with_votes(vec![
+            ("p1", "agent://fraud", "APPROVE"),
+            ("p1", "agent://compliance", "REJECT"),
+            ("p1", "agent://abstainer0", "ABSTAIN"),
+            ("p1", "agent://abstainer1", "ABSTAIN"),
+            ("p1", "agent://abstainer2", "ABSTAIN"),
+        ]);
+        let participants = vec![
+            "agent://fraud".into(),
+            "agent://compliance".into(),
+            "agent://abstainer0".into(),
+            "agent://abstainer1".into(),
+            "agent://abstainer2".into(),
+        ];
+        let result = evaluate_decision_commitment(&policy, &state, &participants);
+        assert!(matches!(result, PolicyDecision::Deny { .. }));
+    }
+
+    #[test]
+    fn all_abstain_returns_no_votes() {
+        // All abstain → non_abstain_total = 0 → NoVotes → algorithm skipped
+        let policy = make_policy(serde_json::json!({
+            "voting": {
+                "algorithm": "majority",
+                "threshold": 0.5
+            }
+        }));
+        let state = make_state_with_votes(vec![
+            ("p1", "agent://abstainer0", "ABSTAIN"),
+            ("p1", "agent://abstainer1", "ABSTAIN"),
+            ("p1", "agent://abstainer2", "ABSTAIN"),
+        ]);
+        let participants = vec![
+            "agent://abstainer0".into(),
+            "agent://abstainer1".into(),
+            "agent://abstainer2".into(),
+        ];
+        // No non-abstain votes → algorithm returns NoVotes → no deny
+        let result = evaluate_decision_commitment(&policy, &state, &participants);
+        assert!(matches!(result, PolicyDecision::Allow { .. }));
+    }
+
+    #[test]
+    fn weighted_votes_exclude_abstain() {
+        let policy = make_policy(serde_json::json!({
+            "voting": {
+                "algorithm": "weighted",
+                "threshold": 0.6,
+                "weights": {
+                    "agent://heavy": 10.0,
+                    "agent://light": 1.0,
+                    "agent://abstainer": 100.0
+                }
+            }
+        }));
+        let state = make_state_with_votes(vec![
+            ("p1", "agent://heavy", "APPROVE"),
+            ("p1", "agent://light", "REJECT"),
+            ("p1", "agent://abstainer", "ABSTAIN"),
+        ]);
+        let participants = vec![
+            "agent://heavy".into(),
+            "agent://light".into(),
+            "agent://abstainer".into(),
+        ];
+        // weighted_approve = 10.0, weighted_total = 10.0 + 1.0 = 11.0
+        // ratio = 10/11 ≈ 0.909 >= 0.6 → pass
+        // Without fix, would be 10/(10+1+100) = 0.09 → fail
+        let result = evaluate_decision_commitment(&policy, &state, &participants);
         assert!(matches!(result, PolicyDecision::Allow { .. }));
     }
 }

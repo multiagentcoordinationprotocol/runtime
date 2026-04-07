@@ -367,8 +367,17 @@ impl Runtime {
         session.apply_mode_response(response);
 
         let result_state = session.state.clone();
-        // 3. Best-effort session save
-        self.save_session_to_storage(&session).await;
+        // 3. Session save — fatal on SessionStart to ensure snapshot durability.
+        // For subsequent messages, the log entry (COMMIT POINT) is already persisted
+        // so snapshot failure is recoverable via replay.
+        if let Err(err) = self.storage.save_session(&session).await {
+            tracing::error!(
+                session_id = %session.session_id,
+                error = %err,
+                "failed to persist session snapshot at SessionStart"
+            );
+            return Err(MacpError::StorageFailed);
+        }
         self.metrics.record_session_start(mode_name);
         tracing::info!(
             session_id = %env.session_id,
