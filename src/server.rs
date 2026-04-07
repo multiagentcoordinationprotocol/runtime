@@ -188,13 +188,15 @@ impl MacpServer {
                 Ok(None)
             }
             Err(TryRecvError::Lagged(skipped)) => {
-                // Instead of terminating the stream, log the lag and continue.
-                // The subscriber misses N messages but stays connected.
+                // Terminate the stream so the client knows it missed messages.
+                // Consistent with the async recv() path which also returns ResourceExhausted.
                 tracing::warn!(
                     skipped,
-                    "StreamSession receiver fell behind; skipping envelopes"
+                    "StreamSession receiver fell behind; terminating stream"
                 );
-                Ok(None)
+                Err(Status::resource_exhausted(format!(
+                    "StreamSession receiver fell behind by {skipped} envelopes"
+                )))
             }
         }
     }

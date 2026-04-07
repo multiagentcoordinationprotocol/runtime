@@ -491,7 +491,9 @@ impl Runtime {
         // 3. Best-effort session save + checkpoint
         self.save_session_to_storage(session).await;
         if result_state == SessionState::Resolved {
-            self.maybe_compact_log(&env.session_id, session).await;
+            if !self.maybe_compact_log(&env.session_id, session).await {
+                self.force_insert_checkpoint(&env.session_id, session).await;
+            }
         } else {
             self.maybe_insert_checkpoint(&env.session_id, session).await;
         }
@@ -593,7 +595,9 @@ impl Runtime {
         self.log_store.append(session_id, cancel_entry).await;
         session.state = SessionState::Expired;
         self.save_session_to_storage(session).await;
-        self.maybe_compact_log(session_id, session).await;
+        if !self.maybe_compact_log(session_id, session).await {
+            self.force_insert_checkpoint(session_id, session).await;
+        }
         self.metrics.record_session_cancelled(&session.mode);
         tracing::info!(session_id, reason, "session cancelled");
 
@@ -604,39 +608,31 @@ impl Runtime {
     }
 
     /// Best-effort log compaction for terminal sessions.
-    async fn maybe_compact_log(&self, session_id: &str, session: &Session) {
-        if let Err(e) =
-            crate::storage::compaction::compact_session_log(&*self.storage, session_id, session)
-                .await
+    /// Returns `true` if compaction succeeded, `false` if skipped or failed.
+    async fn maybe_compact_log(&self, session_id: &str, session: &Session) -> bool {
+        match crate::storage::compaction::compact_session_log(&*self.storage, session_id, session)
+            .await
         {
-            tracing::debug!(
-                session_id,
-                error = %e,
-                "log compaction skipped (backend may not support it)"
-            );
+            Ok(()) => true,
+            Err(e) => {
+                tracing::debug!(
+                    session_id,
+                    error = %e,
+                    "log compaction skipped (backend may not support it)"
+                );
+                false
+            }
         }
     }
 
-    /// Insert a checkpoint entry if the log has reached the configured interval.
-    async fn maybe_insert_checkpoint(&self, session_id: &str, session: &Session) {
-        if self.checkpoint_interval == 0 {
-            return;
-        }
-        let log_len = self
-            .log_store
-            .get_log(session_id)
-            .await
-            .map(|l| l.len())
-            .unwrap_or(0);
-        // Only checkpoint at interval boundaries, and not on the first entry
-        if log_len < self.checkpoint_interval || log_len % self.checkpoint_interval != 0 {
-            return;
-        }
+    /// Force a checkpoint entry regardless of interval settings.
+    /// Used as a fallback when compaction fails on terminal sessions.
+    async fn force_insert_checkpoint(&self, session_id: &str, session: &Session) {
         let persisted = crate::registry::PersistedSession::from(session);
         let raw_payload = match serde_json::to_vec(&persisted) {
             Ok(bytes) => bytes,
             Err(e) => {
-                tracing::warn!(session_id, error = %e, "failed to serialize checkpoint");
+                tracing::warn!(session_id, error = %e, "failed to serialize forced checkpoint");
                 return;
             }
         };
@@ -654,11 +650,33 @@ impl Runtime {
             timestamp_unix_ms: now,
         };
         if let Err(e) = self.storage.append_log_entry(session_id, &checkpoint).await {
-            tracing::warn!(session_id, error = %e, "failed to write checkpoint");
+            tracing::warn!(session_id, error = %e, "failed to write forced checkpoint");
             return;
         }
         self.log_store.append(session_id, checkpoint).await;
-        tracing::debug!(session_id, log_len, "checkpoint inserted");
+        tracing::debug!(
+            session_id,
+            "forced checkpoint inserted for terminal session"
+        );
+    }
+
+    /// Insert a checkpoint entry if the log has reached the configured interval.
+    async fn maybe_insert_checkpoint(&self, session_id: &str, session: &Session) {
+        if self.checkpoint_interval == 0 {
+            return;
+        }
+        let log_len = self
+            .log_store
+            .get_log(session_id)
+            .await
+            .map(|l| l.len())
+            .unwrap_or(0);
+        // Only checkpoint at interval boundaries, and not on the first entry
+        if log_len < self.checkpoint_interval || log_len % self.checkpoint_interval != 0 {
+            return;
+        }
+        self.force_insert_checkpoint(session_id, session).await;
+        tracing::debug!(session_id, log_len, "checkpoint inserted at interval");
     }
 
     /// Expire all sessions that have exceeded their TTL.
@@ -691,6 +709,9 @@ impl Runtime {
                 session.state = SessionState::Expired;
                 self.metrics.record_session_expired(&session.mode);
                 self.save_session_to_storage(session).await;
+                if !self.maybe_compact_log(session_id, session).await {
+                    self.force_insert_checkpoint(session_id, session).await;
+                }
                 tracing::info!(session_id, "session expired via background cleanup");
             }
         }

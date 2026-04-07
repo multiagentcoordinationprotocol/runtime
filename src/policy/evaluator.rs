@@ -297,9 +297,9 @@ fn check_voting_algorithm(
             }
         }
         _ => {
-            // Unknown algorithm: treat as pass-through
-            VotingResult::Passed(format!(
-                "unknown voting algorithm '{}'; allowing",
+            // Unknown or misspelled algorithm must not silently pass.
+            VotingResult::Failed(format!(
+                "unknown voting algorithm '{}'; supported: majority, supermajority, unanimous, weighted, plurality, none",
                 algorithm
             ))
         }
@@ -1505,5 +1505,25 @@ mod tests {
         // Without fix, would be 10/(10+1+100) = 0.09 → fail
         let result = evaluate_decision_commitment(&policy, &state, &participants);
         assert!(matches!(result, PolicyDecision::Allow { .. }));
+    }
+
+    // ── Unknown voting algorithm ───────────────────────────────────
+
+    #[test]
+    fn unknown_voting_algorithm_denies_commitment() {
+        let policy = make_policy(serde_json::json!({
+            "voting": { "algorithm": "majrity" }
+        }));
+        let state = make_state_with_votes(vec![
+            ("p1", "agent://fraud", "APPROVE"),
+            ("p1", "agent://growth", "APPROVE"),
+            ("p1", "agent://compliance", "APPROVE"),
+        ]);
+        let result = evaluate_decision_commitment(&policy, &state, &participants());
+        assert!(
+            matches!(result, PolicyDecision::Deny { .. }),
+            "unknown voting algorithm must deny, got: {:?}",
+            result
+        );
     }
 }

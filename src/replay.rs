@@ -37,7 +37,7 @@ fn try_replay_from_checkpoint(
     session_id: &str,
     log_entries: &[LogEntry],
     registry: &ModeRegistry,
-    policy_registry: Option<&PolicyRegistry>,
+    _policy_registry: Option<&PolicyRegistry>,
 ) -> Result<Option<Session>, MacpError> {
     let checkpoint_idx = log_entries
         .iter()
@@ -57,14 +57,16 @@ fn try_replay_from_checkpoint(
     // Re-resolve policy definition if policy_version is bound but missing from checkpoint.
     // This can happen with legacy checkpoints. The resolved definition may differ from the
     // original if the policy was modified since the session started (RFC-MACP-0012 Section 8).
+    // Policy definitions MUST be serialized in checkpoint entries. Any checkpoint
+    // missing a policy definition was created by a legacy version and cannot be
+    // trusted for deterministic replay — fall back to full replay from SessionStart.
     if !session.policy_version.is_empty() && session.policy_definition.is_none() {
         tracing::warn!(
             session_id,
             policy_version = %session.policy_version,
-            "checkpoint missing policy_definition; re-resolving from registry (may differ from original)"
+            "checkpoint missing policy_definition; falling back to full replay for deterministic policy resolution"
         );
-        session.policy_definition =
-            policy_registry.and_then(|pr| pr.resolve(&session.policy_version).ok());
+        return Ok(None);
     }
 
     let mode = registry

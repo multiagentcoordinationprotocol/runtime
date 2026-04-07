@@ -242,7 +242,6 @@ impl SecurityLayer {
                     .unwrap_or(true)
             })
             .map(|(k, _)| k.clone())
-            .take(100)
             .collect();
         for key in stale_keys {
             guard.remove(&key);
