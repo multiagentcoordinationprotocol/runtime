@@ -107,6 +107,12 @@ pub fn validate_canonical_session_start_payload(
         return Err(MacpError::InvalidPayload);
     }
 
+    // Safety limit: prevent resource exhaustion from excessively large participant lists.
+    const MAX_PARTICIPANTS: usize = 1000;
+    if payload.participants.len() > MAX_PARTICIPANTS {
+        return Err(MacpError::InvalidPayload);
+    }
+
     let mut seen = HashSet::new();
     for participant in &payload.participants {
         let participant = participant.trim();
@@ -365,5 +371,26 @@ mod tests {
                 .to_string(),
             "InvalidSessionId"
         );
+    }
+
+    #[test]
+    fn too_many_participants_rejected() {
+        let participants: Vec<String> = (0..1001).map(|i| format!("agent://p{i}")).collect();
+        let bytes = encode_payload(5000, participants);
+        let payload = parse_session_start_payload(&bytes).unwrap();
+        assert_eq!(
+            validate_canonical_session_start_payload(&payload)
+                .unwrap_err()
+                .to_string(),
+            "InvalidPayload"
+        );
+    }
+
+    #[test]
+    fn max_participants_accepted() {
+        let participants: Vec<String> = (0..1000).map(|i| format!("agent://p{i}")).collect();
+        let bytes = encode_payload(5000, participants);
+        let payload = parse_session_start_payload(&bytes).unwrap();
+        validate_canonical_session_start_payload(&payload).unwrap();
     }
 }

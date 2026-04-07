@@ -200,6 +200,10 @@ impl Mode for DecisionMode {
                     "APPROVE" | "REVIEW" | "BLOCK" | "REJECT" => {}
                     _ => return Err(MacpError::InvalidPayload),
                 }
+                // RFC-MACP-0004 §2.2: confidence must be a normalized value in [0.0, 1.0]
+                if payload.confidence < 0.0 || payload.confidence > 1.0 {
+                    return Err(MacpError::InvalidPayload);
+                }
                 Self::ensure_can_deliberate(&state)?;
                 Self::ensure_known_proposal(&state, &payload.proposal_id)?;
                 state.evaluations.push(Evaluation {
@@ -214,16 +218,21 @@ impl Mode for DecisionMode {
             "Objection" => {
                 let payload = ObjectionPayload::decode(&*env.payload)
                     .map_err(|_| MacpError::InvalidPayload)?;
+                // RFC-MACP-0004 §2.3: severity must be one of {critical, high, medium, low}
+                let severity = if payload.severity.is_empty() {
+                    "medium".into()
+                } else {
+                    match payload.severity.to_lowercase().as_str() {
+                        "critical" | "high" | "medium" | "low" => payload.severity.to_lowercase(),
+                        _ => return Err(MacpError::InvalidPayload),
+                    }
+                };
                 Self::ensure_can_deliberate(&state)?;
                 Self::ensure_known_proposal(&state, &payload.proposal_id)?;
                 state.objections.push(Objection {
                     proposal_id: payload.proposal_id,
                     reason: payload.reason,
-                    severity: if payload.severity.is_empty() {
-                        "medium".into()
-                    } else {
-                        payload.severity
-                    },
+                    severity,
                     sender: env.sender.clone(),
                 });
                 Ok(ModeResponse::PersistState(Self::encode_state(&state)))
@@ -1037,5 +1046,209 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err.to_string(), "PolicyDenied");
+    }
+
+    #[test]
+    fn evaluation_confidence_out_of_bounds_rejected() {
+        let mode = DecisionMode;
+        let mut session = test_session();
+        let resp = mode
+            .on_session_start(
+                &session,
+                &env("agent://orchestrator", "SessionStart", vec![]),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://orchestrator", "Proposal", proposal("p1")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        let bad_eval = EvaluationPayload {
+            proposal_id: "p1".into(),
+            recommendation: "APPROVE".into(),
+            confidence: 1.5,
+            reason: "too confident".into(),
+        }
+        .encode_to_vec();
+        assert_eq!(
+            mode.on_message(&session, &env("agent://fraud", "Evaluation", bad_eval))
+                .unwrap_err()
+                .to_string(),
+            "InvalidPayload"
+        );
+    }
+
+    #[test]
+    fn evaluation_confidence_negative_rejected() {
+        let mode = DecisionMode;
+        let mut session = test_session();
+        let resp = mode
+            .on_session_start(
+                &session,
+                &env("agent://orchestrator", "SessionStart", vec![]),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://orchestrator", "Proposal", proposal("p1")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        let bad_eval = EvaluationPayload {
+            proposal_id: "p1".into(),
+            recommendation: "APPROVE".into(),
+            confidence: -0.1,
+            reason: "negative".into(),
+        }
+        .encode_to_vec();
+        assert_eq!(
+            mode.on_message(&session, &env("agent://fraud", "Evaluation", bad_eval))
+                .unwrap_err()
+                .to_string(),
+            "InvalidPayload"
+        );
+    }
+
+    #[test]
+    fn evaluation_confidence_boundary_accepted() {
+        let mode = DecisionMode;
+        let mut session = test_session();
+        let resp = mode
+            .on_session_start(
+                &session,
+                &env("agent://orchestrator", "SessionStart", vec![]),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://orchestrator", "Proposal", proposal("p1")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        // confidence=0.0 should be accepted
+        let eval_zero = EvaluationPayload {
+            proposal_id: "p1".into(),
+            recommendation: "APPROVE".into(),
+            confidence: 0.0,
+            reason: "zero".into(),
+        }
+        .encode_to_vec();
+        let resp = mode
+            .on_message(&session, &env("agent://fraud", "Evaluation", eval_zero))
+            .unwrap();
+        apply(&mut session, resp);
+        // confidence=1.0 should be accepted
+        let eval_one = EvaluationPayload {
+            proposal_id: "p1".into(),
+            recommendation: "REVIEW".into(),
+            confidence: 1.0,
+            reason: "one".into(),
+        }
+        .encode_to_vec();
+        mode.on_message(&session, &env("agent://growth", "Evaluation", eval_one))
+            .unwrap();
+    }
+
+    #[test]
+    fn objection_invalid_severity_rejected() {
+        let mode = DecisionMode;
+        let mut session = test_session();
+        let resp = mode
+            .on_session_start(
+                &session,
+                &env("agent://orchestrator", "SessionStart", vec![]),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://orchestrator", "Proposal", proposal("p1")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        let bad_objection = ObjectionPayload {
+            proposal_id: "p1".into(),
+            reason: "bad".into(),
+            severity: "urgent".into(),
+        }
+        .encode_to_vec();
+        assert_eq!(
+            mode.on_message(&session, &env("agent://fraud", "Objection", bad_objection))
+                .unwrap_err()
+                .to_string(),
+            "InvalidPayload"
+        );
+    }
+
+    #[test]
+    fn objection_valid_severities_accepted() {
+        let mode = DecisionMode;
+        let mut session = test_session();
+        let resp = mode
+            .on_session_start(
+                &session,
+                &env("agent://orchestrator", "SessionStart", vec![]),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://orchestrator", "Proposal", proposal("p1")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        for severity in &["critical", "high", "medium", "low"] {
+            let obj = ObjectionPayload {
+                proposal_id: "p1".into(),
+                reason: "reason".into(),
+                severity: severity.to_string(),
+            }
+            .encode_to_vec();
+            let resp = mode
+                .on_message(&session, &env("agent://fraud", "Objection", obj))
+                .unwrap();
+            apply(&mut session, resp);
+        }
+    }
+
+    #[test]
+    fn objection_severity_case_normalized() {
+        let mode = DecisionMode;
+        let mut session = test_session();
+        let resp = mode
+            .on_session_start(
+                &session,
+                &env("agent://orchestrator", "SessionStart", vec![]),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://orchestrator", "Proposal", proposal("p1")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        let obj = ObjectionPayload {
+            proposal_id: "p1".into(),
+            reason: "reason".into(),
+            severity: "CRITICAL".into(),
+        }
+        .encode_to_vec();
+        let resp = mode
+            .on_message(&session, &env("agent://fraud", "Objection", obj))
+            .unwrap();
+        apply(&mut session, resp);
+        let state = decode(&session);
+        assert_eq!(state.objections[0].severity, "critical");
     }
 }

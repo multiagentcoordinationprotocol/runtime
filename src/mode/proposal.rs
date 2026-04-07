@@ -287,7 +287,8 @@ impl Mode for ProposalMode {
             "Reject" => {
                 let payload =
                     RejectPayload::decode(&*env.payload).map_err(|_| MacpError::InvalidPayload)?;
-                if !state.proposals.contains_key(&payload.proposal_id) {
+                // Reject only applies to live proposals (consistent with Accept validation)
+                if Self::live_proposal(&state, &payload.proposal_id).is_none() {
                     return Err(MacpError::InvalidPayload);
                 }
                 // RFC-MACP-0012: terminal_on_any_reject overrides per-message terminal flag
@@ -320,6 +321,9 @@ impl Mode for ProposalMode {
             "Withdraw" => {
                 let payload = WithdrawPayload::decode(&*env.payload)
                     .map_err(|_| MacpError::InvalidPayload)?;
+                if payload.proposal_id.trim().is_empty() {
+                    return Err(MacpError::InvalidPayload);
+                }
                 let record = state
                     .proposals
                     .get_mut(&payload.proposal_id)
@@ -1110,6 +1114,62 @@ mod tests {
         assert_eq!(
             state.proposals["p2"].supersedes_proposal_id,
             Some("p1".into())
+        );
+    }
+
+    #[test]
+    fn reject_withdrawn_proposal_fails() {
+        let mode = ProposalMode;
+        let mut session = base_session();
+        let resp = mode
+            .on_session_start(&session, &env("agent://buyer", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, resp);
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://buyer", "Proposal", make_proposal("p1")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        // Withdraw p1
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://buyer", "Withdraw", make_withdraw("p1")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        // Reject on withdrawn proposal should fail
+        assert_eq!(
+            mode.on_message(
+                &session,
+                &env("agent://seller", "Reject", make_reject("p1", false))
+            )
+            .unwrap_err()
+            .to_string(),
+            "InvalidPayload"
+        );
+    }
+
+    #[test]
+    fn withdraw_empty_proposal_id_rejected() {
+        let mode = ProposalMode;
+        let mut session = base_session();
+        let resp = mode
+            .on_session_start(&session, &env("agent://buyer", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, resp);
+        let empty_withdraw = WithdrawPayload {
+            proposal_id: String::new(),
+            reason: "empty".into(),
+        }
+        .encode_to_vec();
+        assert_eq!(
+            mode.on_message(&session, &env("agent://buyer", "Withdraw", empty_withdraw))
+                .unwrap_err()
+                .to_string(),
+            "InvalidPayload"
         );
     }
 }

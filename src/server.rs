@@ -501,6 +501,11 @@ impl MacpRuntimeService for MacpServer {
         request: Request<InitializeRequest>,
     ) -> Result<Response<InitializeResponse>, Status> {
         let req = request.into_inner();
+        if req.supported_protocol_versions.is_empty() {
+            return Err(Status::invalid_argument(
+                "INVALID_REQUEST: supported_protocol_versions must not be empty",
+            ));
+        }
         if !req.supported_protocol_versions.iter().any(|v| v == "1.0") {
             return Err(Status::failed_precondition(
                 "UNSUPPORTED_PROTOCOL_VERSION: no mutually supported protocol version",
@@ -1604,5 +1609,33 @@ mod tests {
             .unwrap();
         let caps = resp.into_inner().capabilities.unwrap();
         assert!(caps.sessions.unwrap().stream);
+    }
+
+    #[tokio::test]
+    async fn initialize_empty_versions_rejected() {
+        let (server, _) = make_server();
+        let err = server
+            .initialize(Request::new(InitializeRequest {
+                supported_protocol_versions: vec![],
+                client_info: None,
+                capabilities: None,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn initialize_unsupported_version_rejected() {
+        let (server, _) = make_server();
+        let err = server
+            .initialize(Request::new(InitializeRequest {
+                supported_protocol_versions: vec!["2.0".into()],
+                client_info: None,
+                capabilities: None,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     }
 }

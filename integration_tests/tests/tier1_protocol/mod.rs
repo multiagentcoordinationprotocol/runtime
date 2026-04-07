@@ -14,3 +14,4 @@ mod test_rfc_cross_cutting;
 mod test_session_lifecycle;
 mod test_stream_session;
 mod test_task_mode;
+mod test_validation_gaps;

@@ -507,6 +507,15 @@ impl Runtime {
     /// notifications. Progress messages carry structured ProgressPayload.
     /// Neither mutates session state — both are broadcast to subscribers.
     async fn process_signal(&self, env: &Envelope) -> Result<ProcessResult, MacpError> {
+        // RFC-MACP-0001 §4 / RFC-MACP-0010: validate SignalPayload structure.
+        // signal_type must be non-empty when a payload is present.
+        if env.message_type == "Signal" && !env.payload.is_empty() {
+            let signal: crate::pb::SignalPayload =
+                prost::Message::decode(&*env.payload).map_err(|_| MacpError::InvalidPayload)?;
+            if signal.signal_type.trim().is_empty() {
+                return Err(MacpError::InvalidPayload);
+            }
+        }
         // RFC-MACP-0001: validate ProgressPayload structure for Progress messages.
         if env.message_type == "Progress" && !env.payload.is_empty() {
             let _: crate::pb::ProgressPayload =
@@ -1701,5 +1710,69 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.error_code(), "INVALID_ENVELOPE");
+    }
+
+    #[tokio::test]
+    async fn signal_empty_signal_type_rejected() {
+        let rt = make_runtime();
+        // Use non-default data so proto3 serializes a non-empty payload
+        let signal_payload = crate::pb::SignalPayload {
+            signal_type: String::new(),
+            data: b"some data".to_vec(),
+            confidence: 0.0,
+            correlation_session_id: String::new(),
+        }
+        .encode_to_vec();
+        let signal = Envelope {
+            macp_version: "1.0".into(),
+            mode: String::new(),
+            message_type: "Signal".into(),
+            message_id: "sig-1".into(),
+            session_id: String::new(),
+            sender: "agent://a".into(),
+            timestamp_unix_ms: 0,
+            payload: signal_payload,
+        };
+        let err = rt.process_signal(&signal).await.unwrap_err();
+        assert_eq!(err.error_code(), "INVALID_ENVELOPE");
+    }
+
+    #[tokio::test]
+    async fn signal_valid_payload_accepted() {
+        let rt = make_runtime();
+        let signal_payload = crate::pb::SignalPayload {
+            signal_type: "heartbeat".into(),
+            data: vec![],
+            confidence: 0.8,
+            correlation_session_id: String::new(),
+        }
+        .encode_to_vec();
+        let signal = Envelope {
+            macp_version: "1.0".into(),
+            mode: String::new(),
+            message_type: "Signal".into(),
+            message_id: "sig-2".into(),
+            session_id: String::new(),
+            sender: "agent://a".into(),
+            timestamp_unix_ms: 0,
+            payload: signal_payload,
+        };
+        rt.process_signal(&signal).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn signal_empty_payload_accepted() {
+        let rt = make_runtime();
+        let signal = Envelope {
+            macp_version: "1.0".into(),
+            mode: String::new(),
+            message_type: "Signal".into(),
+            message_id: "sig-3".into(),
+            session_id: String::new(),
+            sender: "agent://a".into(),
+            timestamp_unix_ms: 0,
+            payload: vec![],
+        };
+        rt.process_signal(&signal).await.unwrap();
     }
 }
