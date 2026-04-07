@@ -11,7 +11,7 @@ pub fn default_policy() -> PolicyDefinition {
         description: "Default policy \u{2014} mode built-in rules apply with no additional governance constraints".to_string(),
         rules: serde_json::json!({
             "voting": { "algorithm": "none", "quorum": { "type": "count", "value": 0 } },
-            "objection_handling": { "block_severity_vetoes": false, "veto_threshold": 1 },
+            "objection_handling": { "critical_severity_vetoes": false, "veto_threshold": 1 },
             "evaluation": { "required_before_voting": false, "minimum_confidence": 0.0 },
             "commitment": { "authority": "initiator_only", "designated_roles": [], "require_vote_quorum": false }
         }),

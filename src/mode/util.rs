@@ -67,8 +67,8 @@ pub fn is_declared_participant(participants: &[String], sender: &str) -> bool {
 
 /// Check whether the sender is authorized to commit per the policy's `commitment.authority` rule.
 ///
-/// If no policy is bound, defaults to initiator-only. Per RFC-MACP-0012 Section 4,
-/// the `commitment` rule group controls who can emit a Commitment envelope.
+/// RFC-MACP-0012 §4: the `commitment` rule group controls who can emit a Commitment
+/// envelope. If no policy is bound, defaults to initiator-only (RFC-MACP-0001 §7.3).
 pub fn check_commitment_authority(session: &Session, sender: &str) -> Result<(), MacpError> {
     if let Some(ref policy) = session.policy_definition {
         let rules: crate::policy::rules::CommitmentRules = extract_commitment_rules(&policy.rules);

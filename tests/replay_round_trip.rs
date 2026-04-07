@@ -117,7 +117,7 @@ fn replay_decision_session() {
     assert_eq!(session.seen_message_ids.len(), 4);
     let mode_state: serde_json::Value = serde_json::from_slice(&session.mode_state).unwrap();
     assert_eq!(mode_state["phase"], "Committed");
-    assert_eq!(mode_state["votes"]["p1"]["agent://a"]["vote"], "approve");
+    assert_eq!(mode_state["votes"]["p1"]["agent://a"]["vote"], "APPROVE");
 }
 
 #[test]

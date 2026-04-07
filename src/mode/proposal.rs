@@ -1049,4 +1049,45 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.to_string(), "PolicyDenied");
     }
+
+    // --- CounterProposal does NOT retire original ---
+
+    #[test]
+    fn counter_proposal_does_not_retire_original() {
+        let mode = ProposalMode;
+        let mut session = base_session();
+        let resp = mode
+            .on_session_start(&session, &env("agent://buyer", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, resp);
+        // Seller proposes p1
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://seller", "Proposal", make_proposal("p1")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        // Buyer counter-proposes p2, superseding p1
+        let resp = mode
+            .on_message(
+                &session,
+                &env(
+                    "agent://buyer",
+                    "CounterProposal",
+                    make_counter_proposal("p2", "p1"),
+                ),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        // Verify both proposals are still live in the mode state
+        let state = decode(&session);
+        assert_eq!(state.proposals.len(), 2);
+        assert_eq!(state.proposals["p1"].disposition, ProposalDisposition::Live);
+        assert_eq!(state.proposals["p2"].disposition, ProposalDisposition::Live);
+        assert_eq!(
+            state.proposals["p2"].supersedes_proposal_id,
+            Some("p1".into())
+        );
+    }
 }

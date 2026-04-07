@@ -195,7 +195,7 @@ impl MacpServer {
         }
         if let Some(bound) = bound_session_id.as_ref() {
             if bound != &envelope.session_id {
-                return Err(Status::failed_precondition(
+                return Err(Status::invalid_argument(
                     "StreamSession may only carry envelopes for one session_id",
                 ));
             }
@@ -208,12 +208,12 @@ impl MacpServer {
         if !is_session_start {
             if let Some(session) = self.runtime.get_session_checked(&envelope.session_id).await {
                 if envelope.mode != session.mode {
-                    return Err(Status::failed_precondition(
+                    return Err(Status::invalid_argument(
                         "INVALID_ENVELOPE: envelope mode does not match the bound session mode",
                     ));
                 }
                 if session.state != SessionState::Open {
-                    return Err(Status::failed_precondition("SESSION_NOT_OPEN"));
+                    return Err(Status::invalid_argument("SESSION_NOT_OPEN"));
                 }
             } else if envelope.message_type == "Signal" {
                 return Err(Status::not_found(format!(
@@ -301,14 +301,37 @@ impl MacpServer {
 
                     match action {
                         StreamAction::ProcessRequest(req) => {
-                            server
+                            match server
                                 .process_stream_request(
                                     &identity,
                                     req,
                                     &mut bound_session_id,
                                     &mut session_events,
                                 )
-                                .await?;
+                                .await
+                            {
+                                Ok(()) => {}
+                                Err(status) if Self::is_stream_terminal_error(&status) => {
+                                    Err(status)?;
+                                }
+                                Err(status) => {
+                                    // RFC-MACP-0001: application-level validation errors
+                                    // are sent as inline MACPError; stream remains open.
+                                    yield StreamSessionResponse {
+                                        response: Some(
+                                            macp_runtime::pb::stream_session_response::Response::Error(
+                                                PbMacpError {
+                                                    code: status.message().to_string(),
+                                                    message: status.message().to_string(),
+                                                    session_id: bound_session_id.clone().unwrap_or_default(),
+                                                    message_id: String::new(),
+                                                    details: vec![],
+                                                },
+                                            ),
+                                        ),
+                                    };
+                                }
+                            }
                             while let Some(envelope) = Self::try_next_stream_event(&mut session_events)? {
                                 yield StreamSessionResponse {
                                     response: Some(
@@ -349,14 +372,35 @@ impl MacpServer {
                 } else {
                     match inbound.next().await {
                         Some(Ok(req)) => {
-                            server
+                            match server
                                 .process_stream_request(
                                     &identity,
                                     req,
                                     &mut bound_session_id,
                                     &mut session_events,
                                 )
-                                .await?;
+                                .await
+                            {
+                                Ok(()) => {}
+                                Err(status) if Self::is_stream_terminal_error(&status) => {
+                                    Err(status)?;
+                                }
+                                Err(status) => {
+                                    yield StreamSessionResponse {
+                                        response: Some(
+                                            macp_runtime::pb::stream_session_response::Response::Error(
+                                                PbMacpError {
+                                                    code: status.message().to_string(),
+                                                    message: status.message().to_string(),
+                                                    session_id: bound_session_id.clone().unwrap_or_default(),
+                                                    message_id: String::new(),
+                                                    details: vec![],
+                                                },
+                                            ),
+                                        ),
+                                    };
+                                }
+                            }
                             while let Some(envelope) = Self::try_next_stream_event(&mut session_events)? {
                                 yield StreamSessionResponse {
                                     response: Some(
@@ -372,6 +416,21 @@ impl MacpServer {
             }
         };
         Box::pin(output)
+    }
+
+    /// Returns true if the error should terminate a StreamSession stream.
+    /// Transport and binding errors terminate. Application-level validation
+    /// errors (from `runtime.process()`) are sent as inline MACPError per RFC-0001.
+    fn is_stream_terminal_error(status: &Status) -> bool {
+        matches!(
+            status.code(),
+            tonic::Code::Unauthenticated
+                | tonic::Code::Internal
+                | tonic::Code::ResourceExhausted
+                | tonic::Code::InvalidArgument
+                | tonic::Code::NotFound
+                | tonic::Code::AlreadyExists
+        )
     }
 
     fn status_from_error(err: MacpError) -> Status {
@@ -543,10 +602,11 @@ impl MacpRuntimeService for MacpServer {
                 "FORBIDDEN: only the session initiator can cancel",
             ));
         }
+        let sender = identity.sender.clone();
         let req = request.into_inner();
         match self
             .runtime
-            .cancel_session(&req.session_id, &req.reason)
+            .cancel_session(&req.session_id, &req.reason, &sender)
             .await
         {
             Ok(result) => Ok(Response::new(CancelSessionResponse {
@@ -1202,7 +1262,7 @@ mod tests {
         };
         assert_eq!(first_env.session_id, sid1);
         let err = stream.next().await.unwrap().unwrap_err();
-        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
     #[tokio::test]

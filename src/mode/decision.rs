@@ -231,9 +231,10 @@ impl Mode for DecisionMode {
             "Vote" => {
                 let payload =
                     VotePayload::decode(&*env.payload).map_err(|_| MacpError::InvalidPayload)?;
-                // RFC-MACP-0004: valid vote values
-                match payload.vote.as_str() {
-                    "approve" | "reject" | "abstain" => {}
+                // RFC-MACP-0007: valid vote values (case-insensitive input, stored UPPERCASE)
+                let normalized_vote = payload.vote.to_uppercase();
+                match normalized_vote.as_str() {
+                    "APPROVE" | "REJECT" | "ABSTAIN" => {}
                     _ => return Err(MacpError::InvalidPayload),
                 }
                 Self::ensure_can_vote(&state)?;
@@ -246,7 +247,7 @@ impl Mode for DecisionMode {
                     env.sender.clone(),
                     Vote {
                         proposal_id: payload.proposal_id,
-                        vote: payload.vote,
+                        vote: normalized_vote,
                         reason: payload.reason,
                         sender: env.sender.clone(),
                     },

@@ -70,8 +70,9 @@ fn default_quorum_type() -> String {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ObjectionHandlingRules {
-    #[serde(default)]
-    pub block_severity_vetoes: bool,
+    /// RFC-MACP-0012: objections with severity "critical" trigger veto logic.
+    #[serde(default, alias = "critical_severity_vetoes")]
+    pub critical_severity_vetoes: bool,
     #[serde(default = "default_veto_threshold")]
     pub veto_threshold: u32,
 }
@@ -79,7 +80,7 @@ pub struct ObjectionHandlingRules {
 impl Default for ObjectionHandlingRules {
     fn default() -> Self {
         Self {
-            block_severity_vetoes: false,
+            critical_severity_vetoes: false,
             veto_threshold: default_veto_threshold(),
         }
     }
@@ -280,7 +281,7 @@ mod tests {
         assert_eq!(rules.voting.algorithm, "none");
         assert!((rules.voting.threshold - 0.5).abs() < f64::EPSILON);
         assert_eq!(rules.voting.quorum.quorum_type, "count");
-        assert!(!rules.objection_handling.block_severity_vetoes);
+        assert!(!rules.objection_handling.critical_severity_vetoes);
         assert_eq!(rules.objection_handling.veto_threshold, 1);
         assert!(!rules.evaluation.required_before_voting);
         assert!((rules.evaluation.minimum_confidence).abs() < f64::EPSILON);
@@ -299,7 +300,7 @@ mod tests {
                 "weights": { "agent://fraud": 2.0, "agent://growth": 1.0 }
             },
             "objection_handling": {
-                "block_severity_vetoes": true,
+                "critical_severity_vetoes": true,
                 "veto_threshold": 2
             },
             "evaluation": {
@@ -319,7 +320,7 @@ mod tests {
         assert_eq!(rules.voting.quorum.quorum_type, "percentage");
         assert!((rules.voting.quorum.value - 75.0).abs() < f64::EPSILON);
         assert_eq!(*rules.voting.weights.get("agent://fraud").unwrap(), 2.0);
-        assert!(rules.objection_handling.block_severity_vetoes);
+        assert!(rules.objection_handling.critical_severity_vetoes);
         assert_eq!(rules.objection_handling.veto_threshold, 2);
         assert!(rules.evaluation.required_before_voting);
         assert!((rules.evaluation.minimum_confidence - 0.8).abs() < f64::EPSILON);
@@ -336,7 +337,7 @@ mod tests {
         let rules: DecisionPolicyRules = serde_json::from_value(json).unwrap();
         assert_eq!(rules.voting.algorithm, "unanimous");
         assert!((rules.voting.threshold - 0.5).abs() < f64::EPSILON);
-        assert!(!rules.objection_handling.block_severity_vetoes);
+        assert!(!rules.objection_handling.critical_severity_vetoes);
         assert_eq!(rules.objection_handling.veto_threshold, 1);
     }
 

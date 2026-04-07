@@ -299,7 +299,9 @@ impl Runtime {
         }
 
         // Resolve the governance policy for this session.
-        // RFC-0003 §3: sessions MUST bind policy_version; default to "policy.default".
+        // RFC-MACP-0012 §6.1: policy_version is resolved at SessionStart; empty
+        // resolves to "policy.default". The resolved PolicyDescriptor is stored
+        // immutably on the session for deterministic replay (RFC-MACP-0003 §3).
         let effective_policy_version = if start_payload.policy_version.is_empty() {
             crate::policy::defaults::DEFAULT_POLICY_ID.to_string()
         } else {
@@ -383,6 +385,13 @@ impl Runtime {
         })
     }
 
+    /// Process a session-scoped message following the RFC-MACP-0001 Section 7.3
+    /// terminal-state transition order:
+    /// 1. Check session OPEN
+    /// 2. Validate message (mode.authorize_sender + mode.on_message)
+    /// 3. Accept into history (log_store.append)
+    /// 4. Transition to RESOLVED (session.apply_mode_response)
+    /// 5. Reject subsequent messages (enforced by step 1 on next call)
     async fn process_message(&self, env: &Envelope) -> Result<ProcessResult, MacpError> {
         let mut guard = self.registry.sessions.write().await;
         let session = guard
@@ -466,13 +475,19 @@ impl Runtime {
         })
     }
 
-    /// Process a Signal envelope. Signals are informational out-of-band
-    /// notifications (progress, heartbeat, etc.). Broadcast to signal
-    /// subscribers but no session state mutation.
+    /// Process a Signal or Progress envelope. Signals are informational out-of-band
+    /// notifications. Progress messages carry structured ProgressPayload.
+    /// Neither mutates session state — both are broadcast to subscribers.
     async fn process_signal(&self, env: &Envelope) -> Result<ProcessResult, MacpError> {
+        // RFC-MACP-0001: validate ProgressPayload structure for Progress messages.
+        if env.message_type == "Progress" && !env.payload.is_empty() {
+            let _: crate::pb::ProgressPayload =
+                prost::Message::decode(&*env.payload).map_err(|_| MacpError::InvalidPayload)?;
+        }
         tracing::debug!(
             sender = %env.sender,
             message_id = %env.message_id,
+            message_type = %env.message_type,
             "signal received"
         );
         let _ = self.signal_bus.send(env.clone());
@@ -499,10 +514,14 @@ impl Runtime {
         guard.get(session_id).cloned()
     }
 
+    /// Cancel a session. The `cancelled_by` parameter MUST be the authenticated
+    /// sender of the CancelSession RPC (RFC-MACP-0001 Section 7.3: CancelSession
+    /// is a Core control-plane message; mode authorization does not apply).
     pub async fn cancel_session(
         &self,
         session_id: &str,
         reason: &str,
+        cancelled_by: &str,
     ) -> Result<ProcessResult, MacpError> {
         let mut guard = self.registry.sessions.write().await;
         let session = guard.get_mut(session_id).ok_or(MacpError::UnknownSession)?;
@@ -518,9 +537,15 @@ impl Runtime {
             });
         }
 
+        // RFC-MACP-0001: runtime encodes a proper SessionCancelPayload with
+        // `cancelled_by` set to the authenticated sender identity.
+        let cancel_payload = crate::pb::SessionCancelPayload {
+            reason: reason.to_string(),
+            cancelled_by: cancelled_by.to_string(),
+        };
         let cancel_entry = Self::make_internal_entry(
             "SessionCancel",
-            reason.as_bytes(),
+            &prost::Message::encode_to_vec(&cancel_payload),
             session_id,
             &session.mode,
         );
@@ -951,7 +976,10 @@ mod tests {
         .await
         .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        let result = rt.cancel_session(&sid, "cleanup").await.unwrap();
+        let result = rt
+            .cancel_session(&sid, "cleanup", "agent://orchestrator")
+            .await
+            .unwrap();
         assert_eq!(result.session_state, SessionState::Expired);
     }
 
@@ -1375,7 +1403,10 @@ mod tests {
         .await
         .unwrap();
 
-        let err = rt.cancel_session(&sid, "test cancel").await.unwrap_err();
+        let err = rt
+            .cancel_session(&sid, "test cancel", "agent://orchestrator")
+            .await
+            .unwrap_err();
         assert_eq!(err.to_string(), "StorageFailed");
     }
 }

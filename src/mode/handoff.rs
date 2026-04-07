@@ -997,4 +997,74 @@ mod tests {
             .unwrap();
         assert!(matches!(result, ModeResponse::PersistAndResolve { .. }));
     }
+
+    // --- Second HandoffOffer while first pending ---
+
+    #[test]
+    fn second_offer_to_different_target_while_first_pending_rejected() {
+        let mode = HandoffMode;
+        let mut session = base_session();
+        session.participants = vec!["owner".into(), "targetA".into(), "targetB".into()];
+        let result = mode
+            .on_session_start(&session, &env("owner", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        // First offer to targetA — succeeds
+        let result = mode
+            .on_message(
+                &session,
+                &env("owner", "HandoffOffer", make_offer("h1", "targetA")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        // Second offer to targetB while h1 is still pending — rejected
+        let err = mode
+            .on_message(
+                &session,
+                &env("owner", "HandoffOffer", make_offer("h2", "targetB")),
+            )
+            .unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
+    }
+
+    // --- After HandoffAccept, further offers are allowed (prior resolved) ---
+
+    #[test]
+    fn offer_after_accept_allowed_since_prior_resolved() {
+        let mode = HandoffMode;
+        let mut session = base_session();
+        session.participants = vec!["owner".into(), "target".into(), "other".into()];
+        let result = mode
+            .on_session_start(&session, &env("owner", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        // Send HandoffOffer to target
+        let result = mode
+            .on_message(
+                &session,
+                &env("owner", "HandoffOffer", make_offer("h1", "target")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        // Target accepts — h1 disposition moves from Offered to Accepted
+        let result = mode
+            .on_message(
+                &session,
+                &env("target", "HandoffAccept", make_accept("h1", "target")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        // New HandoffOffer is allowed because no offer is in Offered disposition
+        let result = mode
+            .on_message(
+                &session,
+                &env("owner", "HandoffOffer", make_offer("h2", "other")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let state: HandoffState = serde_json::from_slice(&session.mode_state).unwrap();
+        assert_eq!(state.offers.len(), 2);
+        assert_eq!(state.offers["h1"].disposition, HandoffDisposition::Accepted);
+        assert_eq!(state.offers["h2"].disposition, HandoffDisposition::Offered);
+    }
 }

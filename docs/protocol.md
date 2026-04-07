@@ -28,6 +28,14 @@ Clients should call `Initialize` before using the runtime.
 - `UnregisterExtMode`
 - `PromoteMode`
 
+## Policy RPCs
+
+- `RegisterPolicy` — register a new governance policy descriptor
+- `UnregisterPolicy` — remove a registered policy (does not affect active sessions)
+- `GetPolicy` — retrieve a policy descriptor by ID
+- `ListPolicies` — list registered policies, optionally filtered by mode
+- `WatchPolicies` — stream notifications on policy registry changes
+
 ## Streaming watch RPCs
 
 - `WatchModeRegistry` — sends the current registry state, then fires `RegistryChanged` on register/unregister/promote
@@ -50,7 +58,8 @@ Clients should call `Initialize` before using the runtime.
 - stream attachment observes future accepted envelopes from the bind point; it does not backfill earlier history
 - accepted envelope order matches runtime admission order for that session
 - mixed-session streams are rejected with `FAILED_PRECONDITION`
-- stream-level validation failures terminate the stream with a gRPC status; use `Send` if you need explicit per-message negative acknowledgements
+- application-level validation errors (e.g. InvalidPayload, PolicyDenied) are sent as inline `MACPError` responses; the stream remains open (RFC-MACP-0001)
+- transport-level failures (auth, rate limit, internal) terminate the stream with a gRPC status
 - to attach to an existing session without mutating it, send a session-scoped `Signal` envelope with the correct `session_id` and `mode`
 
 ## Strict session start rules

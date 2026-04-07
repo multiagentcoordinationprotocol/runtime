@@ -45,27 +45,38 @@ pub fn evaluate_decision_commitment(
     let mut allow_reasons: Vec<String> = Vec::new();
 
     // 1. Check evaluation requirements (minimum confidence threshold)
+    // RFC-MACP-0007: REVIEW evaluations are informational only and MUST NOT
+    // satisfy confidence thresholds or "required before voting" checks.
+    let qualifying_evaluations: Vec<_> = state
+        .evaluations
+        .iter()
+        .filter(|e| {
+            let rec = e.recommendation.to_uppercase();
+            rec != "REVIEW"
+        })
+        .collect();
+
     if rules.evaluation.required_before_voting && rules.evaluation.minimum_confidence > 0.0 {
-        let meets_confidence = state
-            .evaluations
+        let meets_confidence = qualifying_evaluations
             .iter()
             .any(|e| e.confidence >= rules.evaluation.minimum_confidence);
-        if state.evaluations.is_empty() || !meets_confidence {
+        if qualifying_evaluations.is_empty() || !meets_confidence {
             deny_reasons.push(format!(
-                "no evaluation meets minimum confidence threshold: {:.2}",
+                "no qualifying evaluation meets minimum confidence threshold: {:.2}",
                 rules.evaluation.minimum_confidence
             ));
         }
-    } else if rules.evaluation.required_before_voting && state.evaluations.is_empty() {
-        deny_reasons.push("evaluations required before voting but none provided".into());
+    } else if rules.evaluation.required_before_voting && qualifying_evaluations.is_empty() {
+        deny_reasons.push("evaluations required before voting but none provided (REVIEW evaluations are informational only)".into());
     }
 
-    // 2. Check blocking objections (veto by count of "block" severity objections)
-    if rules.objection_handling.block_severity_vetoes {
+    // 2. Check critical objections (veto by count of "critical" severity objections)
+    // RFC-MACP-0007 §5: only Objections with severity "critical" trigger veto logic
+    if rules.objection_handling.critical_severity_vetoes {
         let blocking: Vec<&str> = state
             .objections
             .iter()
-            .filter(|o| o.severity == "block")
+            .filter(|o| o.severity == "critical")
             .map(|o| o.sender.as_str())
             .collect();
         if blocking.len() >= rules.objection_handling.veto_threshold as usize {
@@ -229,11 +240,11 @@ fn check_voting_algorithm(
             }
         }
         "unanimous" => {
-            // All declared participants must have voted "approve"
+            // All declared participants must have voted "APPROVE"
             let all_voted = participants.iter().all(|p| {
                 votes
                     .values()
-                    .any(|pv| pv.get(p).map(|v| v.vote == "approve").unwrap_or(false))
+                    .any(|pv| pv.get(p).map(|v| v.vote == "APPROVE").unwrap_or(false))
             });
             if all_voted && reject_count == 0 {
                 VotingResult::Passed("unanimous vote passed: all participants approved".into())
@@ -304,9 +315,9 @@ fn aggregate_votes(votes: &BTreeMap<String, BTreeMap<String, Vote>>) -> (usize, 
         for vote in proposal_votes.values() {
             total += 1;
             match vote.vote.as_str() {
-                "approve" => approve += 1,
-                "reject" => reject += 1,
-                _ => {} // abstain or other values don't count for/against
+                "APPROVE" => approve += 1,
+                "REJECT" => reject += 1,
+                _ => {} // ABSTAIN or other values don't count for/against
             }
         }
     }
@@ -326,7 +337,7 @@ fn compute_weighted_votes(
         for (voter, vote) in proposal_votes {
             let weight = weights.get(voter).copied().unwrap_or(1.0);
             weighted_total += weight;
-            if vote.vote == "approve" {
+            if vote.vote == "APPROVE" {
                 weighted_approve += weight;
             }
         }
@@ -584,9 +595,9 @@ mod tests {
             "voting": { "algorithm": "majority", "threshold": 0.5 }
         }));
         let state = make_state_with_votes(vec![
-            ("p1", "agent://fraud", "approve"),
-            ("p1", "agent://growth", "approve"),
-            ("p1", "agent://compliance", "reject"),
+            ("p1", "agent://fraud", "APPROVE"),
+            ("p1", "agent://growth", "APPROVE"),
+            ("p1", "agent://compliance", "REJECT"),
         ]);
         let result = evaluate_decision_commitment(&policy, &state, &participants());
         assert!(matches!(result, PolicyDecision::Allow { .. }));
@@ -598,9 +609,9 @@ mod tests {
             "voting": { "algorithm": "majority", "threshold": 0.5 }
         }));
         let state = make_state_with_votes(vec![
-            ("p1", "agent://fraud", "reject"),
-            ("p1", "agent://growth", "reject"),
-            ("p1", "agent://compliance", "approve"),
+            ("p1", "agent://fraud", "REJECT"),
+            ("p1", "agent://growth", "REJECT"),
+            ("p1", "agent://compliance", "APPROVE"),
         ]);
         let result = evaluate_decision_commitment(&policy, &state, &participants());
         assert!(matches!(result, PolicyDecision::Deny { .. }));
@@ -612,8 +623,8 @@ mod tests {
             "voting": { "algorithm": "majority", "threshold": 0.5 }
         }));
         let state = make_state_with_votes(vec![
-            ("p1", "agent://fraud", "approve"),
-            ("p1", "agent://growth", "reject"),
+            ("p1", "agent://fraud", "APPROVE"),
+            ("p1", "agent://growth", "REJECT"),
         ]);
         let result = evaluate_decision_commitment(&policy, &state, &participants());
         // 50% >= 50% passes (threshold comparison uses >=)
@@ -628,9 +639,9 @@ mod tests {
             "voting": { "algorithm": "supermajority" }
         }));
         let state = make_state_with_votes(vec![
-            ("p1", "agent://fraud", "approve"),
-            ("p1", "agent://growth", "approve"),
-            ("p1", "agent://compliance", "reject"),
+            ("p1", "agent://fraud", "APPROVE"),
+            ("p1", "agent://growth", "APPROVE"),
+            ("p1", "agent://compliance", "REJECT"),
         ]);
         let result = evaluate_decision_commitment(&policy, &state, &participants());
         // 2/3 = 66.7% >= 66.7%
@@ -643,9 +654,9 @@ mod tests {
             "voting": { "algorithm": "supermajority", "threshold": 0.75 }
         }));
         let state = make_state_with_votes(vec![
-            ("p1", "agent://fraud", "approve"),
-            ("p1", "agent://growth", "approve"),
-            ("p1", "agent://compliance", "reject"),
+            ("p1", "agent://fraud", "APPROVE"),
+            ("p1", "agent://growth", "APPROVE"),
+            ("p1", "agent://compliance", "REJECT"),
         ]);
         let result = evaluate_decision_commitment(&policy, &state, &participants());
         // 2/3 = 66.7% < 75%
@@ -660,9 +671,9 @@ mod tests {
             "voting": { "algorithm": "unanimous" }
         }));
         let state = make_state_with_votes(vec![
-            ("p1", "agent://fraud", "approve"),
-            ("p1", "agent://growth", "approve"),
-            ("p1", "agent://compliance", "approve"),
+            ("p1", "agent://fraud", "APPROVE"),
+            ("p1", "agent://growth", "APPROVE"),
+            ("p1", "agent://compliance", "APPROVE"),
         ]);
         let result = evaluate_decision_commitment(&policy, &state, &participants());
         assert!(matches!(result, PolicyDecision::Allow { .. }));
@@ -674,9 +685,9 @@ mod tests {
             "voting": { "algorithm": "unanimous" }
         }));
         let state = make_state_with_votes(vec![
-            ("p1", "agent://fraud", "approve"),
-            ("p1", "agent://growth", "approve"),
-            ("p1", "agent://compliance", "reject"),
+            ("p1", "agent://fraud", "APPROVE"),
+            ("p1", "agent://growth", "APPROVE"),
+            ("p1", "agent://compliance", "REJECT"),
         ]);
         let result = evaluate_decision_commitment(&policy, &state, &participants());
         assert!(matches!(result, PolicyDecision::Deny { .. }));
@@ -688,8 +699,8 @@ mod tests {
             "voting": { "algorithm": "unanimous" }
         }));
         let state = make_state_with_votes(vec![
-            ("p1", "agent://fraud", "approve"),
-            ("p1", "agent://growth", "approve"),
+            ("p1", "agent://fraud", "APPROVE"),
+            ("p1", "agent://growth", "APPROVE"),
             // compliance didn't vote
         ]);
         let result = evaluate_decision_commitment(&policy, &state, &participants());
@@ -713,9 +724,9 @@ mod tests {
         }));
         // fraud (weight 3) approves, others reject => 3/5 = 60% > 50%
         let state = make_state_with_votes(vec![
-            ("p1", "agent://fraud", "approve"),
-            ("p1", "agent://growth", "reject"),
-            ("p1", "agent://compliance", "reject"),
+            ("p1", "agent://fraud", "APPROVE"),
+            ("p1", "agent://growth", "REJECT"),
+            ("p1", "agent://compliance", "REJECT"),
         ]);
         let result = evaluate_decision_commitment(&policy, &state, &participants());
         assert!(matches!(result, PolicyDecision::Allow { .. }));
@@ -736,9 +747,9 @@ mod tests {
         }));
         // fraud (weight 3) rejects, others approve => 2/5 = 40% < 50%
         let state = make_state_with_votes(vec![
-            ("p1", "agent://fraud", "reject"),
-            ("p1", "agent://growth", "approve"),
-            ("p1", "agent://compliance", "approve"),
+            ("p1", "agent://fraud", "REJECT"),
+            ("p1", "agent://growth", "APPROVE"),
+            ("p1", "agent://compliance", "APPROVE"),
         ]);
         let result = evaluate_decision_commitment(&policy, &state, &participants());
         assert!(matches!(result, PolicyDecision::Deny { .. }));
@@ -752,9 +763,9 @@ mod tests {
             "voting": { "algorithm": "plurality" }
         }));
         let state = make_state_with_votes(vec![
-            ("p1", "agent://fraud", "approve"),
-            ("p1", "agent://growth", "approve"),
-            ("p1", "agent://compliance", "reject"),
+            ("p1", "agent://fraud", "APPROVE"),
+            ("p1", "agent://growth", "APPROVE"),
+            ("p1", "agent://compliance", "REJECT"),
         ]);
         let result = evaluate_decision_commitment(&policy, &state, &participants());
         assert!(matches!(result, PolicyDecision::Allow { .. }));
@@ -766,8 +777,8 @@ mod tests {
             "voting": { "algorithm": "plurality" }
         }));
         let state = make_state_with_votes(vec![
-            ("p1", "agent://fraud", "approve"),
-            ("p1", "agent://growth", "reject"),
+            ("p1", "agent://fraud", "APPROVE"),
+            ("p1", "agent://growth", "REJECT"),
         ]);
         let result = evaluate_decision_commitment(&policy, &state, &participants());
         assert!(matches!(result, PolicyDecision::Deny { .. }));
@@ -779,7 +790,7 @@ mod tests {
     fn veto_blocks_commitment_when_blocking_objections_reach_threshold() {
         let policy = make_policy(serde_json::json!({
             "voting": { "algorithm": "none" },
-            "objection_handling": { "block_severity_vetoes": true, "veto_threshold": 1 }
+            "objection_handling": { "critical_severity_vetoes": true, "veto_threshold": 1 }
         }));
         let mut state = make_state_with_votes(vec![]);
         state.proposals.insert(
@@ -794,7 +805,7 @@ mod tests {
         state.objections.push(Objection {
             proposal_id: "p1".into(),
             reason: "too risky".into(),
-            severity: "block".into(),
+            severity: "critical".into(),
             sender: "agent://compliance".into(),
         });
         let result = evaluate_decision_commitment(&policy, &state, &participants());
@@ -805,7 +816,7 @@ mod tests {
     fn veto_allows_when_objections_below_threshold() {
         let policy = make_policy(serde_json::json!({
             "voting": { "algorithm": "none" },
-            "objection_handling": { "block_severity_vetoes": true, "veto_threshold": 3 }
+            "objection_handling": { "critical_severity_vetoes": true, "veto_threshold": 3 }
         }));
         let mut state = make_state_with_votes(vec![]);
         state.proposals.insert(
@@ -821,7 +832,7 @@ mod tests {
         state.objections.push(Objection {
             proposal_id: "p1".into(),
             reason: "minor concern".into(),
-            severity: "block".into(),
+            severity: "critical".into(),
             sender: "agent://compliance".into(),
         });
         let result = evaluate_decision_commitment(&policy, &state, &participants());
@@ -832,7 +843,7 @@ mod tests {
     fn veto_ignores_non_blocking_severity_objections() {
         let policy = make_policy(serde_json::json!({
             "voting": { "algorithm": "none" },
-            "objection_handling": { "block_severity_vetoes": true, "veto_threshold": 1 }
+            "objection_handling": { "critical_severity_vetoes": true, "veto_threshold": 1 }
         }));
         let mut state = make_state_with_votes(vec![]);
         state.proposals.insert(
@@ -844,7 +855,7 @@ mod tests {
                 sender: "initiator".into(),
             },
         );
-        // "high" severity is NOT "block", so it should NOT trigger veto
+        // "high" severity is NOT "critical", so it should NOT trigger veto
         state.objections.push(Objection {
             proposal_id: "p1".into(),
             reason: "serious concern".into(),
@@ -859,7 +870,7 @@ mod tests {
     fn veto_disabled_ignores_objections() {
         let policy = make_policy(serde_json::json!({
             "voting": { "algorithm": "none" },
-            "objection_handling": { "block_severity_vetoes": false }
+            "objection_handling": { "critical_severity_vetoes": false }
         }));
         let mut state = make_state_with_votes(vec![]);
         state.proposals.insert(
@@ -895,8 +906,8 @@ mod tests {
         }));
         // Only 2 voters, need 3
         let state = make_state_with_votes(vec![
-            ("p1", "agent://fraud", "approve"),
-            ("p1", "agent://growth", "approve"),
+            ("p1", "agent://fraud", "APPROVE"),
+            ("p1", "agent://growth", "APPROVE"),
         ]);
         let result = evaluate_decision_commitment(&policy, &state, &participants());
         assert!(matches!(result, PolicyDecision::Deny { .. }));
@@ -917,8 +928,8 @@ mod tests {
         }));
         // Only 2 of 3 voted: 66.7% < 100%
         let state = make_state_with_votes(vec![
-            ("p1", "agent://fraud", "approve"),
-            ("p1", "agent://growth", "approve"),
+            ("p1", "agent://fraud", "APPROVE"),
+            ("p1", "agent://growth", "APPROVE"),
         ]);
         let result = evaluate_decision_commitment(&policy, &state, &participants());
         assert!(matches!(result, PolicyDecision::Deny { .. }));
@@ -935,8 +946,8 @@ mod tests {
             "commitment": { "require_vote_quorum": false }
         }));
         let state = make_state_with_votes(vec![
-            ("p1", "agent://fraud", "approve"),
-            ("p1", "agent://growth", "approve"),
+            ("p1", "agent://fraud", "APPROVE"),
+            ("p1", "agent://growth", "APPROVE"),
         ]);
         let result = evaluate_decision_commitment(&policy, &state, &participants());
         // Quorum not met, but not required => allow (majority is met)
@@ -1048,14 +1059,14 @@ mod tests {
                 "threshold": 0.5,
                 "quorum": { "type": "count", "value": 10 }
             },
-            "objection_handling": { "block_severity_vetoes": true, "veto_threshold": 1 },
+            "objection_handling": { "critical_severity_vetoes": true, "veto_threshold": 1 },
             "commitment": { "require_vote_quorum": true }
         }));
-        let mut state = make_state_with_votes(vec![("p1", "agent://fraud", "reject")]);
+        let mut state = make_state_with_votes(vec![("p1", "agent://fraud", "REJECT")]);
         state.objections.push(Objection {
             proposal_id: "p1".into(),
             reason: "bad".into(),
-            severity: "block".into(),
+            severity: "critical".into(),
             sender: "agent://compliance".into(),
         });
         let result = evaluate_decision_commitment(&policy, &state, &participants());
@@ -1203,6 +1214,171 @@ mod tests {
             "abstention": { "counts_toward_quorum": true }
         }));
         let result = super::evaluate_quorum_commitment(&policy, 2, 1, 0, 5);
+        assert!(matches!(result, PolicyDecision::Allow { .. }));
+    }
+
+    // ── REVIEW evaluation filtering ────────────────────────────────
+
+    #[test]
+    fn review_evaluation_does_not_satisfy_required_before_voting() {
+        let policy = make_policy(serde_json::json!({
+            "voting": { "algorithm": "none" },
+            "evaluation": { "required_before_voting": true, "minimum_confidence": 0.5 }
+        }));
+        let mut state = make_state_with_votes(vec![]);
+        state.proposals.insert(
+            "p1".into(),
+            Proposal {
+                proposal_id: "p1".into(),
+                option: "option-1".into(),
+                rationale: "reason".into(),
+                sender: "initiator".into(),
+            },
+        );
+        // Only REVIEW evaluations — these are informational and MUST NOT
+        // satisfy the required_before_voting check.
+        state.evaluations.push(Evaluation {
+            proposal_id: "p1".into(),
+            recommendation: "REVIEW".into(),
+            confidence: 0.9,
+            reason: "needs more analysis".into(),
+            sender: "agent://fraud".into(),
+        });
+        let result = evaluate_decision_commitment(&policy, &state, &participants());
+        assert!(matches!(result, PolicyDecision::Deny { .. }));
+    }
+
+    #[test]
+    fn review_evaluation_does_not_satisfy_minimum_confidence() {
+        let policy = make_policy(serde_json::json!({
+            "voting": { "algorithm": "none" },
+            "evaluation": { "required_before_voting": true, "minimum_confidence": 0.5 }
+        }));
+        let mut state = make_state_with_votes(vec![]);
+        state.proposals.insert(
+            "p1".into(),
+            Proposal {
+                proposal_id: "p1".into(),
+                option: "option-1".into(),
+                rationale: "reason".into(),
+                sender: "initiator".into(),
+            },
+        );
+        // REVIEW evaluation with high confidence (filtered out)
+        state.evaluations.push(Evaluation {
+            proposal_id: "p1".into(),
+            recommendation: "REVIEW".into(),
+            confidence: 0.9,
+            reason: "informational only".into(),
+            sender: "agent://fraud".into(),
+        });
+        // APPROVE evaluation with confidence below threshold
+        state.evaluations.push(Evaluation {
+            proposal_id: "p1".into(),
+            recommendation: "APPROVE".into(),
+            confidence: 0.3,
+            reason: "low confidence approval".into(),
+            sender: "agent://growth".into(),
+        });
+        let result = evaluate_decision_commitment(&policy, &state, &participants());
+        // REVIEW is filtered out; APPROVE at 0.3 < 0.5 threshold => deny
+        assert!(matches!(result, PolicyDecision::Deny { .. }));
+    }
+
+    #[test]
+    fn approve_evaluation_alongside_review_allows() {
+        let policy = make_policy(serde_json::json!({
+            "voting": { "algorithm": "none" },
+            "evaluation": { "required_before_voting": true, "minimum_confidence": 0.5 }
+        }));
+        let mut state = make_state_with_votes(vec![]);
+        state.proposals.insert(
+            "p1".into(),
+            Proposal {
+                proposal_id: "p1".into(),
+                option: "option-1".into(),
+                rationale: "reason".into(),
+                sender: "initiator".into(),
+            },
+        );
+        // REVIEW evaluation (filtered out from qualifying evaluations)
+        state.evaluations.push(Evaluation {
+            proposal_id: "p1".into(),
+            recommendation: "REVIEW".into(),
+            confidence: 0.9,
+            reason: "informational only".into(),
+            sender: "agent://fraud".into(),
+        });
+        // APPROVE evaluation that meets the confidence threshold
+        state.evaluations.push(Evaluation {
+            proposal_id: "p1".into(),
+            recommendation: "APPROVE".into(),
+            confidence: 0.8,
+            reason: "high confidence approval".into(),
+            sender: "agent://growth".into(),
+        });
+        let result = evaluate_decision_commitment(&policy, &state, &participants());
+        // APPROVE at 0.8 >= 0.5 threshold => allow
+        assert!(matches!(result, PolicyDecision::Allow { .. }));
+    }
+
+    // ── Critical objection veto vs BLOCK evaluation ────────────────
+
+    #[test]
+    fn critical_severity_objection_triggers_veto() {
+        let policy = make_policy(serde_json::json!({
+            "voting": { "algorithm": "none" },
+            "objection_handling": { "critical_severity_vetoes": true, "veto_threshold": 1 }
+        }));
+        let mut state = make_state_with_votes(vec![]);
+        state.proposals.insert(
+            "p1".into(),
+            Proposal {
+                proposal_id: "p1".into(),
+                option: "option-1".into(),
+                rationale: "reason".into(),
+                sender: "initiator".into(),
+            },
+        );
+        // A single critical-severity objection should trigger veto
+        state.objections.push(Objection {
+            proposal_id: "p1".into(),
+            reason: "unacceptable risk".into(),
+            severity: "critical".into(),
+            sender: "agent://compliance".into(),
+        });
+        let result = evaluate_decision_commitment(&policy, &state, &participants());
+        assert!(matches!(result, PolicyDecision::Deny { .. }));
+    }
+
+    #[test]
+    fn block_evaluation_does_not_trigger_objection_veto_logic() {
+        let policy = make_policy(serde_json::json!({
+            "voting": { "algorithm": "none" },
+            "objection_handling": { "critical_severity_vetoes": true, "veto_threshold": 1 }
+        }));
+        let mut state = make_state_with_votes(vec![]);
+        state.proposals.insert(
+            "p1".into(),
+            Proposal {
+                proposal_id: "p1".into(),
+                option: "option-1".into(),
+                rationale: "reason".into(),
+                sender: "initiator".into(),
+            },
+        );
+        // A BLOCK evaluation is NOT an objection — veto logic only looks
+        // at the objections list, not evaluations.
+        state.evaluations.push(Evaluation {
+            proposal_id: "p1".into(),
+            recommendation: "BLOCK".into(),
+            confidence: 0.95,
+            reason: "strongly disagree".into(),
+            sender: "agent://compliance".into(),
+        });
+        // No objections in the objections list
+        let result = evaluate_decision_commitment(&policy, &state, &participants());
+        // BLOCK evaluation != critical objection, so veto logic is not triggered
         assert!(matches!(result, PolicyDecision::Allow { .. }));
     }
 }

@@ -1024,4 +1024,100 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.to_string(), "PolicyDenied");
     }
+
+    // --- All participants abstain — eligible for negative commitment ---
+
+    #[test]
+    fn all_participants_abstain_allows_negative_commitment() {
+        let mode = QuorumMode;
+        let mut session = base_session();
+        // 3 participants, required_approvals = 2
+        let result = mode
+            .on_session_start(&session, &env("coordinator", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env(
+                    "coordinator",
+                    "ApprovalRequest",
+                    make_approval_request("r1", 2),
+                ),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        // All 3 participants abstain
+        let result = mode
+            .on_message(
+                &session,
+                &env("alice", "Abstain", make_abstain("r1", "neutral")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("bob", "Abstain", make_abstain("r1", "neutral")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("carol", "Abstain", make_abstain("r1", "neutral")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        // Threshold is unreachable: 0 approvals + 0 remaining < 2 required
+        // commitment_ready() returns true, so a negative commitment should succeed
+        let negative_commitment = CommitmentPayload {
+            commitment_id: "c1".into(),
+            action: "quorum.rejected".into(),
+            authority_scope: "deploy".into(),
+            reason: "all abstained".into(),
+            mode_version: "1.0.0".into(),
+            policy_version: "policy".into(),
+            configuration_version: "config".into(),
+            outcome_positive: false,
+        }
+        .encode_to_vec();
+        let result = mode
+            .on_message(
+                &session,
+                &env("coordinator", "Commitment", negative_commitment),
+            )
+            .unwrap();
+        assert!(matches!(result, ModeResponse::PersistAndResolve { .. }));
+    }
+
+    // --- Initiator not in participants cannot cast ballot ---
+
+    #[test]
+    fn initiator_not_in_participants_cannot_cast_ballot() {
+        let mode = QuorumMode;
+        let mut session = base_session();
+        // coordinator is initiator but NOT in participants
+        // participants are alice, bob, carol (coordinator excluded)
+        let result = mode
+            .on_session_start(&session, &env("coordinator", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env(
+                    "coordinator",
+                    "ApprovalRequest",
+                    make_approval_request("r1", 2),
+                ),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        // coordinator tries to Approve — should be Forbidden because coordinator
+        // is not a declared participant
+        let approve_env = env("coordinator", "Approve", make_approve("r1", "yes"));
+        let err = mode.authorize_sender(&session, &approve_env).unwrap_err();
+        assert_eq!(err.to_string(), "Forbidden");
+    }
 }

@@ -70,7 +70,7 @@
     "votes": {
       "p1": {
         "agent://a": {
-          "vote": "approve"
+          "vote": "APPROVE"
         }
       }
     }

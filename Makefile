@@ -23,7 +23,10 @@ test-integration:
 test-conformance:
 	cargo test conformance
 
-test-all: fmt clippy test test-integration test-conformance
+test-policy:
+	cargo test policy
+
+test-all: fmt clippy test test-integration test-conformance test-policy
 
 coverage:
 	cargo tarpaulin --all-targets --out html

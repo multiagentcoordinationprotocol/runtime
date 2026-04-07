@@ -1221,4 +1221,81 @@ mod tests {
             .unwrap();
         assert!(matches!(result, ModeResponse::PersistAndResolve { .. }));
     }
+
+    // --- Competing TaskAccept ---
+
+    #[test]
+    fn competing_task_accept_second_rejected() {
+        let mode = TaskMode;
+        let mut session = base_session();
+        // Three participants: planner (initiator), w1, w2
+        session.participants = vec!["planner".into(), "w1".into(), "w2".into()];
+        let result = mode
+            .on_session_start(&session, &env("planner", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        // Open-assignee task (no specific requested_assignee)
+        let result = mode
+            .on_message(
+                &session,
+                &env("planner", "TaskRequest", make_task_request("t1", "")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        // First accept from w1 succeeds
+        let result = mode
+            .on_message(
+                &session,
+                &env("w1", "TaskAccept", make_task_accept("t1", "w1")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let state: TaskState = serde_json::from_slice(&session.mode_state).unwrap();
+        assert_eq!(state.active_assignee, Some("w1".into()));
+        // Second accept from w2 is rejected (active_assignee already set)
+        let err = mode
+            .on_message(
+                &session,
+                &env("w2", "TaskAccept", make_task_accept("t1", "w2")),
+            )
+            .unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
+    }
+
+    // --- Only active assignee can send TaskUpdate ---
+
+    #[test]
+    fn only_active_assignee_can_send_task_update() {
+        let mode = TaskMode;
+        let mut session = base_session();
+        session.participants = vec!["planner".into(), "agentA".into(), "agentB".into()];
+        let result = mode
+            .on_session_start(&session, &env("planner", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        // Open-assignee task
+        let result = mode
+            .on_message(
+                &session,
+                &env("planner", "TaskRequest", make_task_request("t1", "")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        // agentA accepts the task
+        let result = mode
+            .on_message(
+                &session,
+                &env("agentA", "TaskAccept", make_task_accept("t1", "agentA")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        // agentB (non-assignee) attempts to send TaskUpdate — expect Forbidden
+        let err = mode
+            .on_message(
+                &session,
+                &env("agentB", "TaskUpdate", make_task_update("t1")),
+            )
+            .unwrap_err();
+        assert_eq!(err.to_string(), "Forbidden");
+    }
 }

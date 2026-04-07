@@ -123,6 +123,16 @@ jobs:
         env:
           MACP_MEMORY_ONLY: "1"
 
+      - name: Run conformance tests
+        run: cargo test conformance
+        env:
+          MACP_MEMORY_ONLY: "1"
+
+      - name: Run policy tests
+        run: cargo test policy
+        env:
+          MACP_MEMORY_ONLY: "1"
+
   build:
     name: Build
     runs-on: ubuntu-latest
