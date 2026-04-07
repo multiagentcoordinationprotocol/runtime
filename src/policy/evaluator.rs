@@ -1407,7 +1407,7 @@ mod tests {
                 "threshold": 0.9
             }
         }));
-        let mut state = make_state_with_votes(vec![
+        let state = make_state_with_votes(vec![
             ("p1", "agent://fraud", "APPROVE"),
             ("p1", "agent://compliance", "APPROVE"),
             ("p1", "agent://ops", "APPROVE"),
