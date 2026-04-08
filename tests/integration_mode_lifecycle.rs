@@ -25,7 +25,7 @@ fn session_start(participants: Vec<String>) -> Vec<u8> {
         participants,
         mode_version: "1.0.0".into(),
         configuration_version: "cfg-1".into(),
-        policy_version: "policy-1".into(),
+        policy_version: String::new(),
         ttl_ms: 60_000,
         context: vec![],
         roots: vec![],
@@ -60,8 +60,9 @@ fn commitment(action: &str) -> Vec<u8> {
         authority_scope: "test".into(),
         reason: "done".into(),
         mode_version: "1.0.0".into(),
-        policy_version: "policy-1".into(),
+        policy_version: "policy.default".into(),
         configuration_version: "cfg-1".into(),
+        outcome_positive: true,
     }
     .encode_to_vec()
 }
@@ -81,7 +82,11 @@ async fn decision_full_lifecycle_through_runtime() {
             "m1",
             &sid,
             "agent://orchestrator",
-            session_start(vec!["agent://a".into(), "agent://b".into()]),
+            session_start(vec![
+                "agent://orchestrator".into(),
+                "agent://a".into(),
+                "agent://b".into(),
+            ]),
         ),
         None,
     )

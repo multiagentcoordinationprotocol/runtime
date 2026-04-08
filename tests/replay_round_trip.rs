@@ -41,6 +41,7 @@ fn incoming(
         session_id: "s1".into(),
         mode: mode.into(),
         macp_version: "1.0".into(),
+        timestamp_unix_ms: ts,
     }
 }
 
@@ -53,6 +54,7 @@ fn commitment(action: &str) -> Vec<u8> {
         mode_version: "1.0.0".into(),
         policy_version: "policy-1".into(),
         configuration_version: "cfg-1".into(),
+        outcome_positive: true,
     }
     .encode_to_vec()
 }
@@ -69,7 +71,7 @@ fn replay_decision_session() {
             "m1",
             "SessionStart",
             "agent://orchestrator",
-            start_payload(vec!["agent://a", "agent://b"]),
+            start_payload(vec!["agent://orchestrator", "agent://a", "agent://b"]),
             mode,
             1000,
         ),
@@ -110,13 +112,13 @@ fn replay_decision_session() {
         ),
     ];
 
-    let session = replay_session("s1", &entries, &registry).unwrap();
+    let session = replay_session("s1", &entries, &registry, None).unwrap();
     assert_eq!(session.state, SessionState::Resolved);
     assert!(session.resolution.is_some());
     assert_eq!(session.seen_message_ids.len(), 4);
     let mode_state: serde_json::Value = serde_json::from_slice(&session.mode_state).unwrap();
     assert_eq!(mode_state["phase"], "Committed");
-    assert_eq!(mode_state["votes"]["p1"]["agent://a"]["vote"], "approve");
+    assert_eq!(mode_state["votes"]["p1"]["agent://a"]["vote"], "APPROVE");
 }
 
 #[test]
@@ -184,7 +186,7 @@ fn replay_proposal_session() {
         ),
     ];
 
-    let session = replay_session("s1", &entries, &registry).unwrap();
+    let session = replay_session("s1", &entries, &registry, None).unwrap();
     assert_eq!(session.state, SessionState::Resolved);
     assert!(session.resolution.is_some());
     assert_eq!(session.seen_message_ids.len(), 5);
@@ -259,7 +261,7 @@ fn replay_task_session() {
         ),
     ];
 
-    let session = replay_session("s1", &entries, &registry).unwrap();
+    let session = replay_session("s1", &entries, &registry, None).unwrap();
     assert_eq!(session.state, SessionState::Resolved);
     assert!(session.resolution.is_some());
 }
@@ -317,7 +319,7 @@ fn replay_handoff_session() {
         ),
     ];
 
-    let session = replay_session("s1", &entries, &registry).unwrap();
+    let session = replay_session("s1", &entries, &registry, None).unwrap();
     assert_eq!(session.state, SessionState::Resolved);
     assert!(session.resolution.is_some());
 }
@@ -387,7 +389,7 @@ fn replay_quorum_session() {
         ),
     ];
 
-    let session = replay_session("s1", &entries, &registry).unwrap();
+    let session = replay_session("s1", &entries, &registry, None).unwrap();
     assert_eq!(session.state, SessionState::Resolved);
     assert!(session.resolution.is_some());
     assert_eq!(session.seen_message_ids.len(), 5);
@@ -433,7 +435,7 @@ fn replay_multi_round_session() {
         ),
     ];
 
-    let session = replay_session("s1", &entries, &registry).unwrap();
+    let session = replay_session("s1", &entries, &registry, None).unwrap();
     assert_eq!(session.state, SessionState::Resolved);
     assert!(session.resolution.is_some());
     assert_eq!(session.seen_message_ids.len(), 4);

@@ -2,12 +2,13 @@
   "mode": "macp.mode.decision.v1",
   "initiator": "agent://orchestrator",
   "participants": [
+    "agent://orchestrator",
     "agent://a",
     "agent://b"
   ],
   "mode_version": "1.0.0",
   "configuration_version": "cfg-1",
-  "policy_version": "policy-1",
+  "policy_version": "",
   "ttl_ms": 60000,
   "messages": [
     {
@@ -43,8 +44,9 @@
         "authority_scope": "test",
         "reason": "done",
         "mode_version": "1.0.0",
-        "policy_version": "policy-1",
-        "configuration_version": "cfg-1"
+        "policy_version": "policy.default",
+        "configuration_version": "cfg-1",
+        "outcome_positive": true
       },
       "expect": "accept"
     }
@@ -54,7 +56,8 @@
   "expected_resolution": {
     "action": "decision.selected",
     "mode_version": "1.0.0",
-    "configuration_version": "cfg-1"
+    "configuration_version": "cfg-1",
+    "outcome_positive": true
   },
   "expected_mode_state": {
     "phase": "Committed",
@@ -67,7 +70,7 @@
     "votes": {
       "p1": {
         "agent://a": {
-          "vote": "approve"
+          "vote": "APPROVE"
         }
       }
     }

@@ -123,6 +123,16 @@ jobs:
         env:
           MACP_MEMORY_ONLY: "1"
 
+      - name: Run conformance tests
+        run: cargo test conformance
+        env:
+          MACP_MEMORY_ONLY: "1"
+
+      - name: Run policy tests
+        run: cargo test policy
+        env:
+          MACP_MEMORY_ONLY: "1"
+
   build:
     name: Build
     runs-on: ubuntu-latest
@@ -153,69 +163,6 @@ jobs:
 
       - name: Build release
         run: cargo build --release
-
-  lint-protobuf:
-    name: Lint Protocol Buffers
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install buf
-        uses: bufbuild/buf-setup-action@v1
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Lint protobuf with buf
-        run: buf lint proto
-
-      - name: Check for breaking changes
-        if: github.event_name == 'pull_request'
-        run: |
-          git fetch origin main
-          # Skip if main branch doesn't have a buf module yet
-          if git show origin/main:proto/buf.yaml > /dev/null 2>&1; then
-            buf breaking proto --against '.git#branch=origin/main,subdir=proto'
-          else
-            echo "No buf module found on main branch, skipping breaking change check"
-          fi
-
-  proto-sync:
-    name: Proto Sync Check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: bufbuild/buf-setup-action@v1
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Verify protos match pinned BSR version
-        run: |
-          TMPDIR=$(mktemp -d)
-          buf export buf.build/multiagentcoordinationprotocol/macp -o "$TMPDIR"
-
-          DRIFT=0
-          for proto in \
-            macp/v1/envelope.proto \
-            macp/v1/core.proto \
-            macp/modes/decision/v1/decision.proto \
-            macp/modes/proposal/v1/proposal.proto \
-            macp/modes/task/v1/task.proto \
-            macp/modes/handoff/v1/handoff.proto \
-            macp/modes/quorum/v1/quorum.proto; do
-            if ! diff -q "$TMPDIR/$proto" "proto/$proto" > /dev/null 2>&1; then
-              echo "DRIFT: $proto"
-              diff -u "$TMPDIR/$proto" "proto/$proto" || true
-              DRIFT=1
-            fi
-          done
-          rm -rf "$TMPDIR"
-
-          if [ "$DRIFT" -ne 0 ]; then
-            echo "Proto files don't match BSR. Run 'make sync-protos'."
-            exit 1
-          fi
-          echo "All proto files match BSR."
 
   audit:
     name: Security Audit
@@ -275,7 +222,7 @@ jobs:
   ci-pass:
     name: All Checks Passed
     runs-on: ubuntu-latest
-    needs: [check, fmt, clippy, test, build, lint-protobuf, proto-sync, audit]
+    needs: [check, fmt, clippy, test, build, audit]
 
     steps:
       - name: Summary

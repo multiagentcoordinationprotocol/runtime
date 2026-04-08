@@ -116,7 +116,7 @@ async fn parallel_decision_sessions_are_independent() {
             &new_message_id(),
             &sid1,
             coord,
-            commitment_payload("c1", "option-A", "team", "done"),
+            commitment_payload("c1", "option-A", "team", "done", true),
         ),
     )
     .await

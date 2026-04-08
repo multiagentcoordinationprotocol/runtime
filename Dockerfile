@@ -7,7 +7,6 @@ WORKDIR /app
 
 # Cache dependencies: copy manifests first, build a dummy, then copy real source
 COPY Cargo.toml Cargo.lock build.rs ./
-COPY proto/ proto/
 RUN mkdir -p src && echo "fn main() {}" > src/main.rs && \
     mkdir -p src/bin && \
     cargo build --release 2>/dev/null || true && \

@@ -6,6 +6,8 @@ use crate::log_store::{EntryKind, LogEntry, LogStore};
 use crate::metrics::RuntimeMetrics;
 use crate::mode_registry::ModeRegistry;
 use crate::pb::{Envelope, ModeDescriptor};
+use crate::policy::registry::PolicyRegistry;
+use crate::policy::PolicyDefinition;
 use crate::registry::SessionRegistry;
 use crate::session::{
     extract_ttl_ms, parse_session_start_payload, validate_canonical_session_start_payload,
@@ -27,6 +29,7 @@ pub struct Runtime {
     stream_bus: Arc<SessionStreamBus>,
     signal_bus: tokio::sync::broadcast::Sender<Envelope>,
     mode_registry: Arc<ModeRegistry>,
+    policy_registry: Arc<PolicyRegistry>,
     metrics: Arc<RuntimeMetrics>,
     checkpoint_interval: usize,
 }
@@ -51,6 +54,22 @@ impl Runtime {
         log_store: Arc<LogStore>,
         mode_registry: Arc<ModeRegistry>,
     ) -> Self {
+        Self::with_registries(
+            storage,
+            registry,
+            log_store,
+            mode_registry,
+            Arc::new(PolicyRegistry::new()),
+        )
+    }
+
+    pub fn with_registries(
+        storage: Arc<dyn StorageBackend>,
+        registry: Arc<SessionRegistry>,
+        log_store: Arc<LogStore>,
+        mode_registry: Arc<ModeRegistry>,
+        policy_registry: Arc<PolicyRegistry>,
+    ) -> Self {
         let checkpoint_interval = std::env::var("MACP_CHECKPOINT_INTERVAL")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -63,6 +82,7 @@ impl Runtime {
             stream_bus: Arc::new(SessionStreamBus::default()),
             signal_bus: signal_tx,
             mode_registry,
+            policy_registry,
             metrics: Arc::new(RuntimeMetrics::new()),
             checkpoint_interval,
         }
@@ -104,6 +124,32 @@ impl Runtime {
         &self.mode_registry
     }
 
+    // ── Policy registry delegation ──────────────────────────────────
+
+    pub fn register_policy(&self, definition: PolicyDefinition) -> Result<(), String> {
+        self.policy_registry.register(definition)
+    }
+
+    pub fn unregister_policy(&self, policy_id: &str) -> Result<(), String> {
+        self.policy_registry.unregister(policy_id)
+    }
+
+    pub fn get_policy(&self, policy_id: &str) -> Option<PolicyDefinition> {
+        self.policy_registry.get(policy_id)
+    }
+
+    pub fn list_policies(&self, mode_filter: Option<&str>) -> Vec<PolicyDefinition> {
+        self.policy_registry.list(mode_filter)
+    }
+
+    pub fn subscribe_policy_changes(&self) -> tokio::sync::broadcast::Receiver<()> {
+        self.policy_registry.subscribe_changes()
+    }
+
+    pub fn policy_registry(&self) -> &Arc<PolicyRegistry> {
+        &self.policy_registry
+    }
+
     pub fn metrics(&self) -> &Arc<RuntimeMetrics> {
         &self.metrics
     }
@@ -136,6 +182,7 @@ impl Runtime {
             session_id: env.session_id.clone(),
             mode: env.mode.clone(),
             macp_version: env.macp_version.clone(),
+            timestamp_unix_ms: env.timestamp_unix_ms,
         }
     }
 
@@ -145,9 +192,10 @@ impl Runtime {
         session_id: &str,
         mode: &str,
     ) -> LogEntry {
+        let now = Utc::now().timestamp_millis();
         LogEntry {
             message_id: String::new(),
-            received_at_ms: Utc::now().timestamp_millis(),
+            received_at_ms: now,
             sender: "_runtime".into(),
             message_type: message_type.into(),
             raw_payload: payload.to_vec(),
@@ -155,6 +203,7 @@ impl Runtime {
             session_id: session_id.into(),
             mode: mode.into(),
             macp_version: "1.0".into(),
+            timestamp_unix_ms: now,
         }
     }
 
@@ -221,6 +270,22 @@ impl Runtime {
         if require_complete_start {
             validate_canonical_session_start_payload(&start_payload)?;
         }
+
+        // Validate mode_version matches the registered descriptor's version
+        if let Some(descriptor_version) = self.mode_registry.get_mode_version(mode_name) {
+            if !start_payload.mode_version.is_empty()
+                && start_payload.mode_version != descriptor_version
+            {
+                tracing::warn!(
+                    mode = mode_name,
+                    payload_version = %start_payload.mode_version,
+                    descriptor_version = %descriptor_version,
+                    "mode_version mismatch"
+                );
+                return Err(MacpError::InvalidEnvelope);
+            }
+        }
+
         let ttl_ms = extract_ttl_ms(&start_payload)?;
 
         let mut guard = self.registry.sessions.write().await;
@@ -231,7 +296,7 @@ impl Runtime {
                     duplicate: true,
                 });
             }
-            return Err(MacpError::DuplicateSession);
+            return Err(MacpError::SessionAlreadyExists);
         }
 
         // Enforce max_open_sessions atomically under the write lock to
@@ -252,8 +317,38 @@ impl Runtime {
             }
         }
 
+        // Resolve the governance policy for this session.
+        // RFC-MACP-0012 §6.1: policy_version is resolved at SessionStart; empty
+        // resolves to "policy.default". The resolved PolicyDescriptor is stored
+        // immutably on the session for deterministic replay (RFC-MACP-0003 §3).
+        let effective_policy_version = if start_payload.policy_version.is_empty() {
+            crate::policy::defaults::DEFAULT_POLICY_ID.to_string()
+        } else {
+            start_payload.policy_version.clone()
+        };
+        let policy_definition = match self.policy_registry.resolve(&effective_policy_version) {
+            Ok(policy) => {
+                // RFC 6.1: reject if policy mode doesn't match session mode
+                if policy.mode != "*" && policy.mode != mode_name {
+                    return Err(MacpError::InvalidPolicyDefinition);
+                }
+                Some(policy)
+            }
+            Err(_) => {
+                return Err(MacpError::UnknownPolicyVersion);
+            }
+        };
+
         let accepted_at = Utc::now().timestamp_millis();
-        let ttl_expiry = accepted_at.saturating_add(ttl_ms);
+        // RFC-MACP-0003 §2: TTL deadline is computed from the SessionStart
+        // envelope's timestamp_unix_ms, not wall-clock time. This ensures
+        // deterministic replay. Fall back to accepted_at if envelope has no timestamp.
+        let ttl_base = if env.timestamp_unix_ms > 0 {
+            env.timestamp_unix_ms
+        } else {
+            accepted_at
+        };
+        let ttl_expiry = ttl_base.saturating_add(ttl_ms);
         let session = Session {
             session_id: env.session_id.clone(),
             state: SessionState::Open,
@@ -268,12 +363,13 @@ impl Runtime {
             intent: start_payload.intent.clone(),
             mode_version: start_payload.mode_version.clone(),
             configuration_version: start_payload.configuration_version.clone(),
-            policy_version: start_payload.policy_version.clone(),
+            policy_version: effective_policy_version,
             context: start_payload.context.clone(),
             roots: start_payload.roots.clone(),
             initiator_sender: env.sender.clone(),
             participant_message_counts: std::collections::HashMap::new(),
             participant_last_seen: std::collections::HashMap::new(),
+            policy_definition,
         };
 
         let response = mode.on_session_start(&session, env)?;
@@ -298,8 +394,17 @@ impl Runtime {
         session.apply_mode_response(response);
 
         let result_state = session.state.clone();
-        // 3. Best-effort session save
-        self.save_session_to_storage(&session).await;
+        // 3. Session save — fatal on SessionStart to ensure snapshot durability.
+        // For subsequent messages, the log entry (COMMIT POINT) is already persisted
+        // so snapshot failure is recoverable via replay.
+        if let Err(err) = self.storage.save_session(&session).await {
+            tracing::error!(
+                session_id = %session.session_id,
+                error = %err,
+                "failed to persist session snapshot at SessionStart"
+            );
+            return Err(MacpError::StorageFailed);
+        }
         self.metrics.record_session_start(mode_name);
         tracing::info!(
             session_id = %env.session_id,
@@ -316,6 +421,13 @@ impl Runtime {
         })
     }
 
+    /// Process a session-scoped message following the RFC-MACP-0001 Section 7.3
+    /// terminal-state transition order:
+    /// 1. Check session OPEN
+    /// 2. Validate message (mode.authorize_sender + mode.on_message)
+    /// 3. Accept into history (log_store.append)
+    /// 4. Transition to RESOLVED (session.apply_mode_response)
+    /// 5. Reject subsequent messages (enforced by step 1 on next call)
     async fn process_message(&self, env: &Envelope) -> Result<ProcessResult, MacpError> {
         let mut guard = self.registry.sessions.write().await;
         let session = guard
@@ -387,7 +499,9 @@ impl Runtime {
         // 3. Best-effort session save + checkpoint
         self.save_session_to_storage(session).await;
         if result_state == SessionState::Resolved {
-            self.maybe_compact_log(&env.session_id, session).await;
+            if !self.maybe_compact_log(&env.session_id, session).await {
+                self.force_insert_checkpoint(&env.session_id, session).await;
+            }
         } else {
             self.maybe_insert_checkpoint(&env.session_id, session).await;
         }
@@ -399,13 +513,28 @@ impl Runtime {
         })
     }
 
-    /// Process a Signal envelope. Signals are informational out-of-band
-    /// notifications (progress, heartbeat, etc.). Broadcast to signal
-    /// subscribers but no session state mutation.
+    /// Process a Signal or Progress envelope. Signals are informational out-of-band
+    /// notifications. Progress messages carry structured ProgressPayload.
+    /// Neither mutates session state — both are broadcast to subscribers.
     async fn process_signal(&self, env: &Envelope) -> Result<ProcessResult, MacpError> {
+        // RFC-MACP-0001 §4 / RFC-MACP-0010: validate SignalPayload structure.
+        // signal_type must be non-empty when a payload is present.
+        if env.message_type == "Signal" && !env.payload.is_empty() {
+            let signal: crate::pb::SignalPayload =
+                prost::Message::decode(&*env.payload).map_err(|_| MacpError::InvalidPayload)?;
+            if signal.signal_type.trim().is_empty() {
+                return Err(MacpError::InvalidPayload);
+            }
+        }
+        // RFC-MACP-0001: validate ProgressPayload structure for Progress messages.
+        if env.message_type == "Progress" && !env.payload.is_empty() {
+            let _: crate::pb::ProgressPayload =
+                prost::Message::decode(&*env.payload).map_err(|_| MacpError::InvalidPayload)?;
+        }
         tracing::debug!(
             sender = %env.sender,
             message_id = %env.message_id,
+            message_type = %env.message_type,
             "signal received"
         );
         let _ = self.signal_bus.send(env.clone());
@@ -432,10 +561,14 @@ impl Runtime {
         guard.get(session_id).cloned()
     }
 
+    /// Cancel a session. The `cancelled_by` parameter MUST be the authenticated
+    /// sender of the CancelSession RPC (RFC-MACP-0001 Section 7.3: CancelSession
+    /// is a Core control-plane message; mode authorization does not apply).
     pub async fn cancel_session(
         &self,
         session_id: &str,
         reason: &str,
+        cancelled_by: &str,
     ) -> Result<ProcessResult, MacpError> {
         let mut guard = self.registry.sessions.write().await;
         let session = guard.get_mut(session_id).ok_or(MacpError::UnknownSession)?;
@@ -451,9 +584,15 @@ impl Runtime {
             });
         }
 
+        // RFC-MACP-0001: runtime encodes a proper SessionCancelPayload with
+        // `cancelled_by` set to the authenticated sender identity.
+        let cancel_payload = crate::pb::SessionCancelPayload {
+            reason: reason.to_string(),
+            cancelled_by: cancelled_by.to_string(),
+        };
         let cancel_entry = Self::make_internal_entry(
             "SessionCancel",
-            reason.as_bytes(),
+            &prost::Message::encode_to_vec(&cancel_payload),
             session_id,
             &session.mode,
         );
@@ -464,7 +603,9 @@ impl Runtime {
         self.log_store.append(session_id, cancel_entry).await;
         session.state = SessionState::Expired;
         self.save_session_to_storage(session).await;
-        self.maybe_compact_log(session_id, session).await;
+        if !self.maybe_compact_log(session_id, session).await {
+            self.force_insert_checkpoint(session_id, session).await;
+        }
         self.metrics.record_session_cancelled(&session.mode);
         tracing::info!(session_id, reason, "session cancelled");
 
@@ -475,17 +616,56 @@ impl Runtime {
     }
 
     /// Best-effort log compaction for terminal sessions.
-    async fn maybe_compact_log(&self, session_id: &str, session: &Session) {
-        if let Err(e) =
-            crate::storage::compaction::compact_session_log(&*self.storage, session_id, session)
-                .await
+    /// Returns `true` if compaction succeeded, `false` if skipped or failed.
+    async fn maybe_compact_log(&self, session_id: &str, session: &Session) -> bool {
+        match crate::storage::compaction::compact_session_log(&*self.storage, session_id, session)
+            .await
         {
-            tracing::debug!(
-                session_id,
-                error = %e,
-                "log compaction skipped (backend may not support it)"
-            );
+            Ok(()) => true,
+            Err(e) => {
+                tracing::debug!(
+                    session_id,
+                    error = %e,
+                    "log compaction skipped (backend may not support it)"
+                );
+                false
+            }
         }
+    }
+
+    /// Force a checkpoint entry regardless of interval settings.
+    /// Used as a fallback when compaction fails on terminal sessions.
+    async fn force_insert_checkpoint(&self, session_id: &str, session: &Session) {
+        let persisted = crate::registry::PersistedSession::from(session);
+        let raw_payload = match serde_json::to_vec(&persisted) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(session_id, error = %e, "failed to serialize forced checkpoint");
+                return;
+            }
+        };
+        let now = Utc::now().timestamp_millis();
+        let checkpoint = LogEntry {
+            message_id: String::new(),
+            received_at_ms: now,
+            sender: "_runtime".into(),
+            message_type: "Checkpoint".into(),
+            raw_payload,
+            entry_kind: EntryKind::Checkpoint,
+            session_id: session_id.into(),
+            mode: session.mode.clone(),
+            macp_version: String::new(),
+            timestamp_unix_ms: now,
+        };
+        if let Err(e) = self.storage.append_log_entry(session_id, &checkpoint).await {
+            tracing::warn!(session_id, error = %e, "failed to write forced checkpoint");
+            return;
+        }
+        self.log_store.append(session_id, checkpoint).await;
+        tracing::debug!(
+            session_id,
+            "forced checkpoint inserted for terminal session"
+        );
     }
 
     /// Insert a checkpoint entry if the log has reached the configured interval.
@@ -503,31 +683,80 @@ impl Runtime {
         if log_len < self.checkpoint_interval || log_len % self.checkpoint_interval != 0 {
             return;
         }
-        let persisted = crate::registry::PersistedSession::from(session);
-        let raw_payload = match serde_json::to_vec(&persisted) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                tracing::warn!(session_id, error = %e, "failed to serialize checkpoint");
-                return;
+        self.force_insert_checkpoint(session_id, session).await;
+        tracing::debug!(session_id, log_len, "checkpoint inserted at interval");
+    }
+
+    /// Expire all sessions that have exceeded their TTL.
+    /// Called by the background cleanup task to proactively transition
+    /// stale sessions without waiting for the next incoming message.
+    pub async fn cleanup_expired_sessions(&self) {
+        let now = Utc::now().timestamp_millis();
+        let mut guard = self.registry.sessions.write().await;
+        let expired_ids: Vec<String> = guard
+            .iter()
+            .filter(|(_, s)| s.state == SessionState::Open && now > s.ttl_expiry)
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        for session_id in &expired_ids {
+            if let Some(session) = guard.get_mut(session_id) {
+                if session.state != SessionState::Open || now <= session.ttl_expiry {
+                    continue;
+                }
+                let entry = Self::make_internal_entry("TtlExpired", b"", session_id, &session.mode);
+                if let Err(e) = self.storage.append_log_entry(session_id, &entry).await {
+                    tracing::warn!(
+                        session_id,
+                        error = %e,
+                        "failed to write TTL expiry during cleanup"
+                    );
+                    continue;
+                }
+                self.log_store.append(session_id, entry).await;
+                session.state = SessionState::Expired;
+                self.metrics.record_session_expired(&session.mode);
+                self.save_session_to_storage(session).await;
+                if !self.maybe_compact_log(session_id, session).await {
+                    self.force_insert_checkpoint(session_id, session).await;
+                }
+                tracing::info!(session_id, "session expired via background cleanup");
             }
-        };
-        let checkpoint = LogEntry {
-            message_id: String::new(),
-            received_at_ms: Utc::now().timestamp_millis(),
-            sender: "_runtime".into(),
-            message_type: "Checkpoint".into(),
-            raw_payload,
-            entry_kind: EntryKind::Checkpoint,
-            session_id: session_id.into(),
-            mode: session.mode.clone(),
-            macp_version: String::new(),
-        };
-        if let Err(e) = self.storage.append_log_entry(session_id, &checkpoint).await {
-            tracing::warn!(session_id, error = %e, "failed to write checkpoint");
-            return;
         }
-        self.log_store.append(session_id, checkpoint).await;
-        tracing::debug!(session_id, log_len, "checkpoint inserted");
+
+        if !expired_ids.is_empty() {
+            tracing::info!(
+                count = expired_ids.len(),
+                "background cleanup expired sessions"
+            );
+        }
+    }
+
+    /// Evict resolved/expired sessions older than `retention_secs` from memory.
+    /// Sessions remain queryable from durable storage even after eviction.
+    pub async fn evict_stale_sessions(&self, retention_secs: u64) {
+        let now = Utc::now().timestamp_millis();
+        let cutoff = now - (retention_secs as i64 * 1000);
+        let mut guard = self.registry.sessions.write().await;
+        let evict_ids: Vec<String> = guard
+            .iter()
+            .filter(|(_, s)| {
+                matches!(s.state, SessionState::Resolved | SessionState::Expired)
+                    && s.started_at_unix_ms < cutoff
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        for id in &evict_ids {
+            guard.remove(id);
+        }
+
+        if !evict_ids.is_empty() {
+            tracing::info!(
+                count = evict_ids.len(),
+                "evicted stale sessions from memory"
+            );
+        }
     }
 }
 
@@ -555,7 +784,7 @@ mod tests {
             participants,
             mode_version: "1.0.0".into(),
             configuration_version: "cfg-1".into(),
-            policy_version: "policy-1".into(),
+            policy_version: String::new(),
             ttl_ms: 1_000,
             context: vec![],
             roots: vec![],
@@ -644,7 +873,7 @@ mod tests {
                 "m1",
                 &sid,
                 "agent://orchestrator",
-                session_start(vec!["agent://fraud".into()]),
+                session_start(vec!["agent://orchestrator".into(), "agent://fraud".into()]),
             ),
             None,
         )
@@ -700,7 +929,7 @@ mod tests {
             participants: vec!["agent://fraud".into()],
             mode_version: "1.0.0".into(),
             configuration_version: "cfg-1".into(),
-            policy_version: "policy-1".into(),
+            policy_version: String::new(),
             ttl_ms: 1,
             context: vec![],
             roots: vec![],
@@ -864,7 +1093,7 @@ mod tests {
             participants: vec!["agent://fraud".into()],
             mode_version: "1.0.0".into(),
             configuration_version: "cfg-1".into(),
-            policy_version: "policy-1".into(),
+            policy_version: String::new(),
             ttl_ms: 1,
             context: vec![],
             roots: vec![],
@@ -884,7 +1113,10 @@ mod tests {
         .await
         .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        let result = rt.cancel_session(&sid, "cleanup").await.unwrap();
+        let result = rt
+            .cancel_session(&sid, "cleanup", "agent://orchestrator")
+            .await
+            .unwrap();
         assert_eq!(result.session_state, SessionState::Expired);
     }
 
@@ -900,7 +1132,7 @@ mod tests {
             "m1",
             &sid,
             "agent://orchestrator",
-            session_start(vec!["agent://fraud".into()]),
+            session_start(vec!["agent://orchestrator".into(), "agent://fraud".into()]),
         );
         rt.process(&start, None).await.unwrap();
         let first = events.recv().await.unwrap();
@@ -1004,8 +1236,9 @@ mod tests {
             authority_scope: "commercial".into(),
             reason: "bound".into(),
             mode_version: "1.0.0".into(),
-            policy_version: "policy-1".into(),
+            policy_version: "policy.default".into(),
             configuration_version: "cfg-1".into(),
+            outcome_positive: true,
         }
         .encode_to_vec();
         let result = rt
@@ -1208,7 +1441,7 @@ mod tests {
                 "m1",
                 &sid,
                 "agent://orchestrator",
-                session_start(vec!["agent://fraud".into()]),
+                session_start(vec!["agent://orchestrator".into(), "agent://fraud".into()]),
             ),
             None,
         )
@@ -1307,7 +1540,268 @@ mod tests {
         .await
         .unwrap();
 
-        let err = rt.cancel_session(&sid, "test cancel").await.unwrap_err();
+        let err = rt
+            .cancel_session(&sid, "test cancel", "agent://orchestrator")
+            .await
+            .unwrap_err();
         assert_eq!(err.to_string(), "StorageFailed");
+    }
+
+    #[tokio::test]
+    async fn ttl_expiration_rejects_message() {
+        let rt = make_runtime();
+        let sid = new_sid();
+        let payload = SessionStartPayload {
+            intent: "intent".into(),
+            participants: vec!["agent://orchestrator".into(), "agent://fraud".into()],
+            mode_version: "1.0.0".into(),
+            configuration_version: "cfg-1".into(),
+            policy_version: String::new(),
+            ttl_ms: 1,
+            context: vec![],
+            roots: vec![],
+        }
+        .encode_to_vec();
+        rt.process(
+            &env(
+                "macp.mode.decision.v1",
+                "SessionStart",
+                "m1",
+                &sid,
+                "agent://orchestrator",
+                payload,
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let proposal = ProposalPayload {
+            proposal_id: "p1".into(),
+            option: "step-up".into(),
+            rationale: "risk".into(),
+            supporting_data: vec![],
+        }
+        .encode_to_vec();
+        let err = rt
+            .process(
+                &env(
+                    "macp.mode.decision.v1",
+                    "Proposal",
+                    "m2",
+                    &sid,
+                    "agent://orchestrator",
+                    proposal,
+                ),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "TtlExpired");
+    }
+
+    #[tokio::test]
+    async fn cleanup_expired_sessions_marks_expired() {
+        let rt = make_runtime();
+        let sid = new_sid();
+        let payload = SessionStartPayload {
+            intent: "intent".into(),
+            participants: vec!["agent://fraud".into()],
+            mode_version: "1.0.0".into(),
+            configuration_version: "cfg-1".into(),
+            policy_version: String::new(),
+            ttl_ms: 1,
+            context: vec![],
+            roots: vec![],
+        }
+        .encode_to_vec();
+        rt.process(
+            &env(
+                "macp.mode.decision.v1",
+                "SessionStart",
+                "m1",
+                &sid,
+                "agent://orchestrator",
+                payload,
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        rt.cleanup_expired_sessions().await;
+        let session = rt.get_session_checked(&sid).await.unwrap();
+        assert_eq!(session.state, SessionState::Expired);
+    }
+
+    #[tokio::test]
+    async fn evict_stale_sessions_removes_resolved() {
+        let rt = make_runtime();
+        let sid = new_sid();
+        // Start a decision session
+        rt.process(
+            &env(
+                "macp.mode.decision.v1",
+                "SessionStart",
+                "m1",
+                &sid,
+                "agent://orchestrator",
+                session_start(vec!["agent://orchestrator".into(), "agent://fraud".into()]),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        // Send a Proposal
+        let proposal = ProposalPayload {
+            proposal_id: "p1".into(),
+            option: "step-up".into(),
+            rationale: "risk".into(),
+            supporting_data: vec![],
+        }
+        .encode_to_vec();
+        rt.process(
+            &env(
+                "macp.mode.decision.v1",
+                "Proposal",
+                "m2",
+                &sid,
+                "agent://orchestrator",
+                proposal,
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        // Commit to resolve the session
+        let commitment = CommitmentPayload {
+            commitment_id: "c1".into(),
+            action: "decision.selected".into(),
+            authority_scope: "payments".into(),
+            reason: "bound".into(),
+            mode_version: "1.0.0".into(),
+            policy_version: "policy.default".into(),
+            configuration_version: "cfg-1".into(),
+            outcome_positive: true,
+        }
+        .encode_to_vec();
+        let result = rt
+            .process(
+                &env(
+                    "macp.mode.decision.v1",
+                    "Commitment",
+                    "m3",
+                    &sid,
+                    "agent://orchestrator",
+                    commitment,
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.session_state, SessionState::Resolved);
+        // Wait a moment so the session's started_at_unix_ms is strictly in the past
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        // Evict with retention = 0 (evict immediately)
+        rt.evict_stale_sessions(0).await;
+        // Session should no longer be in the in-memory registry
+        assert!(rt.registry.get_session(&sid).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn session_start_with_wrong_mode_version_rejected() {
+        let rt = make_runtime();
+        let sid = new_sid();
+        let payload = SessionStartPayload {
+            intent: "test".into(),
+            participants: vec!["agent://orchestrator".into(), "agent://worker".into()],
+            mode_version: "99.0.0".into(), // wrong version
+            configuration_version: "cfg-1".into(),
+            policy_version: String::new(),
+            ttl_ms: 60_000,
+            context: vec![],
+            roots: vec![],
+        }
+        .encode_to_vec();
+
+        let err = rt
+            .process(
+                &env(
+                    "macp.mode.decision.v1",
+                    "SessionStart",
+                    "m1",
+                    &sid,
+                    "agent://orchestrator",
+                    payload,
+                ),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.error_code(), "INVALID_ENVELOPE");
+    }
+
+    #[tokio::test]
+    async fn signal_empty_signal_type_rejected() {
+        let rt = make_runtime();
+        // Use non-default data so proto3 serializes a non-empty payload
+        let signal_payload = crate::pb::SignalPayload {
+            signal_type: String::new(),
+            data: b"some data".to_vec(),
+            confidence: 0.0,
+            correlation_session_id: String::new(),
+        }
+        .encode_to_vec();
+        let signal = Envelope {
+            macp_version: "1.0".into(),
+            mode: String::new(),
+            message_type: "Signal".into(),
+            message_id: "sig-1".into(),
+            session_id: String::new(),
+            sender: "agent://a".into(),
+            timestamp_unix_ms: 0,
+            payload: signal_payload,
+        };
+        let err = rt.process_signal(&signal).await.unwrap_err();
+        assert_eq!(err.error_code(), "INVALID_ENVELOPE");
+    }
+
+    #[tokio::test]
+    async fn signal_valid_payload_accepted() {
+        let rt = make_runtime();
+        let signal_payload = crate::pb::SignalPayload {
+            signal_type: "heartbeat".into(),
+            data: vec![],
+            confidence: 0.8,
+            correlation_session_id: String::new(),
+        }
+        .encode_to_vec();
+        let signal = Envelope {
+            macp_version: "1.0".into(),
+            mode: String::new(),
+            message_type: "Signal".into(),
+            message_id: "sig-2".into(),
+            session_id: String::new(),
+            sender: "agent://a".into(),
+            timestamp_unix_ms: 0,
+            payload: signal_payload,
+        };
+        rt.process_signal(&signal).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn signal_empty_payload_accepted() {
+        let rt = make_runtime();
+        let signal = Envelope {
+            macp_version: "1.0".into(),
+            mode: String::new(),
+            message_type: "Signal".into(),
+            message_id: "sig-3".into(),
+            session_id: String::new(),
+            sender: "agent://a".into(),
+            timestamp_unix_ms: 0,
+            payload: vec![],
+        };
+        rt.process_signal(&signal).await.unwrap();
     }
 }

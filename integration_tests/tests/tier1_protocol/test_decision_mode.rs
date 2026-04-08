@@ -86,7 +86,7 @@ async fn decision_happy_path() {
             &new_message_id(),
             &sid,
             coord,
-            commitment_payload("c1", "deploy-v2", "team", "consensus reached"),
+            commitment_payload("c1", "deploy-v2", "team", "consensus reached", true),
         ),
     )
     .await

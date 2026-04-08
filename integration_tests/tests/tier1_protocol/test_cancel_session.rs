@@ -26,7 +26,9 @@ async fn cancel_active_session() {
     assert!(ack.ok);
 
     // Cancel from initiator
-    let ack = cancel_session_as(&mut client, coord, &sid, "changed my mind").await.unwrap();
+    let ack = cancel_session_as(&mut client, coord, &sid, "changed my mind")
+        .await
+        .unwrap();
     assert!(ack.ok);
 
     // Verify session is no longer open
@@ -58,7 +60,9 @@ async fn send_to_cancelled_session_fails() {
     .await
     .unwrap();
 
-    cancel_session_as(&mut client, coord, &sid, "done").await.unwrap();
+    cancel_session_as(&mut client, coord, &sid, "done")
+        .await
+        .unwrap();
 
     // Try sending to cancelled session
     let ack = send_as(

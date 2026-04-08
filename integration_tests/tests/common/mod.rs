@@ -1,10 +1,10 @@
 use std::sync::OnceLock;
 
-use macp_runtime::pb::macp_runtime_service_client::MacpRuntimeServiceClient;
 use macp_integration_tests::config::TestConfig;
 use macp_integration_tests::server_manager::ServerManager;
-use tonic::transport::Channel;
+use macp_runtime::pb::macp_runtime_service_client::MacpRuntimeServiceClient;
 use tokio::sync::Mutex;
+use tonic::transport::Channel;
 
 /// Global server instance (started once, shared across all tests in a binary).
 static SERVER: OnceLock<Mutex<Option<ServerManager>>> = OnceLock::new();

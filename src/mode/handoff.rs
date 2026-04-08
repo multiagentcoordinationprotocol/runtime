@@ -2,7 +2,9 @@ use crate::error::MacpError;
 use crate::handoff_pb::{
     HandoffAcceptPayload, HandoffContextPayload, HandoffDeclinePayload, HandoffOfferPayload,
 };
-use crate::mode::util::{is_declared_participant, validate_commitment_payload_for_session};
+use crate::mode::util::{
+    check_commitment_authority, is_declared_participant, validate_commitment_payload_for_session,
+};
 use crate::mode::{Mode, ModeResponse};
 use crate::pb::Envelope;
 use crate::session::Session;
@@ -28,6 +30,8 @@ pub struct HandoffOfferRecord {
     pub accepted_by: Option<String>,
     pub declined_by: Option<String>,
     pub outcome_reason: Option<String>,
+    #[serde(default)]
+    pub offered_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,9 +69,14 @@ impl HandoffMode {
 impl Mode for HandoffMode {
     fn authorize_sender(&self, session: &Session, env: &Envelope) -> Result<(), MacpError> {
         match env.message_type.as_str() {
-            "Commitment" if env.sender == session.initiator_sender => Ok(()),
-            "Commitment" => Err(MacpError::Forbidden),
-            "HandoffOffer" | "HandoffContext" if env.sender == session.initiator_sender => Ok(()),
+            "Commitment" => check_commitment_authority(session, &env.sender),
+            // HandoffOffer: only initiator can offer
+            "HandoffOffer" if env.sender == session.initiator_sender => Ok(()),
+            "HandoffOffer" => Err(MacpError::Forbidden),
+            // HandoffContext: any declared participant (on_message enforces offerer match)
+            "HandoffContext" if is_declared_participant(&session.participants, &env.sender) => {
+                Ok(())
+            }
             _ if is_declared_participant(&session.participants, &env.sender) => Ok(()),
             _ => Err(MacpError::Forbidden),
         }
@@ -104,6 +113,8 @@ impl Mode for HandoffMode {
             "HandoffOffer" => {
                 let payload = HandoffOfferPayload::decode(&*env.payload)
                     .map_err(|_| MacpError::InvalidPayload)?;
+                // RFC-MACP-0010: At most one offer may be outstanding at any time.
+                // Once an offer is accepted, no further offers may be issued.
                 if payload.handoff_id.is_empty()
                     || payload.target_participant.is_empty()
                     || state.offers.contains_key(&payload.handoff_id)
@@ -113,6 +124,10 @@ impl Mode for HandoffMode {
                         .offers
                         .values()
                         .any(|o| o.disposition == HandoffDisposition::Offered)
+                    || state
+                        .offers
+                        .values()
+                        .any(|o| o.disposition == HandoffDisposition::Accepted)
                 {
                     return Err(MacpError::InvalidPayload);
                 }
@@ -128,6 +143,7 @@ impl Mode for HandoffMode {
                         accepted_by: None,
                         declined_by: None,
                         outcome_reason: None,
+                        offered_at_ms: env.timestamp_unix_ms,
                     },
                 );
                 Ok(ModeResponse::PersistState(Self::encode_state(&state)))
@@ -142,9 +158,8 @@ impl Mode for HandoffMode {
                 if offer.offered_by != env.sender {
                     return Err(MacpError::Forbidden);
                 }
-                if offer.disposition != HandoffDisposition::Offered {
-                    return Err(MacpError::InvalidPayload);
-                }
+                // RFC-MACP-0010 §2.1: Late context (sent after accept/decline) is
+                // permitted as supplementary documentation. No disposition check.
                 state
                     .contexts
                     .entry(payload.handoff_id)
@@ -199,12 +214,42 @@ impl Mode for HandoffMode {
                 Ok(ModeResponse::PersistState(Self::encode_state(&state)))
             }
             "Commitment" => {
-                if env.sender != session.initiator_sender {
-                    return Err(MacpError::Forbidden);
-                }
                 validate_commitment_payload_for_session(session, &env.payload)?;
+                // RFC-MACP-0012: lazy implicit_accept_timeout_ms check
+                if let Some(ref policy) = session.policy_definition {
+                    let rules: crate::policy::rules::HandoffPolicyRules =
+                        serde_json::from_value(policy.rules.clone()).unwrap_or_default();
+                    if rules.acceptance.implicit_accept_timeout_ms > 0 {
+                        // Use envelope timestamp for replay determinism
+                        let now_ms = env.timestamp_unix_ms;
+                        let timeout = rules.acceptance.implicit_accept_timeout_ms as i64;
+                        for offer in state.offers.values_mut() {
+                            if offer.disposition == HandoffDisposition::Offered
+                                && offer.offered_at_ms > 0
+                                && (now_ms - offer.offered_at_ms) >= timeout
+                            {
+                                offer.disposition = HandoffDisposition::Accepted;
+                                offer.accepted_by = Some(offer.target_participant.clone());
+                                offer.outcome_reason = Some("implicit accept (timeout)".into());
+                            }
+                        }
+                    }
+                }
                 if !Self::commitment_ready(&state) {
                     return Err(MacpError::InvalidPayload);
+                }
+                // Evaluate governance policy if one is bound to the session.
+                if let Some(ref policy) = session.policy_definition {
+                    let decision = crate::policy::evaluator::evaluate_handoff_commitment(policy);
+                    if let crate::policy::PolicyDecision::Deny { reasons } = decision {
+                        tracing::warn!(
+                            session_id = %session.session_id,
+                            policy_id = %policy.policy_id,
+                            reasons = ?reasons,
+                            "policy denied commitment"
+                        );
+                        return Err(MacpError::PolicyDenied { reasons });
+                    }
                 }
                 Ok(ModeResponse::PersistAndResolve {
                     state: Self::encode_state(&state),
@@ -244,6 +289,7 @@ mod tests {
             initiator_sender: "owner".into(),
             participant_message_counts: std::collections::HashMap::new(),
             participant_last_seen: std::collections::HashMap::new(),
+            policy_definition: None,
         }
     }
 
@@ -255,7 +301,7 @@ mod tests {
             message_id: format!("{}-{}", sender, message_type),
             session_id: "s1".into(),
             sender: sender.into(),
-            timestamp_unix_ms: 0,
+            timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
             payload,
         }
     }
@@ -269,6 +315,7 @@ mod tests {
             mode_version: "1.0.0".into(),
             policy_version: "policy".into(),
             configuration_version: "config".into(),
+            outcome_positive: true,
         }
         .encode_to_vec()
     }
@@ -469,6 +516,8 @@ mod tests {
             ModeResponse::PersistState(data) => {
                 let state: HandoffState = serde_json::from_slice(&data).unwrap();
                 assert_eq!(state.contexts["h1"].len(), 1);
+                assert_eq!(state.contexts["h1"][0].content_type, "text/plain");
+                assert_eq!(state.contexts["h1"][0].sender, "owner");
             }
             _ => panic!("Expected PersistState"),
         }
@@ -773,7 +822,8 @@ mod tests {
     }
 
     #[test]
-    fn second_offer_after_first_accepted_succeeds() {
+    fn second_offer_after_first_accepted_is_rejected() {
+        // RFC-MACP-0010: "Once an offer is accepted, no further offers may be issued."
         let mode = HandoffMode;
         let mut session = base_session();
         session.participants = vec!["owner".into(), "target".into(), "other".into()];
@@ -795,11 +845,13 @@ mod tests {
             )
             .unwrap();
         apply(&mut session, result);
-        mode.on_message(
-            &session,
-            &env("owner", "HandoffOffer", make_offer("h2", "other")),
-        )
-        .unwrap();
+        let err = mode
+            .on_message(
+                &session,
+                &env("owner", "HandoffOffer", make_offer("h2", "other")),
+            )
+            .unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
     }
 
     #[test]
@@ -864,6 +916,7 @@ mod tests {
             mode_version: "wrong".into(),
             policy_version: "policy".into(),
             configuration_version: "config".into(),
+            outcome_positive: true,
         }
         .encode_to_vec();
         let err = mode
@@ -889,7 +942,9 @@ mod tests {
     }
 
     #[test]
-    fn context_after_accept_is_rejected() {
+    fn context_after_accept_is_permitted() {
+        // RFC-MACP-0010 §2.1: Late context after accept/decline is permitted
+        // as supplementary documentation.
         let mode = HandoffMode;
         let mut session = base_session();
         let resp = mode
@@ -910,14 +965,181 @@ mod tests {
             )
             .unwrap();
         apply(&mut session, resp);
-        assert_eq!(
-            mode.on_message(
-                &session,
-                &env("owner", "HandoffContext", make_context("h1"))
-            )
-            .unwrap_err()
-            .to_string(),
-            "InvalidPayload"
+        // Late context after accept should succeed
+        let result = mode.on_message(
+            &session,
+            &env("owner", "HandoffContext", make_context("h1")),
         );
+        assert!(
+            result.is_ok(),
+            "late HandoffContext should be permitted per RFC"
+        );
+    }
+
+    // --- Policy ---
+
+    #[test]
+    fn handoff_policy_evaluator_always_allows() {
+        let mode = HandoffMode;
+        let mut session = base_session();
+        session.policy_definition = Some(crate::policy::PolicyDefinition {
+            policy_id: "test-handoff".into(),
+            mode: "macp.mode.handoff.v1".into(),
+            description: "handoff policy".into(),
+            rules: serde_json::json!({
+                "acceptance": { "implicit_accept_timeout_ms": 0 },
+                "commitment": { "authority": "initiator_only" }
+            }),
+            schema_version: 1,
+        });
+        let result = mode
+            .on_session_start(&session, &env("owner", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("owner", "HandoffOffer", make_offer("h1", "target")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("target", "HandoffAccept", make_accept("h1", "target")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        // Handoff policy evaluator always allows — commitment should succeed
+        let result = mode
+            .on_message(&session, &env("owner", "Commitment", commitment_payload()))
+            .unwrap();
+        assert!(matches!(result, ModeResponse::PersistAndResolve { .. }));
+    }
+
+    // --- Second HandoffOffer while first pending ---
+
+    #[test]
+    fn second_offer_to_different_target_while_first_pending_rejected() {
+        let mode = HandoffMode;
+        let mut session = base_session();
+        session.participants = vec!["owner".into(), "targetA".into(), "targetB".into()];
+        let result = mode
+            .on_session_start(&session, &env("owner", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        // First offer to targetA — succeeds
+        let result = mode
+            .on_message(
+                &session,
+                &env("owner", "HandoffOffer", make_offer("h1", "targetA")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        // Second offer to targetB while h1 is still pending — rejected
+        let err = mode
+            .on_message(
+                &session,
+                &env("owner", "HandoffOffer", make_offer("h2", "targetB")),
+            )
+            .unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
+    }
+
+    // --- After HandoffAccept, further offers are allowed (prior resolved) ---
+
+    #[test]
+    fn offer_after_accept_blocked_per_rfc() {
+        // RFC-MACP-0010: "Once an offer is accepted, no further offers may be issued
+        // for the Session. Only one final Commitment may resolve the Session."
+        let mode = HandoffMode;
+        let mut session = base_session();
+        session.participants = vec!["owner".into(), "target".into(), "other".into()];
+        let result = mode
+            .on_session_start(&session, &env("owner", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("owner", "HandoffOffer", make_offer("h1", "target")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("target", "HandoffAccept", make_accept("h1", "target")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        // New HandoffOffer MUST be rejected after an offer has been accepted
+        let err = mode
+            .on_message(
+                &session,
+                &env("owner", "HandoffOffer", make_offer("h2", "other")),
+            )
+            .unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
+        let state: HandoffState = serde_json::from_slice(&session.mode_state).unwrap();
+        assert_eq!(state.offers.len(), 1);
+        assert_eq!(state.offers["h1"].disposition, HandoffDisposition::Accepted);
+    }
+
+    #[test]
+    fn offered_at_ms_is_populated() {
+        let mode = HandoffMode;
+        let mut session = base_session();
+        session.participants = vec!["owner".into(), "target".into()];
+        let result = mode
+            .on_session_start(&session, &env("owner", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        let result = mode
+            .on_message(
+                &session,
+                &env("owner", "HandoffOffer", make_offer("h1", "target")),
+            )
+            .unwrap();
+        apply(&mut session, result);
+        let state: HandoffState = serde_json::from_slice(&session.mode_state).unwrap();
+        assert!(
+            state.offers["h1"].offered_at_ms > 0,
+            "offered_at_ms should be set"
+        );
+    }
+
+    #[test]
+    fn implicit_accept_timeout_fires() {
+        // RFC-MACP-0010: when implicit_accept_timeout_ms policy is set and
+        // sufficient time has elapsed, the offer is auto-accepted at commitment.
+        let mode = HandoffMode;
+        let mut session = base_session();
+        session.participants = vec!["owner".into(), "target".into()];
+        session.policy_definition = Some(crate::policy::PolicyDefinition {
+            policy_id: "auto-accept".into(),
+            mode: "macp.mode.handoff.v1".into(),
+            description: "short timeout".into(),
+            rules: serde_json::json!({
+                "acceptance": { "implicit_accept_timeout_ms": 100 },
+                "commitment": { "authority": "initiator_only" }
+            }),
+            schema_version: 1,
+        });
+        let result = mode
+            .on_session_start(&session, &env("owner", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, result);
+        // Offer with a specific timestamp
+        let offer_time = 1000i64;
+        let mut offer_env = env("owner", "HandoffOffer", make_offer("h1", "target"));
+        offer_env.timestamp_unix_ms = offer_time;
+        let result = mode.on_message(&session, &offer_env).unwrap();
+        apply(&mut session, result);
+        // Commitment with timestamp past the timeout (offer_time + 100ms = 1100)
+        let mut commit_env = env("owner", "Commitment", commitment_payload());
+        commit_env.timestamp_unix_ms = offer_time + 200; // well past 100ms timeout
+        let commit = mode.on_message(&session, &commit_env).unwrap();
+        assert!(matches!(commit, ModeResponse::PersistAndResolve { .. }));
     }
 }

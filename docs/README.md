@@ -1,99 +1,47 @@
-# MACP Runtime documentation
+# MACP Runtime Documentation
 
-This directory documents the runtime implementation profile for `macp-runtime v0.4.0`.
+**Version**: v0.4.0 | **Protocol**: MACP 1.0 | **Language**: Rust
 
-The RFC/spec repository is still the normative source for MACP semantics. These runtime docs focus on how this implementation behaves today: startup configuration, security model, persistence profile, mode surface, and local-development examples.
+The MACP Runtime is the reference implementation of the [Multi-Agent Coordination Protocol](https://www.multiagentcoordinationprotocol.io). It is a coordination kernel written in Rust that enforces session boundaries, validates messages, manages append-only history, and serializes concurrent agent interactions over gRPC.
 
-## What is in this runtime profile
+This documentation covers the **runtime implementation** -- how to build, configure, deploy, and integrate with it. For protocol-level concepts like sessions, modes, signals, determinism, and the two-plane architecture, see the [protocol documentation](https://www.multiagentcoordinationprotocol.io/docs).
 
-- MACP server over gRPC with unary RPCs and per-session bidirectional streaming
-- five standards-track modes from the main RFC repository and one built-in extension
-- strict canonical `SessionStart` for standards-track modes and qualifying extensions
-- authenticated sender derivation
-- payload limits and rate limiting
-- optional file-backed persistence for sessions and accepted-history logs
-- extension mode lifecycle management (register, unregister, promote)
+## What the runtime provides
 
-## Standards-track modes
+The runtime ships as a single binary that exposes 18 gRPC RPCs over TLS. It supports the five standards-track coordination modes (Decision, Proposal, Task, Handoff, Quorum) and one built-in extension mode for iterative convergence. A governance policy framework evaluates rules at commitment time, and pluggable storage backends (file, RocksDB, Redis, or in-memory) handle persistence with append-only logs and checkpoint-based replay.
 
-- `macp.mode.decision.v1`
-- `macp.mode.proposal.v1`
-- `macp.mode.task.v1`
-- `macp.mode.handoff.v1`
-- `macp.mode.quorum.v1`
+Authentication is handled through bearer tokens mapped to agent identities, with per-sender rate limiting for both session creation and message throughput. In development, a header-based identity shortcut lets you get started without configuring tokens.
 
-## Built-in extension modes
+## Documentation
 
-- `ext.multi_round.v1`
+### Getting started
+- [**Getting Started**](getting-started.md) -- Build the runtime, start a server, and run your first coordination session
+- [**Examples**](examples.md) -- Runnable example clients for every mode, with troubleshooting tips
 
-## Freeze profile
+### Implementation reference
+- [**Architecture**](architecture.md) -- Rust layer design, request processing flows, concurrency model, and source layout
+- [**API Reference**](API.md) -- All 18 gRPC RPCs with request/response fields, authentication, and rate limiting
+- [**Modes**](modes.md) -- Runtime implementation details for each mode's state machine
+- [**Policy**](policy.md) -- Policy registration, JSON rule examples, evaluation internals, and error handling
 
-The current runtime is intended to be the freeze candidate for unary and streaming SDKs and reference examples.
+### Operations
+- [**Deployment**](deployment.md) -- Production configuration, storage backends, crash recovery, containers, and monitoring
+- [**Testing**](testing.md) -- Three test tiers, conformance fixtures, and CI/CD integration
 
-Implemented and supported:
+### For SDK authors
+- [**SDK Developer Guide**](sdk-guide.md) -- Patterns for building client libraries: envelope construction, error handling, streaming, and retries
 
-- `Initialize`
-- `Send`
-- `StreamSession`
-- `GetSession`
-- `CancelSession`
-- `GetManifest`
-- `ListModes`
-- `ListRoots`
+## Protocol documentation
 
-Extension mode lifecycle:
+The runtime implements the protocol as specified in the RFCs. For protocol-level topics, refer to the specification documentation:
 
-- `ListExtModes`
-- `RegisterExtMode`
-- `UnregisterExtMode`
-- `PromoteMode`
-
-Streaming watch RPCs:
-
-- `WatchModeRegistry` — sends initial state, then fires on register/unregister/promote changes
-- `WatchRoots` — sends initial state, holds stream open
-
-## Security model
-
-Production expectations:
-
-- TLS transport
-- bearer-token authentication
-- runtime-derived `Envelope.sender`
-- per-request authorization
-- payload size limits
-- rate limiting
-
-Local development shortcut:
-
-```bash
-export MACP_ALLOW_INSECURE=1
-export MACP_ALLOW_DEV_SENDER_HEADER=1
-cargo run
-```
-
-In dev mode, example clients attach `x-macp-agent-id` metadata and may use plaintext transport.
-
-## Persistence model
-
-By default the runtime persists state under `.macp-data/` via `FileBackend`:
-
-- per-session directories containing `session.json` and append-only `log.jsonl`
-- crash recovery reconciles dedup state from the log on startup
-- atomic writes (tmp file + rename) prevent partial-write corruption
-
-If a snapshot file contains corrupt or incompatible JSON, the runtime logs a warning to stderr and starts with empty state.
-
-Disable persistence with:
-
-```bash
-export MACP_MEMORY_ONLY=1
-```
-
-## Document map
-
-- `../README.md` — root-level quick start and configuration reference
-- `examples.md` — updated local-development examples and canonical message patterns
-- `protocol.md` — implementation notes and protocol surface summary
-- `architecture.md` — runtime component layout and mode registry design
-- `deployment.md` — production deployment guide, container notes, and environment reference
+| Topic | Link |
+|-------|------|
+| Architecture and two-plane model | [Protocol Architecture](https://www.multiagentcoordinationprotocol.io/docs/architecture) |
+| Session lifecycle | [Protocol Lifecycle](https://www.multiagentcoordinationprotocol.io/docs/lifecycle) |
+| Coordination modes | [Protocol Modes](https://www.multiagentcoordinationprotocol.io/docs/modes) |
+| Governance policies | [Protocol Policy](https://www.multiagentcoordinationprotocol.io/docs/policy) |
+| Determinism and replay | [Protocol Determinism](https://www.multiagentcoordinationprotocol.io/docs/determinism) |
+| Security model | [Protocol Security](https://www.multiagentcoordinationprotocol.io/docs/security) |
+| Transport bindings | [Protocol Transports](https://www.multiagentcoordinationprotocol.io/docs/transports) |
+| Agent discovery | [Protocol Discovery](https://www.multiagentcoordinationprotocol.io/docs/discovery) |

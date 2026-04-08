@@ -276,8 +276,8 @@ Check that the sender identity matches the session's participant list. For `Comm
 **`StorageFailed` error**
 The runtime requires write access to `MACP_DATA_DIR`. Check directory permissions. Log append failures are fatal — the runtime will not acknowledge a message without a durable record.
 
-**Proto drift / `make check-protos` failure**
-Run `make sync-protos` to update local proto files from BSR.
+**Proto version mismatch**
+Update the `macp-proto` dependency version in `Cargo.toml` and run `cargo build`.
 
 ## Testing
 

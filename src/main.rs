@@ -3,6 +3,7 @@ mod server;
 use macp_runtime::log_store::LogStore;
 use macp_runtime::mode_registry::ModeRegistry;
 use macp_runtime::pb;
+use macp_runtime::policy::registry::PolicyRegistry;
 use macp_runtime::registry::SessionRegistry;
 use macp_runtime::replay::replay_session;
 use macp_runtime::runtime::Runtime;
@@ -12,9 +13,72 @@ use macp_runtime::storage::{
 };
 use server::MacpServer;
 use std::io;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
+
+/// Validate environment variables at startup. Returns a list of errors, if any.
+fn validate_env_config() -> Vec<String> {
+    let mut errors = Vec::new();
+
+    // Validate MACP_BIND_ADDR is a valid socket address
+    if let Ok(val) = std::env::var("MACP_BIND_ADDR") {
+        if val.parse::<SocketAddr>().is_err() {
+            errors.push(format!(
+                "MACP_BIND_ADDR: '{val}' is not a valid socket address (expected host:port, e.g. 127.0.0.1:50051)"
+            ));
+        }
+    }
+
+    // Validate TLS cert/key paths exist if specified
+    if let Ok(cert_path) = std::env::var("MACP_TLS_CERT_PATH") {
+        if !std::path::Path::new(&cert_path).exists() {
+            errors.push(format!(
+                "MACP_TLS_CERT_PATH: file does not exist: {cert_path}"
+            ));
+        }
+    }
+    if let Ok(key_path) = std::env::var("MACP_TLS_KEY_PATH") {
+        if !std::path::Path::new(&key_path).exists() {
+            errors.push(format!(
+                "MACP_TLS_KEY_PATH: file does not exist: {key_path}"
+            ));
+        }
+    }
+
+    // Validate positive integer environment variables
+    for var_name in [
+        "MACP_MAX_PAYLOAD_BYTES",
+        "MACP_SESSION_START_LIMIT_PER_MINUTE",
+        "MACP_MESSAGE_LIMIT_PER_MINUTE",
+    ] {
+        if let Ok(val) = std::env::var(var_name) {
+            match val.parse::<u64>() {
+                Ok(0) => {
+                    errors.push(format!("{var_name}: must be a positive integer, got '0'"));
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    errors.push(format!(
+                        "{var_name}: '{val}' is not a valid positive integer"
+                    ));
+                }
+            }
+        }
+    }
+
+    // Validate non-negative integer environment variable
+    if let Ok(val) = std::env::var("MACP_CHECKPOINT_INTERVAL") {
+        if val.parse::<u64>().is_err() {
+            errors.push(format!(
+                "MACP_CHECKPOINT_INTERVAL: '{val}' is not a valid non-negative integer"
+            ));
+        }
+    }
+
+    errors
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -55,6 +119,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(feature = "otel"))]
     {
         tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    }
+
+    // Validate environment configuration early
+    let config_errors = validate_env_config();
+    if !config_errors.is_empty() {
+        for err in &config_errors {
+            tracing::error!("Configuration error: {err}");
+        }
+        return Err(format!(
+            "startup aborted: {} configuration error(s) detected",
+            config_errors.len()
+        )
+        .into());
     }
 
     let addr = std::env::var("MACP_BIND_ADDR")
@@ -102,6 +179,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let registry = Arc::new(SessionRegistry::new());
     let log_store = Arc::new(LogStore::new());
     let mode_registry = Arc::new(ModeRegistry::build_default());
+    let policy_registry = Arc::new(PolicyRegistry::new());
 
     if !memory_only {
         // Replay sessions from logs
@@ -130,7 +208,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
 
-            match replay_session(&session_id, &log_entries, &mode_registry) {
+            match replay_session(
+                &session_id,
+                &log_entries,
+                &mode_registry,
+                Some(&policy_registry),
+            ) {
                 Ok(session) => {
                     if let Err(e) = storage.save_session(&session).await {
                         if strict_recovery {
@@ -179,11 +262,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let runtime = Arc::new(Runtime::with_mode_registry(
+    let runtime = Arc::new(Runtime::with_registries(
         Arc::clone(&storage),
         Arc::clone(&registry),
         Arc::clone(&log_store),
         mode_registry,
+        policy_registry,
     ));
     let security = SecurityLayer::from_env()?;
     let svc = MacpServer::new(Arc::clone(&runtime), security);
@@ -215,9 +299,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // Set up gRPC health check service
+    let (health_reporter, health_service) = tonic_health::server::health_reporter();
+    health_reporter
+        .set_serving::<pb::macp_runtime_service_server::MacpRuntimeServiceServer<MacpServer>>()
+        .await;
+
     let server_future = builder
+        .add_service(health_service)
         .add_service(pb::macp_runtime_service_server::MacpRuntimeServiceServer::new(svc))
         .serve(addr);
+
+    // Background cleanup task: expire TTL-exceeded sessions and evict stale ones.
+    let cleanup_interval_secs: u64 = std::env::var("MACP_CLEANUP_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
+    let session_retention_secs: u64 = std::env::var("MACP_SESSION_RETENTION_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3600);
+    let cleanup_runtime = runtime.clone();
+    let cleanup_handle = tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(cleanup_interval_secs));
+        loop {
+            interval.tick().await;
+            cleanup_runtime.cleanup_expired_sessions().await;
+            cleanup_runtime
+                .evict_stale_sessions(session_retention_secs)
+                .await;
+        }
+    });
 
     tokio::select! {
         result = server_future => {
@@ -227,6 +340,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing::info!("shutting down gracefully...");
         }
     }
+    cleanup_handle.abort();
 
     // Final snapshot: persist all sessions to storage
     if !memory_only {

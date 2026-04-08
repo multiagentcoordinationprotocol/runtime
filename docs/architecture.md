@@ -1,143 +1,243 @@
-# Runtime architecture
+# Runtime Architecture
 
-`macp-runtime v0.4.0` is organized as a small set of explicit layers.
+The MACP Runtime is a coordination kernel written in Rust. It receives agent messages over gRPC, validates and orders them, dispatches to mode-specific logic, and persists an append-only history that can be replayed to reconstruct any session.
 
-## 1. Transport adapter (`src/server.rs`)
+This page describes the runtime's internal design: its layer structure, how requests flow through the system, how concurrency is managed, and how persistence works. For the protocol-level architecture -- the two-plane model, session lifecycle, and determinism guarantees -- see the [protocol architecture documentation](https://www.multiagentcoordinationprotocol.io/docs/architecture).
 
-Responsibilities:
+## Layers
 
-- receive gRPC requests
-- authenticate request metadata
-- derive the runtime sender identity
-- enforce payload limits and rate limits
-- translate runtime errors into gRPC responses and MACP `Ack` values
-
-## 2. Coordination kernel (`src/runtime.rs`)
-
-Responsibilities:
-
-- route envelopes by message type
-- validate and create sessions
-- apply mode authorization and mode transitions
-- enforce accepted-history ordering
-- enforce lazy TTL expiry on reads and writes
-- persist updated session snapshots
-
-## 3. Mode Registry (`src/mode_registry.rs`)
-
-The `ModeRegistry` is the single source of truth for mode dispatch, replay, and discovery. It eliminates the previous pattern of hardcoded mode maps in `runtime.rs`, `main.rs`, and `replay.rs`.
-
-Responsibilities:
-
-- register all mode implementations
-- provide mode lookup for dispatch and replay
-- provide standards-track mode names for `ListModes`
-- provide mode descriptors for `ListModes` and `GetManifest`
-
-The registry uses `RwLock` for thread-safe dynamic mode registration.
-
-Key methods:
-
-- `build_default()` — constructs the canonical mode set (5 standards-track + 1 built-in extension)
-- `get_mode(name)` — mode lookup for dispatch
-- `standard_mode_names()` — drives `ListModes`
-- `standard_mode_descriptors()` — drives `ListModes` response
-- `all_mode_names()` — drives `GetManifest` and `Initialize` (all modes)
-- `extension_mode_descriptors()` — drives `ListExtModes`
-- `register_extension(descriptor)` — dynamic extension registration
-- `unregister_extension(mode)` — dynamic extension removal (built-in modes cannot be removed)
-- `promote_mode(mode, new_name)` — promote extension to standards-track
-- `subscribe_changes()` — broadcast channel for `WatchModeRegistry`
-
-## 4. Mode layer (`src/mode/*`)
-
-Responsibilities:
-
-- encode coordination semantics per mode
-- validate mode-specific payloads
-- authorize mode-specific message types
-- return declarative `ModeResponse` values for the kernel to apply
-
-Implemented modes:
-
-- Decision — enforced phase transitions (Proposal -> Evaluation -> Voting -> Committed)
-- Proposal — negotiation with counterproposals, acceptance convergence, terminal rejections
-- Task — delegated task with serial assignment, progress tracking, terminal reports
-- Handoff — serial handoff offers with accept/decline disposition
-- Quorum — threshold approval with ballots
-- MultiRound (`ext.multi_round.v1`) — built-in extension: iterative value convergence with explicit Commitment
-- PassthroughMode — generic handler for dynamically registered extension modes
-
-## 5. Storage layer
-
-### Storage backend (`src/storage.rs`)
-
-Provides the `StorageBackend` trait with two implementations:
-
-- `FileBackend` — per-session directories containing `session.json` and append-only `log.jsonl`, with crash recovery and atomic writes
-- `MemoryBackend` — no-op backend for `MACP_MEMORY_ONLY=1`
-
-### Session registry (`src/registry.rs`)
-
-In-memory cache of all sessions, loaded from `FileBackend` on startup. Stores:
-
-- session metadata
-- bound versions
-- participants
-- dedup state
-- current session state
-
-Supports optional file-backed snapshot persistence for backward compatibility.
-
-### Log store (`src/log_store.rs`)
-
-In-memory cache of accepted-history logs. Stores:
-
-- accepted incoming envelopes
-- runtime-generated internal events such as TTL expiry and session cancellation
-
-On-disk persistence is handled by `FileBackend`, not by LogStore.
-
-## 6. Security layer (`src/security.rs`)
-
-Responsibilities:
-
-- load token-to-identity mappings
-- derive sender identities from metadata
-- enforce allowed-mode policy
-- enforce session-start policy
-- enforce per-sender rate limits
-
-## Architecture diagram
+The runtime is organized into six layers, each with a clear responsibility boundary:
 
 ```
-Client Request
-       |
-  [Transport/gRPC] -- server.rs, security.rs
-       |
-  [Coordination Kernel] -- runtime.rs
-       |
-  [Mode Registry] -- mode_registry.rs
-       |            \
-  [Mode Logic]     [Discovery + Extension Lifecycle]
-   mode/*.rs       ListModes, ListExtModes, GetManifest,
-                   RegisterExtMode, UnregisterExtMode, PromoteMode
-       |
-  [Storage Layer] -- storage.rs, log_store.rs
-       |
-  [Replay] -- replay.rs
+Agents (external)
+  |
+  v  gRPC (tonic)
++-----------------------------------------------------------+
+|  Transport Layer (src/server.rs)                          |
+|    18 RPC handlers, authentication, envelope validation,  |
+|    sender derivation, rate limiting                        |
++-----------------------------------------------------------+
+  |
+  v
++-----------------------------------------------------------+
+|  Coordination Kernel (src/runtime.rs)                     |
+|    Session lifecycle, deduplication, TTL enforcement,      |
+|    mode dispatch, signal broadcast                         |
++-----------------------------------------------------------+
+  |
+  v
++-----------------------------------------------------------+
+|  Mode Layer (src/mode/*.rs)                               |
+|    Decision, Proposal, Task, Handoff, Quorum,             |
+|    Multi-Round, Passthrough                                |
++-----------------------------------------------------------+
+  |
+  v
++-----------------------------------------------------------+
+|  Policy Layer (src/policy/*.rs)                           |
+|    Policy registry, per-mode commitment evaluators,       |
+|    rule validation                                         |
++-----------------------------------------------------------+
+  |
+  v
++-----------------------------------------------------------+
+|  Storage Layer (src/storage/*.rs)                         |
+|    File, RocksDB, Redis, and in-memory backends,          |
+|    append-only logs, checkpointing, compaction             |
++-----------------------------------------------------------+
+  |
+  v
++-----------------------------------------------------------+
+|  Replay (src/replay.rs)                                   |
+|    Session rebuild from log entries, checkpoint fast path  |
++-----------------------------------------------------------+
 ```
 
-## Request path summary
+The **transport layer** terminates gRPC connections, authenticates requests using bearer tokens or development headers, validates envelope structure, overrides the sender field with the authenticated identity, and enforces per-sender rate limits. It never touches session state directly.
 
-1. gRPC request arrives in `MacpServer`
-2. request metadata is authenticated
-3. sender identity is derived and envelope spoofing is rejected
-4. runtime processes the envelope
-5. accepted messages mutate state and log history
-6. updated session snapshots are persisted
-7. an `Ack` is returned to the caller
+The **coordination kernel** is the heart of the runtime. It manages session creation, deduplication, lazy TTL expiration, and dispatches messages to the appropriate mode handler. It also broadcasts signals on the ambient plane and publishes accepted envelopes to streaming subscribers.
 
-## Freeze-profile design choice
+The **mode layer** implements each coordination mode as a pure function over session state. Mode handlers receive an immutable session reference and an envelope, and return a declarative response telling the kernel what to do -- persist state, resolve the session, or both. Modes never mutate state directly.
 
-The runtime now exposes `StreamSession` as a per-session accepted-envelope stream. Each gRPC stream binds to one session and receives canonical MACP envelopes in runtime acceptance order. Unary `Send` remains the path for explicit per-message acknowledgement semantics.
+The **policy layer** evaluates governance rules at commitment time. Each mode has a dedicated evaluator that checks whether accumulated session history satisfies the policy's constraints.
+
+The **storage layer** provides a pluggable persistence backend behind a common trait. All backends support the same operations: creating session storage, appending log entries, loading logs for replay, and managing checkpoints.
+
+The **replay engine** reconstructs sessions from their append-only logs on startup. It can optionally use checkpoints as a fast path, only replaying entries written after the last checkpoint.
+
+## Request flow: Send RPC
+
+When a client calls `Send` with an envelope, the request passes through the full pipeline:
+
+```
+Client --Send(Envelope)--> server.rs::send()
+  |
+  +-- authenticate_metadata()       -> AuthIdentity
+  +-- validate_envelope_shape()     -> check version, non-empty fields, size
+  +-- apply_authenticated_sender()  -> override envelope.sender
+  +-- authorize_mode()              -> check allowed_modes whitelist
+  +-- enforce_rate_limit()          -> sliding window check
+  |
+  +-- runtime.process(envelope)
+  |     |
+  |     +-- [SessionStart]
+  |     |     validate session ID format
+  |     |     look up mode in registry
+  |     |     parse and validate payload (participants, versions, TTL)
+  |     |     resolve policy version
+  |     |     call mode.on_session_start()
+  |     |     persist log entry               <-- COMMIT POINT
+  |     |     insert session into registry
+  |     |     publish to stream subscribers
+  |     |
+  |     +-- [Signal]
+  |     |     validate SignalPayload
+  |     |     broadcast on signal bus (no state mutation)
+  |     |
+  |     +-- [Session message]
+  |           dedup check (seen_message_ids)
+  |           verify mode matches session
+  |           lazy TTL expiration check
+  |           verify session is OPEN
+  |           call mode.authorize_sender()
+  |           call mode.on_message()
+  |           persist log entry               <-- COMMIT POINT
+  |           apply mode response to session
+  |           if resolved: compact or checkpoint
+  |           publish to stream subscribers
+  |
+  +-- build Ack and return SendResponse
+```
+
+The critical property is the **commit point**: the log entry is persisted to durable storage before any in-memory state is updated. If the server crashes after the commit point, replay will reconstruct the session correctly on restart. If it crashes before, the message was never acknowledged and the client can safely retry.
+
+## Request flow: StreamSession
+
+Bidirectional streaming works similarly but binds the stream to a single session:
+
+The first envelope on the stream establishes the session binding. All subsequent envelopes must target the same session. The client receives all accepted envelopes for that session (from any participant), delivered through a per-session broadcast channel.
+
+Application-level errors like validation failures or authorization denials are sent as inline error messages on the stream without closing it. Transport-level errors like authentication failure terminate the stream. If the client falls behind the broadcast buffer (capacity: 256 envelopes), the stream is terminated with `ResourceExhausted` and the client must reconnect.
+
+## Key types
+
+The runtime's core abstractions are expressed as a small set of Rust types:
+
+```rust
+// Session state machine -- monotonic transitions only
+enum SessionState { Open, Resolved, Expired }
+
+// Mode contract -- modes are pure functions over session state
+trait Mode: Send + Sync {
+    fn on_session_start(&self, session: &Session, env: &Envelope) -> Result<ModeResponse, MacpError>;
+    fn on_message(&self, session: &Session, env: &Envelope) -> Result<ModeResponse, MacpError>;
+    fn authorize_sender(&self, session: &Session, env: &Envelope) -> Result<(), MacpError>;
+}
+
+// Declarative responses -- modes never mutate state directly
+enum ModeResponse {
+    NoOp,                                          // no state change
+    PersistState(Vec<u8>),                         // update mode state
+    Resolve(Vec<u8>),                              // terminate session
+    PersistAndResolve { state: Vec<u8>, resolution: Vec<u8> },
+}
+
+// Storage contract -- all backends implement this trait
+trait StorageBackend: Send + Sync {
+    async fn append_log_entry(&self, session_id: &str, entry: &LogEntry) -> io::Result<()>;
+    async fn load_log(&self, session_id: &str) -> io::Result<Vec<LogEntry>>;
+    async fn save_session(&self, session: &Session) -> io::Result<()>;
+    async fn load_session(&self, session_id: &str) -> io::Result<Option<Session>>;
+    // ... additional methods for lifecycle management
+}
+
+// Security identity -- derived from auth tokens, never from envelope
+struct AuthIdentity {
+    sender: String,
+    allowed_modes: Option<HashSet<String>>,
+    can_start_sessions: bool,
+    max_open_sessions: Option<usize>,
+    can_manage_mode_registry: bool,
+}
+```
+
+The `Mode` trait is the central abstraction for extensibility. Each mode receives an immutable reference to the session and returns a `ModeResponse` that the kernel applies. This design ensures modes cannot introduce inconsistencies by directly mutating shared state.
+
+## Durability model
+
+The runtime uses a two-phase write strategy:
+
+1. **Log entry persisted first** -- This is the commit point. The append-only log survives server crashes, and the replay engine can reconstruct any session from it.
+
+2. **In-memory state updated second** -- Session snapshots are a cache optimization. If a snapshot is missing or stale, replay rebuilds the correct state from the log.
+
+Session snapshots are written on each state change as a best-effort optimization. For `SessionStart`, snapshot failure is treated as fatal (the initial snapshot must be durable). For subsequent messages, the log entry is the authoritative record and snapshot failure is non-fatal.
+
+### Checkpointing
+
+The runtime supports two forms of log compaction:
+
+- **Interval-based checkpoints**: After a configurable number of log entries (`MACP_CHECKPOINT_INTERVAL`), the runtime writes a checkpoint that captures the full session state. Replay can start from the checkpoint instead of replaying the entire log.
+
+- **Terminal compaction**: When a session reaches a terminal state (resolved, cancelled, or expired), the runtime compacts its log into a single checkpoint entry. If compaction fails, a forced checkpoint is written as a fallback.
+
+## Concurrency model
+
+The runtime processes different sessions in parallel but serializes access within each session:
+
+- **Per-session serialization**: The session registry uses `RwLock<HashMap>`. Mutations to a session acquire a write lock, ensuring only one message is processed at a time for that session.
+
+- **Cross-session parallelism**: Messages targeting different sessions are processed concurrently with no coordination between them.
+
+- **Stream bus**: Each session has a `tokio::sync::broadcast` channel (capacity 256) for delivering accepted envelopes to `StreamSession` subscribers. A separate global broadcast channel handles ambient signals via `WatchSignals`.
+
+- **Background tasks**: A periodic cleanup task runs every 60 seconds (configurable via `MACP_CLEANUP_INTERVAL_SECS`) to expire sessions that have exceeded their TTL and evict terminal sessions from memory after a retention period.
+
+## Mode registry
+
+The `ModeRegistry` is the single source of truth for which modes the runtime supports. It is built at startup with the five standards-track modes and the built-in `ext.multi_round.v1` extension.
+
+At runtime, the registry supports dynamic extension management: `RegisterExtMode` adds new extensions backed by a generic passthrough handler, `UnregisterExtMode` removes them (built-in modes are protected), and `PromoteMode` elevates an extension to standards-track status. All changes are broadcast to `WatchModeRegistry` subscribers.
+
+## Source layout
+
+```
+src/
+  main.rs              -- Startup, TLS config, persistence wiring, background tasks
+  server.rs            -- gRPC adapter (18 RPCs), auth, validation, streaming
+  runtime.rs           -- Coordination kernel, session lifecycle, mode dispatch
+  session.rs           -- Session model, SessionStart validation, ID rules
+  security.rs          -- Auth config, sender derivation, rate limiting
+  error.rs             -- Error types and RFC error code mapping
+  registry.rs          -- In-memory session registry
+  log_store.rs         -- In-memory log cache
+  stream_bus.rs        -- Per-session broadcast channels for StreamSession
+  metrics.rs           -- Atomic per-mode counters
+  mode_registry.rs     -- Mode lookup, extension lifecycle
+  replay.rs            -- Session rebuild from logs, checkpoint fast path
+  mode/
+    mod.rs             -- Mode trait and standard descriptors
+    decision.rs        -- Decision mode state machine
+    proposal.rs        -- Proposal mode (negotiation, convergence)
+    task.rs            -- Task mode (assignment, progress, completion)
+    handoff.rs         -- Handoff mode (serial offers, context, acceptance)
+    quorum.rs          -- Quorum mode (threshold approval, ballots)
+    multi_round.rs     -- Built-in extension: iterative convergence
+    passthrough.rs     -- Generic handler for dynamic extensions
+    util.rs            -- Shared commitment validation and authority checks
+  policy/
+    mod.rs             -- Policy types and decision structures
+    registry.rs        -- Policy CRUD with broadcast notifications
+    evaluator.rs       -- Per-mode commitment evaluation
+    rules.rs           -- Serde structs for mode-specific rule schemas
+    defaults.rs        -- Default policy (no constraints)
+  storage/
+    mod.rs             -- StorageBackend trait and backend selection
+    file.rs            -- File backend: per-session dirs, atomic writes
+    memory.rs          -- In-memory backend for testing
+    rocksdb.rs         -- RocksDB backend (feature-gated)
+    redis_backend.rs   -- Redis backend (feature-gated)
+    compaction.rs      -- Log compaction for terminal sessions
+    recovery.rs        -- Crash recovery (.tmp file cleanup)
+    migration.rs       -- Storage format migration
+```

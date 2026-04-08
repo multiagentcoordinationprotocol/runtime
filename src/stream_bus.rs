@@ -25,10 +25,7 @@ impl SessionStreamBus {
     }
 
     pub fn subscribe(&self, session_id: &str) -> broadcast::Receiver<Envelope> {
-        let mut guard = self
-            .channels
-            .lock()
-            .expect("session stream bus lock poisoned");
+        let mut guard = self.channels.lock().unwrap_or_else(|e| e.into_inner());
         guard
             .entry(session_id.to_string())
             .or_insert_with(|| {
@@ -40,10 +37,7 @@ impl SessionStreamBus {
 
     pub fn publish(&self, session_id: &str, envelope: Envelope) {
         let sender = {
-            let guard = self
-                .channels
-                .lock()
-                .expect("session stream bus lock poisoned");
+            let guard = self.channels.lock().unwrap_or_else(|e| e.into_inner());
             guard.get(session_id).cloned()
         };
         if let Some(sender) = sender {

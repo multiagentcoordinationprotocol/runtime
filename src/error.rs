@@ -6,8 +6,8 @@ pub enum MacpError {
     InvalidMacpVersion,
     #[error("InvalidEnvelope")]
     InvalidEnvelope,
-    #[error("DuplicateSession")]
-    DuplicateSession,
+    #[error("SessionAlreadyExists")]
+    SessionAlreadyExists,
     #[error("UnknownSession")]
     UnknownSession,
     #[error("SessionNotOpen")]
@@ -39,6 +39,12 @@ pub enum MacpError {
     StorageFailed,
     #[error("InvalidSessionId")]
     InvalidSessionId,
+    #[error("UnknownPolicyVersion")]
+    UnknownPolicyVersion,
+    #[error("PolicyDenied")]
+    PolicyDenied { reasons: Vec<String> },
+    #[error("InvalidPolicyDefinition")]
+    InvalidPolicyDefinition,
 }
 
 impl MacpError {
@@ -47,7 +53,7 @@ impl MacpError {
         match self {
             MacpError::InvalidMacpVersion => "UNSUPPORTED_PROTOCOL_VERSION",
             MacpError::InvalidEnvelope => "INVALID_ENVELOPE",
-            MacpError::DuplicateSession => "INVALID_ENVELOPE",
+            MacpError::SessionAlreadyExists => "SESSION_ALREADY_EXISTS",
             MacpError::UnknownSession => "SESSION_NOT_FOUND",
             MacpError::SessionNotOpen => "SESSION_NOT_OPEN",
             MacpError::TtlExpired => "SESSION_NOT_OPEN",
@@ -62,6 +68,9 @@ impl MacpError {
             MacpError::RateLimited => "RATE_LIMITED",
             MacpError::StorageFailed => "INTERNAL_ERROR",
             MacpError::InvalidSessionId => "INVALID_SESSION_ID",
+            MacpError::UnknownPolicyVersion => "UNKNOWN_POLICY_VERSION",
+            MacpError::PolicyDenied { .. } => "POLICY_DENIED",
+            MacpError::InvalidPolicyDefinition => "INVALID_POLICY_DEFINITION",
         }
     }
 }
@@ -78,7 +87,7 @@ mod tests {
                 "UNSUPPORTED_PROTOCOL_VERSION",
             ),
             (MacpError::InvalidEnvelope, "INVALID_ENVELOPE"),
-            (MacpError::DuplicateSession, "INVALID_ENVELOPE"),
+            (MacpError::SessionAlreadyExists, "SESSION_ALREADY_EXISTS"),
             (MacpError::UnknownSession, "SESSION_NOT_FOUND"),
             (MacpError::SessionNotOpen, "SESSION_NOT_OPEN"),
             (MacpError::TtlExpired, "SESSION_NOT_OPEN"),
@@ -93,6 +102,17 @@ mod tests {
             (MacpError::RateLimited, "RATE_LIMITED"),
             (MacpError::StorageFailed, "INTERNAL_ERROR"),
             (MacpError::InvalidSessionId, "INVALID_SESSION_ID"),
+            (MacpError::UnknownPolicyVersion, "UNKNOWN_POLICY_VERSION"),
+            (
+                MacpError::PolicyDenied {
+                    reasons: vec!["test".into()],
+                },
+                "POLICY_DENIED",
+            ),
+            (
+                MacpError::InvalidPolicyDefinition,
+                "INVALID_POLICY_DEFINITION",
+            ),
         ];
 
         for (error, expected_code) in cases {
@@ -120,5 +140,16 @@ mod tests {
         assert_eq!(MacpError::RateLimited.to_string(), "RateLimited");
         assert_eq!(MacpError::StorageFailed.to_string(), "StorageFailed");
         assert_eq!(MacpError::InvalidSessionId.to_string(), "InvalidSessionId");
+        assert_eq!(
+            MacpError::UnknownPolicyVersion.to_string(),
+            "UnknownPolicyVersion"
+        );
+        assert_eq!(
+            MacpError::PolicyDenied {
+                reasons: vec!["test".into()]
+            }
+            .to_string(),
+            "PolicyDenied"
+        );
     }
 }

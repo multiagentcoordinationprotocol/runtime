@@ -1,6 +1,7 @@
 use crate::error::MacpError;
 use crate::mode::util::{
-    is_declared_participant, participants_all_accept, validate_commitment_payload_for_session,
+    check_commitment_authority, is_declared_participant, participants_all_accept,
+    validate_commitment_payload_for_session,
 };
 use crate::mode::{Mode, ModeResponse};
 use crate::pb::Envelope;
@@ -46,11 +47,22 @@ pub struct TerminalRejectRecord {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RejectRecord {
+    pub proposal_id: String,
+    pub sender: String,
+    pub reason: String,
+    pub terminal: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProposalState {
     pub proposals: BTreeMap<String, ProposalRecord>,
     pub accepts: BTreeMap<String, String>,
     pub terminal_rejections: Vec<TerminalRejectRecord>,
+    /// All rejections (terminal and non-terminal) for audit trail.
+    #[serde(default)]
+    pub rejections: Vec<RejectRecord>,
     #[serde(default)]
     pub phase: ProposalPhase,
 }
@@ -77,6 +89,18 @@ impl ProposalMode {
     }
 
     fn refresh_phase(session: &Session, state: &mut ProposalState) {
+        // RFC-MACP-0012: acceptance.criterion controls convergence check
+        let criterion = session
+            .policy_definition
+            .as_ref()
+            .map(|p| {
+                serde_json::from_value::<crate::policy::rules::ProposalPolicyRules>(p.rules.clone())
+                    .unwrap_or_default()
+                    .acceptance
+                    .criterion
+            })
+            .unwrap_or_else(|| "all_parties".to_string());
+
         state.phase = if !state.terminal_rejections.is_empty() {
             ProposalPhase::TerminalRejected
         } else if state
@@ -84,10 +108,12 @@ impl ProposalMode {
             .values()
             .filter(|proposal| proposal.disposition == ProposalDisposition::Live)
             .any(|proposal| {
-                participants_all_accept(
-                    &session.participants,
-                    &state.accepts,
+                Self::check_acceptance_criterion(
+                    &criterion,
+                    session,
+                    state,
                     &proposal.proposal_id,
+                    &proposal.proposer,
                 )
             })
         {
@@ -95,6 +121,37 @@ impl ProposalMode {
         } else {
             ProposalPhase::Negotiating
         };
+    }
+
+    fn check_acceptance_criterion(
+        criterion: &str,
+        session: &Session,
+        state: &ProposalState,
+        proposal_id: &str,
+        proposer: &str,
+    ) -> bool {
+        match criterion {
+            "counterparty" => {
+                // All participants except the proposer must accept
+                session
+                    .participants
+                    .iter()
+                    .filter(|p| p.as_str() != proposer)
+                    .all(|p| state.accepts.get(p).map(String::as_str) == Some(proposal_id))
+            }
+            "initiator" => {
+                // Only the session initiator must accept
+                state
+                    .accepts
+                    .get(&session.initiator_sender)
+                    .map(String::as_str)
+                    == Some(proposal_id)
+            }
+            _ => {
+                // "all_parties" (default)
+                participants_all_accept(&session.participants, &state.accepts, proposal_id)
+            }
+        }
     }
 
     fn commitment_ready(state: &ProposalState) -> bool {
@@ -116,8 +173,7 @@ impl ProposalMode {
 impl Mode for ProposalMode {
     fn authorize_sender(&self, session: &Session, env: &Envelope) -> Result<(), MacpError> {
         match env.message_type.as_str() {
-            "Commitment" if env.sender == session.initiator_sender => Ok(()),
-            "Commitment" => Err(MacpError::Forbidden),
+            "Commitment" => check_commitment_authority(session, &env.sender),
             _ if is_declared_participant(&session.participants, &env.sender) => Ok(()),
             _ => Err(MacpError::Forbidden),
         }
@@ -181,6 +237,25 @@ impl Mode for ProposalMode {
                 {
                     return Err(MacpError::InvalidPayload);
                 }
+                // RFC-MACP-0012: enforce max_rounds at submission time to prevent
+                // unbounded state growth. The evaluator also checks at commitment.
+                if let Some(ref policy) = session.policy_definition {
+                    let rules =
+                        serde_json::from_value::<crate::policy::rules::ProposalPolicyRules>(
+                            policy.rules.clone(),
+                        )
+                        .unwrap_or_default();
+                    if rules.counter_proposal.max_rounds > 0 {
+                        let counter_count = state
+                            .proposals
+                            .values()
+                            .filter(|p| p.supersedes_proposal_id.is_some())
+                            .count();
+                        if counter_count >= rules.counter_proposal.max_rounds {
+                            return Err(MacpError::InvalidPayload);
+                        }
+                    }
+                }
                 state.proposals.insert(
                     payload.proposal_id.clone(),
                     ProposalRecord {
@@ -212,10 +287,28 @@ impl Mode for ProposalMode {
             "Reject" => {
                 let payload =
                     RejectPayload::decode(&*env.payload).map_err(|_| MacpError::InvalidPayload)?;
-                if !state.proposals.contains_key(&payload.proposal_id) {
+                // Reject only applies to live proposals (consistent with Accept validation)
+                if Self::live_proposal(&state, &payload.proposal_id).is_none() {
                     return Err(MacpError::InvalidPayload);
                 }
-                if payload.terminal {
+                // RFC-MACP-0012: terminal_on_any_reject overrides per-message terminal flag
+                let is_terminal = payload.terminal
+                    || session.policy_definition.as_ref().is_some_and(|p| {
+                        serde_json::from_value::<crate::policy::rules::ProposalPolicyRules>(
+                            p.rules.clone(),
+                        )
+                        .unwrap_or_default()
+                        .rejection
+                        .terminal_on_any_reject
+                    });
+                // Always record the rejection for audit trail
+                state.rejections.push(RejectRecord {
+                    proposal_id: payload.proposal_id.clone(),
+                    sender: env.sender.clone(),
+                    reason: payload.reason.clone(),
+                    terminal: is_terminal,
+                });
+                if is_terminal {
                     state.terminal_rejections.push(TerminalRejectRecord {
                         proposal_id: payload.proposal_id,
                         sender: env.sender.clone(),
@@ -228,6 +321,9 @@ impl Mode for ProposalMode {
             "Withdraw" => {
                 let payload = WithdrawPayload::decode(&*env.payload)
                     .map_err(|_| MacpError::InvalidPayload)?;
+                if payload.proposal_id.trim().is_empty() {
+                    return Err(MacpError::InvalidPayload);
+                }
                 let record = state
                     .proposals
                     .get_mut(&payload.proposal_id)
@@ -247,13 +343,31 @@ impl Mode for ProposalMode {
                 Ok(ModeResponse::PersistState(Self::encode_state(&state)))
             }
             "Commitment" => {
-                if env.sender != session.initiator_sender {
-                    return Err(MacpError::Forbidden);
-                }
                 validate_commitment_payload_for_session(session, &env.payload)?;
                 Self::refresh_phase(session, &mut state);
                 if !Self::commitment_ready(&state) {
                     return Err(MacpError::InvalidPayload);
+                }
+                // Evaluate governance policy if one is bound to the session.
+                if let Some(ref policy) = session.policy_definition {
+                    let counter_count = state
+                        .proposals
+                        .values()
+                        .filter(|p| p.supersedes_proposal_id.is_some())
+                        .count();
+                    let decision = crate::policy::evaluator::evaluate_proposal_commitment(
+                        policy,
+                        counter_count,
+                    );
+                    if let crate::policy::PolicyDecision::Deny { reasons } = decision {
+                        tracing::warn!(
+                            session_id = %session.session_id,
+                            policy_id = %policy.policy_id,
+                            reasons = ?reasons,
+                            "policy denied commitment"
+                        );
+                        return Err(MacpError::PolicyDenied { reasons });
+                    }
                 }
                 state.phase = ProposalPhase::Committed;
                 Ok(ModeResponse::PersistAndResolve {
@@ -294,6 +408,7 @@ mod tests {
             initiator_sender: "agent://buyer".into(),
             participant_message_counts: std::collections::HashMap::new(),
             participant_last_seen: std::collections::HashMap::new(),
+            policy_definition: None,
         }
     }
 
@@ -315,6 +430,9 @@ mod tests {
     }
 
     fn commitment(session: &Session, action: &str) -> Vec<u8> {
+        let outcome_positive = !action.contains("rejected")
+            && !action.contains("failed")
+            && !action.contains("declined");
         CommitmentPayload {
             commitment_id: "c1".into(),
             action: action.into(),
@@ -323,6 +441,7 @@ mod tests {
             mode_version: session.mode_version.clone(),
             policy_version: session.policy_version.clone(),
             configuration_version: session.configuration_version.clone(),
+            outcome_positive,
         }
         .encode_to_vec()
     }
@@ -647,6 +766,13 @@ mod tests {
             )
             .unwrap();
         apply(&mut session, resp);
+        // Verify the rejection is still recorded in state for audit
+        let state = decode(&session);
+        assert_eq!(state.rejections.len(), 1);
+        assert_eq!(state.rejections[0].proposal_id, "p1");
+        assert!(!state.rejections[0].terminal);
+        assert!(state.terminal_rejections.is_empty());
+        // But commitment should still be blocked
         assert_eq!(
             mode.on_message(
                 &session,
@@ -709,6 +835,7 @@ mod tests {
             mode_version: "wrong".into(),
             policy_version: session.policy_version.clone(),
             configuration_version: session.configuration_version.clone(),
+            outcome_positive: true,
         }
         .encode_to_vec();
         assert_eq!(
@@ -892,6 +1019,156 @@ mod tests {
             )
             .unwrap_err()
             .to_string(),
+            "InvalidPayload"
+        );
+    }
+
+    #[test]
+    fn policy_blocks_counter_proposal_at_submission_when_limit_exceeded() {
+        // RFC-MACP-0012: max_rounds is enforced both at submission and commitment time.
+        let mode = ProposalMode;
+        let mut session = base_session();
+        session.policy_definition = Some(crate::policy::PolicyDefinition {
+            policy_id: "test-limited".into(),
+            mode: "macp.mode.proposal.v1".into(),
+            description: "limited".into(),
+            rules: serde_json::json!({
+                "counter_proposal": { "max_rounds": 1 }
+            }),
+            schema_version: 1,
+        });
+        let resp = mode
+            .on_session_start(&session, &env("agent://buyer", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, resp);
+        // Seller proposes p1
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://seller", "Proposal", make_proposal("p1")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        // Buyer counter-proposes p2 (supersedes p1) -- 1st counter-proposal: allowed
+        let resp = mode
+            .on_message(
+                &session,
+                &env(
+                    "agent://buyer",
+                    "CounterProposal",
+                    make_counter_proposal("p2", "p1"),
+                ),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        // Seller counter-proposes p3 (supersedes p2) -- 2nd counter-proposal:
+        // REJECTED at submission time (max_rounds=1, already 1 counter-proposal)
+        let err = mode
+            .on_message(
+                &session,
+                &env(
+                    "agent://seller",
+                    "CounterProposal",
+                    make_counter_proposal("p3", "p2"),
+                ),
+            )
+            .unwrap_err();
+        assert_eq!(err.to_string(), "InvalidPayload");
+    }
+
+    // --- CounterProposal does NOT retire original ---
+
+    #[test]
+    fn counter_proposal_does_not_retire_original() {
+        let mode = ProposalMode;
+        let mut session = base_session();
+        let resp = mode
+            .on_session_start(&session, &env("agent://buyer", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, resp);
+        // Seller proposes p1
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://seller", "Proposal", make_proposal("p1")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        // Buyer counter-proposes p2, superseding p1
+        let resp = mode
+            .on_message(
+                &session,
+                &env(
+                    "agent://buyer",
+                    "CounterProposal",
+                    make_counter_proposal("p2", "p1"),
+                ),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        // Verify both proposals are still live in the mode state
+        let state = decode(&session);
+        assert_eq!(state.proposals.len(), 2);
+        assert_eq!(state.proposals["p1"].disposition, ProposalDisposition::Live);
+        assert_eq!(state.proposals["p2"].disposition, ProposalDisposition::Live);
+        assert_eq!(
+            state.proposals["p2"].supersedes_proposal_id,
+            Some("p1".into())
+        );
+    }
+
+    #[test]
+    fn reject_withdrawn_proposal_fails() {
+        let mode = ProposalMode;
+        let mut session = base_session();
+        let resp = mode
+            .on_session_start(&session, &env("agent://buyer", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, resp);
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://buyer", "Proposal", make_proposal("p1")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        // Withdraw p1
+        let resp = mode
+            .on_message(
+                &session,
+                &env("agent://buyer", "Withdraw", make_withdraw("p1")),
+            )
+            .unwrap();
+        apply(&mut session, resp);
+        // Reject on withdrawn proposal should fail
+        assert_eq!(
+            mode.on_message(
+                &session,
+                &env("agent://seller", "Reject", make_reject("p1", false))
+            )
+            .unwrap_err()
+            .to_string(),
+            "InvalidPayload"
+        );
+    }
+
+    #[test]
+    fn withdraw_empty_proposal_id_rejected() {
+        let mode = ProposalMode;
+        let mut session = base_session();
+        let resp = mode
+            .on_session_start(&session, &env("agent://buyer", "SessionStart", vec![]))
+            .unwrap();
+        apply(&mut session, resp);
+        let empty_withdraw = WithdrawPayload {
+            proposal_id: String::new(),
+            reason: "empty".into(),
+        }
+        .encode_to_vec();
+        assert_eq!(
+            mode.on_message(&session, &env("agent://buyer", "Withdraw", empty_withdraw))
+                .unwrap_err()
+                .to_string(),
             "InvalidPayload"
         );
     }

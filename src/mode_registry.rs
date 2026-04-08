@@ -364,7 +364,7 @@ impl ModeRegistry {
     }
 
     pub fn get_mode(&self, name: &str) -> Option<ModeRef<'_>> {
-        let guard = self.entries.read().expect("mode registry lock poisoned");
+        let guard = self.entries.read().unwrap_or_else(|e| e.into_inner());
         if guard.contains_key(name) {
             Some(ModeRef {
                 registry: self,
@@ -376,12 +376,12 @@ impl ModeRegistry {
     }
 
     pub fn standard_mode_names(&self) -> Vec<String> {
-        let guard = self.entries.read().expect("mode registry lock poisoned");
+        let guard = self.entries.read().unwrap_or_else(|e| e.into_inner());
         Self::ordered_standard_names(&guard)
     }
 
     pub fn standard_mode_descriptors(&self) -> Vec<ModeDescriptor> {
-        let guard = self.entries.read().expect("mode registry lock poisoned");
+        let guard = self.entries.read().unwrap_or_else(|e| e.into_inner());
         Self::ordered_standard_names(&guard)
             .into_iter()
             .filter_map(|name| guard.get(&name).and_then(ModeRegistration::descriptor))
@@ -389,7 +389,7 @@ impl ModeRegistry {
     }
 
     pub fn extension_mode_names(&self) -> Vec<String> {
-        let guard = self.entries.read().expect("mode registry lock poisoned");
+        let guard = self.entries.read().unwrap_or_else(|e| e.into_inner());
         let mut names: Vec<String> = guard
             .iter()
             .filter(|(_, e)| !e.standards_track)
@@ -400,7 +400,7 @@ impl ModeRegistry {
     }
 
     pub fn extension_mode_descriptors(&self) -> Vec<ModeDescriptor> {
-        let guard = self.entries.read().expect("mode registry lock poisoned");
+        let guard = self.entries.read().unwrap_or_else(|e| e.into_inner());
         let mut descriptors: Vec<ModeDescriptor> = guard
             .iter()
             .filter(|(_, e)| !e.standards_track)
@@ -411,14 +411,14 @@ impl ModeRegistry {
     }
 
     pub fn all_mode_names(&self) -> Vec<String> {
-        let guard = self.entries.read().expect("mode registry lock poisoned");
+        let guard = self.entries.read().unwrap_or_else(|e| e.into_inner());
         let mut names: Vec<String> = guard.keys().cloned().collect();
         names.sort();
         names
     }
 
     pub fn all_mode_descriptors(&self) -> Vec<ModeDescriptor> {
-        let guard = self.entries.read().expect("mode registry lock poisoned");
+        let guard = self.entries.read().unwrap_or_else(|e| e.into_inner());
         let mut descriptors: Vec<ModeDescriptor> = guard
             .values()
             .filter_map(ModeRegistration::descriptor)
@@ -428,7 +428,7 @@ impl ModeRegistry {
     }
 
     pub fn all_mode_conformance(&self) -> Vec<(String, ModeConformanceCatalog)> {
-        let guard = self.entries.read().expect("mode registry lock poisoned");
+        let guard = self.entries.read().unwrap_or_else(|e| e.into_inner());
         let mut conformance: Vec<(String, ModeConformanceCatalog)> = guard
             .iter()
             .map(|(name, entry)| (name.clone(), entry.conformance_catalog()))
@@ -438,16 +438,26 @@ impl ModeRegistry {
     }
 
     pub fn is_standard_mode(&self, name: &str) -> bool {
-        let guard = self.entries.read().expect("mode registry lock poisoned");
+        let guard = self.entries.read().unwrap_or_else(|e| e.into_inner());
         guard.get(name).map(|e| e.standards_track).unwrap_or(false)
     }
 
     pub fn requires_strict_session_start(&self, name: &str) -> bool {
-        let guard = self.entries.read().expect("mode registry lock poisoned");
+        let guard = self.entries.read().unwrap_or_else(|e| e.into_inner());
         guard
             .get(name)
             .map(|entry| entry.strict_session_start)
             .unwrap_or(false)
+    }
+
+    /// Returns the mode_version from the mode's descriptor, if available.
+    pub fn get_mode_version(&self, name: &str) -> Option<String> {
+        let guard = self.entries.read().unwrap_or_else(|e| e.into_inner());
+        guard
+            .get(name)
+            .and_then(|entry| entry.descriptor())
+            .map(|d| d.mode_version)
+            .filter(|v| !v.is_empty())
     }
 
     fn validate_extension_descriptor(descriptor: &ModeDescriptor) -> Result<(), String> {
@@ -507,7 +517,7 @@ impl ModeRegistry {
         let schema_provider = Arc::new(StaticModeSchemaProvider::new(schema_uris));
         let conformance_provider = Arc::new(StaticModeConformanceProvider::default());
 
-        let mut guard = self.entries.write().expect("mode registry lock poisoned");
+        let mut guard = self.entries.write().unwrap_or_else(|e| e.into_inner());
         if guard.contains_key(&name) {
             return Err(format!("mode '{}' is already registered", name));
         }
@@ -531,7 +541,7 @@ impl ModeRegistry {
 
     /// Unregister a dynamically registered extension mode.
     pub fn unregister_extension(&self, mode: &str) -> Result<(), String> {
-        let mut guard = self.entries.write().expect("mode registry lock poisoned");
+        let mut guard = self.entries.write().unwrap_or_else(|e| e.into_inner());
         match guard.get(mode) {
             None => return Err(format!("mode '{}' not found", mode)),
             Some(entry) if entry.builtin => {
@@ -551,7 +561,7 @@ impl ModeRegistry {
     /// Promote an extension mode to standards-track.
     /// Optionally re-keys the entry with a new identifier.
     pub fn promote_mode(&self, mode: &str, new_name: Option<&str>) -> Result<String, String> {
-        let mut guard = self.entries.write().expect("mode registry lock poisoned");
+        let mut guard = self.entries.write().unwrap_or_else(|e| e.into_inner());
         let entry = guard
             .get(mode)
             .ok_or_else(|| format!("mode '{}' not found", mode))?;
@@ -598,7 +608,7 @@ impl<'a> ModeRef<'a> {
             .registry
             .entries
             .read()
-            .expect("mode registry lock poisoned");
+            .unwrap_or_else(|e| e.into_inner());
         guard
             .get(&self.name)
             .map(|entry| Arc::clone(&entry.factory))

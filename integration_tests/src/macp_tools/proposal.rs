@@ -2,9 +2,9 @@ use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
 
-use crate::helpers;
-use super::SharedClient;
 use super::decision::MacpToolError;
+use super::SharedClient;
+use crate::helpers;
 
 #[derive(Serialize)]
 pub struct ToolResult {
@@ -46,19 +46,28 @@ impl Tool for SubmitProposalTool {
                 },
                 "required": ["session_id", "proposal_id", "title", "summary"]
             }
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let payload = helpers::proposal_mode_payload(&args.proposal_id, &args.title, &args.summary);
         let env = helpers::envelope(
-            helpers::MODE_PROPOSAL, "Proposal",
-            &helpers::new_message_id(), &args.session_id, &self.agent_id, payload,
+            helpers::MODE_PROPOSAL,
+            "Proposal",
+            &helpers::new_message_id(),
+            &args.session_id,
+            &self.agent_id,
+            payload,
         );
         let mut client = self.client.lock().await;
         let ack = helpers::send_as(&mut client, &self.agent_id, env)
-            .await.map_err(|e| MacpToolError(e.to_string()))?;
-        Ok(ToolResult { ok: ack.ok, session_state: ack.session_state })
+            .await
+            .map_err(|e| MacpToolError(e.to_string()))?;
+        Ok(ToolResult {
+            ok: ack.ok,
+            session_state: ack.session_state,
+        })
     }
 }
 
@@ -94,18 +103,27 @@ impl Tool for AcceptProposalTool {
                 },
                 "required": ["session_id", "proposal_id", "reason"]
             }
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let payload = helpers::accept_proposal_payload(&args.proposal_id, &args.reason);
         let env = helpers::envelope(
-            helpers::MODE_PROPOSAL, "Accept",
-            &helpers::new_message_id(), &args.session_id, &self.agent_id, payload,
+            helpers::MODE_PROPOSAL,
+            "Accept",
+            &helpers::new_message_id(),
+            &args.session_id,
+            &self.agent_id,
+            payload,
         );
         let mut client = self.client.lock().await;
         let ack = helpers::send_as(&mut client, &self.agent_id, env)
-            .await.map_err(|e| MacpToolError(e.to_string()))?;
-        Ok(ToolResult { ok: ack.ok, session_state: ack.session_state })
+            .await
+            .map_err(|e| MacpToolError(e.to_string()))?;
+        Ok(ToolResult {
+            ok: ack.ok,
+            session_state: ack.session_state,
+        })
     }
 }

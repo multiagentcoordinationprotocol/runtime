@@ -2,9 +2,9 @@ use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
 
-use crate::helpers;
-use super::SharedClient;
 use super::decision::MacpToolError;
+use super::SharedClient;
+use crate::helpers;
 
 #[derive(Clone)]
 pub struct GetSessionTool {
@@ -41,14 +41,18 @@ impl Tool for GetSessionTool {
                 },
                 "required": ["session_id"]
             }
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let mut client = self.client.lock().await;
         let resp = helpers::get_session_as(&mut client, &self.agent_id, &args.session_id)
-            .await.map_err(|e| MacpToolError(e.to_string()))?;
-        let meta = resp.metadata.ok_or_else(|| MacpToolError("no metadata".into()))?;
+            .await
+            .map_err(|e| MacpToolError(e.to_string()))?;
+        let meta = resp
+            .metadata
+            .ok_or_else(|| MacpToolError("no metadata".into()))?;
         Ok(GetSessionResult {
             session_id: meta.session_id,
             mode: meta.mode,

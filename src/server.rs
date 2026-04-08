@@ -2,16 +2,19 @@ use macp_runtime::error::MacpError;
 use macp_runtime::pb::macp_runtime_service_server::MacpRuntimeService;
 use macp_runtime::pb::{
     Ack, CancelSessionRequest, CancelSessionResponse, CancellationCapability, Capabilities,
-    Envelope, GetManifestRequest, GetManifestResponse, GetSessionRequest, GetSessionResponse,
-    InitializeRequest, InitializeResponse, ListExtModesRequest, ListExtModesResponse,
-    ListModesRequest, ListModesResponse, ListRootsRequest, ListRootsResponse,
+    Envelope, GetManifestRequest, GetManifestResponse, GetPolicyRequest, GetPolicyResponse,
+    GetSessionRequest, GetSessionResponse, InitializeRequest, InitializeResponse,
+    ListExtModesRequest, ListExtModesResponse, ListModesRequest, ListModesResponse,
+    ListPoliciesRequest, ListPoliciesResponse, ListRootsRequest, ListRootsResponse,
     MacpError as PbMacpError, ManifestCapability, ModeRegistryCapability, ParticipantActivity,
-    ProgressCapability, PromoteModeRequest, PromoteModeResponse, RegisterExtModeRequest,
-    RegisterExtModeResponse, RootsCapability, RuntimeInfo, SendRequest, SendResponse,
+    PolicyDescriptor, PolicyRegistryCapability, ProgressCapability, PromoteModeRequest,
+    PromoteModeResponse, RegisterExtModeRequest, RegisterExtModeResponse, RegisterPolicyRequest,
+    RegisterPolicyResponse, RootsCapability, RuntimeInfo, SendRequest, SendResponse,
     SessionMetadata, SessionState as PbSessionState, SessionsCapability, StreamSessionRequest,
     StreamSessionResponse, UnregisterExtModeRequest, UnregisterExtModeResponse,
-    WatchModeRegistryRequest, WatchModeRegistryResponse, WatchRootsRequest, WatchRootsResponse,
-    WatchSignalsRequest, WatchSignalsResponse,
+    UnregisterPolicyRequest, UnregisterPolicyResponse, WatchModeRegistryRequest,
+    WatchModeRegistryResponse, WatchPoliciesRequest, WatchPoliciesResponse, WatchRootsRequest,
+    WatchRootsResponse, WatchSignalsRequest, WatchSignalsResponse,
 };
 use macp_runtime::runtime::Runtime;
 use macp_runtime::security::{AuthIdentity, SecurityLayer};
@@ -42,6 +45,9 @@ impl MacpServer {
         if env.message_type.is_empty() || env.message_id.is_empty() {
             return Err(MacpError::InvalidEnvelope);
         }
+        // RFC-MACP-0001: Signals MUST have empty session_id and empty mode.
+        // Progress messages MAY be ambient (empty session_id/mode) or session-scoped.
+        let is_ambient_type = env.message_type == "Signal" || env.message_type == "Progress";
         if env.message_type == "Signal" {
             if !env.session_id.is_empty() {
                 return Err(MacpError::InvalidEnvelope);
@@ -50,12 +56,20 @@ impl MacpServer {
                 return Err(MacpError::InvalidEnvelope);
             }
         }
-        if env.message_type != "Signal" && env.session_id.is_empty() {
+        if env.message_type == "Progress" && env.session_id.is_empty() {
+            // Ambient Progress: mode must also be empty
+            if !env.mode.trim().is_empty() {
+                return Err(MacpError::InvalidEnvelope);
+            }
+        }
+        if !is_ambient_type && env.session_id.is_empty() {
             return Err(MacpError::InvalidEnvelope);
         }
-        if env.message_type != "Signal" && env.mode.trim().is_empty() {
+        if !is_ambient_type && env.mode.trim().is_empty() {
             return Err(MacpError::InvalidEnvelope);
         }
+        // Session-scoped Progress must have non-empty mode (enforced above for non-ambient types,
+        // and ambient Progress with non-empty session_id falls through to here naturally)
         if env.payload.len() > self.security.max_payload_bytes {
             return Err(MacpError::PayloadTooLarge);
         }
@@ -71,6 +85,7 @@ impl MacpServer {
     }
 
     fn make_error_ack(e: &MacpError, env: &Envelope) -> Ack {
+        let details = Self::error_details_bytes(e);
         Ack {
             ok: false,
             duplicate: false,
@@ -83,8 +98,19 @@ impl MacpServer {
                 message: e.to_string(),
                 session_id: env.session_id.clone(),
                 message_id: env.message_id.clone(),
-                details: vec![],
+                details,
             }),
+        }
+    }
+
+    /// Serialize structured error details as JSON bytes for the `details` field.
+    /// Currently only `PolicyDenied` carries additional detail (its reasons list).
+    fn error_details_bytes(e: &MacpError) -> Vec<u8> {
+        match e {
+            MacpError::PolicyDenied { reasons } => {
+                serde_json::to_vec(&serde_json::json!({ "reasons": reasons })).unwrap_or_default()
+            }
+            _ => vec![],
         }
     }
 
@@ -161,9 +187,17 @@ impl MacpServer {
                 *receiver = None;
                 Ok(None)
             }
-            Err(TryRecvError::Lagged(skipped)) => Err(Status::resource_exhausted(format!(
-                "StreamSession receiver fell behind by {skipped} envelopes"
-            ))),
+            Err(TryRecvError::Lagged(skipped)) => {
+                // Terminate the stream so the client knows it missed messages.
+                // Consistent with the async recv() path which also returns ResourceExhausted.
+                tracing::warn!(
+                    skipped,
+                    "StreamSession receiver fell behind; terminating stream"
+                );
+                Err(Status::resource_exhausted(format!(
+                    "StreamSession receiver fell behind by {skipped} envelopes"
+                )))
+            }
         }
     }
 
@@ -192,7 +226,7 @@ impl MacpServer {
         }
         if let Some(bound) = bound_session_id.as_ref() {
             if bound != &envelope.session_id {
-                return Err(Status::failed_precondition(
+                return Err(Status::invalid_argument(
                     "StreamSession may only carry envelopes for one session_id",
                 ));
             }
@@ -205,12 +239,12 @@ impl MacpServer {
         if !is_session_start {
             if let Some(session) = self.runtime.get_session_checked(&envelope.session_id).await {
                 if envelope.mode != session.mode {
-                    return Err(Status::failed_precondition(
+                    return Err(Status::invalid_argument(
                         "INVALID_ENVELOPE: envelope mode does not match the bound session mode",
                     ));
                 }
                 if session.state != SessionState::Open {
-                    return Err(Status::failed_precondition("SESSION_NOT_OPEN"));
+                    return Err(Status::invalid_argument("SESSION_NOT_OPEN"));
                 }
             } else if envelope.message_type == "Signal" {
                 return Err(Status::not_found(format!(
@@ -298,23 +332,50 @@ impl MacpServer {
 
                     match action {
                         StreamAction::ProcessRequest(req) => {
-                            server
+                            match server
                                 .process_stream_request(
                                     &identity,
                                     req,
                                     &mut bound_session_id,
                                     &mut session_events,
                                 )
-                                .await?;
+                                .await
+                            {
+                                Ok(()) => {}
+                                Err(status) if Self::is_stream_terminal_error(&status) => {
+                                    Err(status)?;
+                                }
+                                Err(status) => {
+                                    // RFC-MACP-0001: application-level validation errors
+                                    // are sent as inline MACPError; stream remains open.
+                                    yield StreamSessionResponse {
+                                        response: Some(
+                                            macp_runtime::pb::stream_session_response::Response::Error(
+                                                PbMacpError {
+                                                    code: status.message().to_string(),
+                                                    message: status.message().to_string(),
+                                                    session_id: bound_session_id.clone().unwrap_or_default(),
+                                                    message_id: String::new(),
+                                                    details: vec![],
+                                                },
+                                            ),
+                                        ),
+                                    };
+                                }
+                            }
                             while let Some(envelope) = Self::try_next_stream_event(&mut session_events)? {
                                 yield StreamSessionResponse {
-                                    envelope: Some(envelope),
+                                    response: Some(
+                                        macp_runtime::pb::stream_session_response::Response::Envelope(envelope),
+                                    ),
                                 };
                             }
                         }
                         StreamAction::EmitEnvelope(envelope) => {
                             yield StreamSessionResponse {
-                                envelope: Some(envelope),
+                                response: Some(
+                                    macp_runtime::pb::stream_session_response::Response::Envelope(envelope),
+                                ),
                             };
                         }
                         StreamAction::ClientError(status) => {
@@ -323,7 +384,9 @@ impl MacpServer {
                         StreamAction::ClientDone => {
                             while let Some(envelope) = Self::try_next_stream_event(&mut session_events)? {
                                 yield StreamSessionResponse {
-                                    envelope: Some(envelope),
+                                    response: Some(
+                                        macp_runtime::pb::stream_session_response::Response::Envelope(envelope),
+                                    ),
                                 };
                             }
                             break;
@@ -340,17 +403,40 @@ impl MacpServer {
                 } else {
                     match inbound.next().await {
                         Some(Ok(req)) => {
-                            server
+                            match server
                                 .process_stream_request(
                                     &identity,
                                     req,
                                     &mut bound_session_id,
                                     &mut session_events,
                                 )
-                                .await?;
+                                .await
+                            {
+                                Ok(()) => {}
+                                Err(status) if Self::is_stream_terminal_error(&status) => {
+                                    Err(status)?;
+                                }
+                                Err(status) => {
+                                    yield StreamSessionResponse {
+                                        response: Some(
+                                            macp_runtime::pb::stream_session_response::Response::Error(
+                                                PbMacpError {
+                                                    code: status.message().to_string(),
+                                                    message: status.message().to_string(),
+                                                    session_id: bound_session_id.clone().unwrap_or_default(),
+                                                    message_id: String::new(),
+                                                    details: vec![],
+                                                },
+                                            ),
+                                        ),
+                                    };
+                                }
+                            }
                             while let Some(envelope) = Self::try_next_stream_event(&mut session_events)? {
                                 yield StreamSessionResponse {
-                                    envelope: Some(envelope),
+                                    response: Some(
+                                        macp_runtime::pb::stream_session_response::Response::Envelope(envelope),
+                                    ),
                                 };
                             }
                         }
@@ -363,6 +449,21 @@ impl MacpServer {
         Box::pin(output)
     }
 
+    /// Returns true if the error should terminate a StreamSession stream.
+    /// Transport and binding errors terminate. Application-level validation
+    /// errors (from `runtime.process()`) are sent as inline MACPError per RFC-0001.
+    fn is_stream_terminal_error(status: &Status) -> bool {
+        matches!(
+            status.code(),
+            tonic::Code::Unauthenticated
+                | tonic::Code::Internal
+                | tonic::Code::ResourceExhausted
+                | tonic::Code::InvalidArgument
+                | tonic::Code::NotFound
+                | tonic::Code::AlreadyExists
+        )
+    }
+
     fn status_from_error(err: MacpError) -> Status {
         match err {
             MacpError::Unauthenticated => Status::unauthenticated(err.to_string()),
@@ -371,6 +472,25 @@ impl MacpServer {
             MacpError::RateLimited => Status::resource_exhausted(err.to_string()),
             MacpError::StorageFailed => Status::internal(err.to_string()),
             MacpError::InvalidSessionId => Status::invalid_argument(err.to_string()),
+            MacpError::InvalidPolicyDefinition => Status::invalid_argument(err.to_string()),
+            MacpError::SessionAlreadyExists => Status::already_exists(err.to_string()),
+            MacpError::PolicyDenied { ref reasons } => {
+                let details = Self::error_details_bytes(&err);
+                let msg = if reasons.is_empty() {
+                    "PolicyDenied".to_string()
+                } else {
+                    format!("PolicyDenied: {}", reasons.join("; "))
+                };
+                let mut status = Status::failed_precondition(msg);
+                if !details.is_empty() {
+                    // Attach JSON details as binary metadata so clients can parse structured reasons.
+                    let val = tonic::metadata::MetadataValue::from_bytes(&details);
+                    status
+                        .metadata_mut()
+                        .insert_bin("macp-error-details-bin", val);
+                }
+                status
+            }
             _ => Status::failed_precondition(err.to_string()),
         }
     }
@@ -383,6 +503,11 @@ impl MacpRuntimeService for MacpServer {
         request: Request<InitializeRequest>,
     ) -> Result<Response<InitializeResponse>, Status> {
         let req = request.into_inner();
+        if req.supported_protocol_versions.is_empty() {
+            return Err(Status::invalid_argument(
+                "INVALID_REQUEST: supported_protocol_versions must not be empty",
+            ));
+        }
         if !req.supported_protocol_versions.iter().any(|v| v == "1.0") {
             return Err(Status::failed_precondition(
                 "UNSUPPORTED_PROTOCOL_VERSION: no mutually supported protocol version",
@@ -412,6 +537,11 @@ impl MacpRuntimeService for MacpServer {
                 }),
                 roots: Some(RootsCapability {
                     list_roots: true,
+                    list_changed: true,
+                }),
+                policy_registry: Some(PolicyRegistryCapability {
+                    register_policy: true,
+                    list_policies: true,
                     list_changed: true,
                 }),
                 experimental: Some(macp_runtime::pb::ExperimentalCapabilities {
@@ -501,6 +631,7 @@ impl MacpRuntimeService for MacpServer {
                 policy_version: session.policy_version.clone(),
                 participants: session.participants.clone(),
                 participant_activity,
+                initiator: session.initiator_sender.clone(),
             }),
         }))
     }
@@ -519,15 +650,21 @@ impl MacpRuntimeService for MacpServer {
             .get_session_checked(&session_id)
             .await
             .ok_or_else(|| Status::not_found(format!("Session '{}' not found", session_id)))?;
-        if identity.sender != session.initiator_sender {
+        // RFC-MACP-0001: "Only the initiator and policy-delegated roles may cancel."
+        // CancelSession is a Core control-plane message — mode authorization does not apply.
+        if identity.sender != session.initiator_sender
+            && macp_runtime::mode::util::check_commitment_authority(&session, &identity.sender)
+                .is_err()
+        {
             return Err(Status::permission_denied(
-                "FORBIDDEN: only the session initiator can cancel",
+                "FORBIDDEN: only the session initiator or policy-delegated roles can cancel",
             ));
         }
+        let sender = identity.sender.clone();
         let req = request.into_inner();
         match self
             .runtime
-            .cancel_session(&req.session_id, &req.reason)
+            .cancel_session(&req.session_id, &req.reason, &sender)
             .await
         {
             Ok(result) => Ok(Response::new(CancelSessionResponse {
@@ -714,7 +851,7 @@ impl MacpRuntimeService for MacpServer {
             .map_err(Self::status_from_error)?;
         let req = request.into_inner();
         let descriptor = req
-            .descriptor
+            .mode_descriptor
             .ok_or_else(|| Status::invalid_argument("descriptor required"))?;
         match self.runtime.register_extension(descriptor) {
             Ok(()) => Ok(Response::new(RegisterExtModeResponse {
@@ -782,6 +919,171 @@ impl MacpRuntimeService for MacpServer {
             })),
         }
     }
+
+    // ── Governance policy lifecycle RPCs (RFC-MACP-0012) ────────────
+
+    async fn register_policy(
+        &self,
+        request: Request<RegisterPolicyRequest>,
+    ) -> Result<Response<RegisterPolicyResponse>, Status> {
+        let identity = self
+            .security
+            .authenticate_metadata(request.metadata())
+            .map_err(Self::status_from_error)?;
+        self.security
+            .authorize_mode_registry(&identity)
+            .map_err(Self::status_from_error)?;
+        let req = request.into_inner();
+        let descriptor = req
+            .policy_descriptor
+            .ok_or_else(|| Status::invalid_argument("descriptor required"))?;
+        let definition = Self::policy_descriptor_to_definition(&descriptor);
+        match self.runtime.register_policy(definition) {
+            Ok(()) => Ok(Response::new(RegisterPolicyResponse {
+                ok: true,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(RegisterPolicyResponse {
+                ok: false,
+                error: e,
+            })),
+        }
+    }
+
+    async fn unregister_policy(
+        &self,
+        request: Request<UnregisterPolicyRequest>,
+    ) -> Result<Response<UnregisterPolicyResponse>, Status> {
+        let identity = self
+            .security
+            .authenticate_metadata(request.metadata())
+            .map_err(Self::status_from_error)?;
+        self.security
+            .authorize_mode_registry(&identity)
+            .map_err(Self::status_from_error)?;
+        let req = request.into_inner();
+        match self.runtime.unregister_policy(&req.policy_id) {
+            Ok(()) => Ok(Response::new(UnregisterPolicyResponse {
+                ok: true,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(UnregisterPolicyResponse {
+                ok: false,
+                error: e,
+            })),
+        }
+    }
+
+    async fn get_policy(
+        &self,
+        request: Request<GetPolicyRequest>,
+    ) -> Result<Response<GetPolicyResponse>, Status> {
+        let _identity = self
+            .security
+            .authenticate_metadata(request.metadata())
+            .map_err(Self::status_from_error)?;
+        let req = request.into_inner();
+        let policy = self
+            .runtime
+            .get_policy(&req.policy_id)
+            .ok_or_else(|| Status::not_found(format!("Policy '{}' not found", req.policy_id)))?;
+        Ok(Response::new(GetPolicyResponse {
+            policy_descriptor: Some(Self::policy_definition_to_descriptor(&policy)),
+        }))
+    }
+
+    async fn list_policies(
+        &self,
+        request: Request<ListPoliciesRequest>,
+    ) -> Result<Response<ListPoliciesResponse>, Status> {
+        let _identity = self
+            .security
+            .authenticate_metadata(request.metadata())
+            .map_err(Self::status_from_error)?;
+        let req = request.into_inner();
+        let mode_filter = if req.mode.is_empty() {
+            None
+        } else {
+            Some(req.mode.as_str())
+        };
+        let policies = self.runtime.list_policies(mode_filter);
+        let descriptors = policies
+            .iter()
+            .map(Self::policy_definition_to_descriptor)
+            .collect();
+        Ok(Response::new(ListPoliciesResponse { descriptors }))
+    }
+
+    type WatchPoliciesStream = std::pin::Pin<
+        Box<dyn futures_core::Stream<Item = Result<WatchPoliciesResponse, Status>> + Send>,
+    >;
+
+    async fn watch_policies(
+        &self,
+        _request: Request<WatchPoliciesRequest>,
+    ) -> Result<Response<Self::WatchPoliciesStream>, Status> {
+        let mut rx = self.runtime.subscribe_policy_changes();
+        let runtime = Arc::clone(&self.runtime);
+        let stream = async_stream::try_stream! {
+            // Send initial state
+            let policies = runtime.list_policies(None);
+            let descriptors: Vec<PolicyDescriptor> = policies
+                .iter()
+                .map(MacpServer::policy_definition_to_descriptor)
+                .collect();
+            yield WatchPoliciesResponse {
+                descriptors,
+                observed_at_unix_ms: chrono::Utc::now().timestamp_millis(),
+            };
+            // Wait for changes
+            while rx.recv().await.is_ok() {
+                let policies = runtime.list_policies(None);
+                let descriptors: Vec<PolicyDescriptor> = policies
+                    .iter()
+                    .map(MacpServer::policy_definition_to_descriptor)
+                    .collect();
+                yield WatchPoliciesResponse {
+                    descriptors,
+                    observed_at_unix_ms: chrono::Utc::now().timestamp_millis(),
+                };
+            }
+        };
+        Ok(Response::new(Box::pin(stream)))
+    }
+}
+
+// ── Policy type conversion helpers ──────────────────────────────────
+
+impl MacpServer {
+    fn policy_descriptor_to_definition(
+        descriptor: &PolicyDescriptor,
+    ) -> macp_runtime::policy::PolicyDefinition {
+        let rules: serde_json::Value = if descriptor.rules.is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_slice(&descriptor.rules).unwrap_or_else(|_| serde_json::json!({}))
+        };
+        macp_runtime::policy::PolicyDefinition {
+            policy_id: descriptor.policy_id.clone(),
+            mode: descriptor.mode.clone(),
+            description: descriptor.description.clone(),
+            rules,
+            schema_version: descriptor.schema_version,
+        }
+    }
+
+    fn policy_definition_to_descriptor(
+        definition: &macp_runtime::policy::PolicyDefinition,
+    ) -> PolicyDescriptor {
+        PolicyDescriptor {
+            policy_id: definition.policy_id.clone(),
+            mode: definition.mode.clone(),
+            description: definition.description.clone(),
+            rules: serde_json::to_vec(&definition.rules).unwrap_or_default(),
+            schema_version: definition.schema_version,
+            registered_at_unix_ms: 0,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -827,7 +1129,7 @@ mod tests {
             participants: vec!["agent://fraud".into()],
             mode_version: "1.0.0".into(),
             configuration_version: "cfg-1".into(),
-            policy_version: "policy-1".into(),
+            policy_version: String::new(),
             ttl_ms: 1000,
             context: vec![],
             roots: vec![],
@@ -921,7 +1223,7 @@ mod tests {
         let server = MacpServer::new(runtime, security);
 
         let req = Request::new(RegisterExtModeRequest {
-            descriptor: Some(macp_runtime::pb::ModeDescriptor {
+            mode_descriptor: Some(macp_runtime::pb::ModeDescriptor {
                 mode: "ext.custom.v1".into(),
                 mode_version: "1.0.0".into(),
                 message_types: vec!["SessionStart".into(), "Commitment".into()],
@@ -965,7 +1267,10 @@ mod tests {
             server.build_stream_session_stream(stream_identity("agent://orchestrator"), requests);
 
         let response = stream.next().await.unwrap().unwrap();
-        let envelope = response.envelope.unwrap();
+        let envelope = match response.response.unwrap() {
+            macp_runtime::pb::stream_session_response::Response::Envelope(e) => e,
+            _ => panic!("expected envelope"),
+        };
         assert_eq!(envelope.message_type, "SessionStart");
         assert_eq!(envelope.message_id, "m1");
         assert!(stream.next().await.is_none());
@@ -1009,9 +1314,13 @@ mod tests {
             server.build_stream_session_stream(stream_identity("agent://orchestrator"), requests);
 
         let first = stream.next().await.unwrap().unwrap();
-        assert_eq!(first.envelope.unwrap().session_id, sid1);
+        let first_env = match first.response.unwrap() {
+            macp_runtime::pb::stream_session_response::Response::Envelope(e) => e,
+            _ => panic!("expected envelope"),
+        };
+        assert_eq!(first_env.session_id, sid1);
         let err = stream.next().await.unwrap().unwrap_err();
-        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
     #[tokio::test]
@@ -1247,6 +1556,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ambient_progress_accepted() {
+        let (server, _) = make_server();
+        let ack = do_send(
+            &server,
+            "agent://orchestrator",
+            Envelope {
+                macp_version: "1.0".into(),
+                mode: String::new(),
+                message_type: "Progress".into(),
+                message_id: "prog-1".into(),
+                session_id: String::new(),
+                sender: String::new(),
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                payload: vec![],
+            },
+        )
+        .await;
+        assert!(ack.ok);
+    }
+
+    #[tokio::test]
+    async fn ambient_progress_with_mode_rejected() {
+        let (server, _) = make_server();
+        let ack = do_send(
+            &server,
+            "agent://orchestrator",
+            Envelope {
+                macp_version: "1.0".into(),
+                mode: "macp.mode.decision.v1".into(),
+                message_type: "Progress".into(),
+                message_id: "prog-2".into(),
+                session_id: String::new(),
+                sender: String::new(),
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                payload: vec![],
+            },
+        )
+        .await;
+        assert!(!ack.ok);
+        assert_eq!(ack.error.as_ref().unwrap().code, "INVALID_ENVELOPE");
+    }
+
+    #[tokio::test]
     async fn manifest_advertises_stream_enabled() {
         let (server, _) = make_server();
         let resp = server
@@ -1259,5 +1611,33 @@ mod tests {
             .unwrap();
         let caps = resp.into_inner().capabilities.unwrap();
         assert!(caps.sessions.unwrap().stream);
+    }
+
+    #[tokio::test]
+    async fn initialize_empty_versions_rejected() {
+        let (server, _) = make_server();
+        let err = server
+            .initialize(Request::new(InitializeRequest {
+                supported_protocol_versions: vec![],
+                client_info: None,
+                capabilities: None,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn initialize_unsupported_version_rejected() {
+        let (server, _) = make_server();
+        let err = server
+            .initialize(Request::new(InitializeRequest {
+                supported_protocol_versions: vec!["2.0".into()],
+                client_info: None,
+                capabilities: None,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     }
 }

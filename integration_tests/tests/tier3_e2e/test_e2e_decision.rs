@@ -2,8 +2,8 @@ use crate::common;
 use macp_integration_tests::helpers::*;
 use macp_integration_tests::macp_tools::{self, decision::*};
 use rig::completion::Prompt;
-use rig::providers::openai;
 use rig::prelude::*;
+use rig::providers::openai;
 
 /// Realistic multi-agent decision coordination following the MACP spec.
 ///
@@ -60,7 +60,7 @@ async fn real_llm_agents_coordinate_decision() {
                 orchestrator_id,
                 session_start_payload(
                     "Review suspicious wire transfer requiring step-up verification",
-                    &[fraud_id, growth_id, compliance_id],
+                    &[orchestrator_id, fraud_id, growth_id, compliance_id],
                     60_000,
                 ),
             ),
@@ -119,7 +119,10 @@ async fn real_llm_agents_coordinate_decision() {
              For recommendation use: APPROVE, REVIEW, BLOCK, or REJECT.\n\
              For confidence use 0.0 to 1.0. Use EXACT session_id and proposal_id from prompt.",
         )
-        .tool(EvaluateTool { client: fraud_client, agent_id: fraud_id.into() })
+        .tool(EvaluateTool {
+            client: fraud_client,
+            agent_id: fraud_id.into(),
+        })
         .build();
 
     let growth_client = macp_tools::shared_client(ep).await;
@@ -131,7 +134,10 @@ async fn real_llm_agents_coordinate_decision() {
              For recommendation use: APPROVE, REVIEW, BLOCK, or REJECT.\n\
              For confidence use 0.0 to 1.0. Use EXACT session_id and proposal_id from prompt.",
         )
-        .tool(EvaluateTool { client: growth_client, agent_id: growth_id.into() })
+        .tool(EvaluateTool {
+            client: growth_client,
+            agent_id: growth_id.into(),
+        })
         .build();
 
     let compliance_client = macp_tools::shared_client(ep).await;
@@ -143,7 +149,10 @@ async fn real_llm_agents_coordinate_decision() {
              For recommendation use: APPROVE, REVIEW, BLOCK, or REJECT.\n\
              For confidence use 0.0 to 1.0. Use EXACT session_id and proposal_id from prompt.",
         )
-        .tool(EvaluateTool { client: compliance_client, agent_id: compliance_id.into() })
+        .tool(EvaluateTool {
+            client: compliance_client,
+            agent_id: compliance_id.into(),
+        })
         .build();
 
     let eval_prompt = |domain: &str| {
@@ -175,7 +184,10 @@ async fn real_llm_agents_coordinate_decision() {
     );
 
     let parallel_duration = start.elapsed();
-    eprintln!("   All 3 agents completed in {:.1}s (parallel)\n", parallel_duration.as_secs_f64());
+    eprintln!(
+        "   All 3 agents completed in {:.1}s (parallel)\n",
+        parallel_duration.as_secs_f64()
+    );
 
     // Log results
     match &fraud_result {
@@ -214,6 +226,7 @@ async fn real_llm_agents_coordinate_decision() {
                     "transfer.step-up-verification",
                     "checkout-payments",
                     "Specialist agents evaluated — proceeding with step-up verification",
+                    true,
                 ),
             ),
         )
@@ -241,7 +254,10 @@ async fn real_llm_agents_coordinate_decision() {
     eprintln!("\n═══════════════════════════════════════════════════════════════");
     eprintln!("  PASSED");
     eprintln!("  Orchestrator (code) proposed");
-    eprintln!("  → 3 specialists (LLM) evaluated IN PARALLEL ({:.1}s)", parallel_duration.as_secs_f64());
+    eprintln!(
+        "  → 3 specialists (LLM) evaluated IN PARALLEL ({:.1}s)",
+        parallel_duration.as_secs_f64()
+    );
     eprintln!("  → Orchestrator (code) committed");
     eprintln!("  LLM reasoning happened OUTSIDE session (ambient plane)");
     eprintln!("  Runtime serialized Evaluations by acceptance order");

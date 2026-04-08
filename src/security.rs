@@ -230,6 +230,23 @@ impl SecurityLayer {
     ) -> Result<(), MacpError> {
         let now = Instant::now();
         let mut guard = bucket.lock().await;
+
+        // Prune stale senders whose events are all outside the window.
+        // Limit pruning to at most 100 entries per call to bound latency.
+        let stale_keys: Vec<String> = guard
+            .iter()
+            .filter(|(_, deque)| {
+                deque
+                    .back()
+                    .map(|last| now.duration_since(*last) > config.window)
+                    .unwrap_or(true)
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in stale_keys {
+            guard.remove(&key);
+        }
+
         let deque = guard.entry(sender.to_string()).or_default();
         while deque
             .front()

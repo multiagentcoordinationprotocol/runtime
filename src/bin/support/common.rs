@@ -62,6 +62,7 @@ pub fn canonical_commitment_payload(
         mode_version: MODE_VERSION.into(),
         policy_version: POLICY_VERSION.into(),
         configuration_version: CONFIG_VERSION.into(),
+        outcome_positive: true,
     }
     .encode_to_vec()
 }

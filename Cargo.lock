@@ -1036,6 +1036,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "macp-proto"
+version = "0.1.0"
+source = "git+https://github.com/multiagentcoordinationprotocol/multiagentcoordinationprotocol.git#07d80fc1052cc1c96eaf069a799889c1d204dc95"
+
+[[package]]
 name = "macp-runtime"
 version = "0.4.0"
 dependencies = [
@@ -1043,6 +1048,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures-core",
+ "macp-proto",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
@@ -1057,6 +1063,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic 0.14.5",
+ "tonic-health",
  "tonic-prost",
  "tonic-prost-build",
  "tracing",
@@ -1944,6 +1951,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -2026,6 +2034,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "tonic-health"
+version = "0.14.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4ff0636fef47afb3ec02818f5bceb4377b8abb9d6a386aeade18bd6212f8eb7"
+dependencies = [
+ "prost 0.14.3",
+ "tokio",
+ "tokio-stream",
+ "tonic 0.14.5",
+ "tonic-prost",
 ]
 
 [[package]]

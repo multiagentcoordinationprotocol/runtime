@@ -2,9 +2,9 @@ use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
 
-use crate::helpers;
-use super::SharedClient;
 use super::decision::MacpToolError;
+use super::SharedClient;
+use crate::helpers;
 
 #[derive(Serialize)]
 pub struct ToolResult {
@@ -50,19 +50,33 @@ impl Tool for TaskRequestTool {
                 },
                 "required": ["session_id", "task_id", "title", "instructions", "assignee"]
             }
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let payload = helpers::task_request_payload(&args.task_id, &args.title, &args.instructions, &args.assignee);
+        let payload = helpers::task_request_payload(
+            &args.task_id,
+            &args.title,
+            &args.instructions,
+            &args.assignee,
+        );
         let env = helpers::envelope(
-            helpers::MODE_TASK, "TaskRequest",
-            &helpers::new_message_id(), &args.session_id, &self.agent_id, payload,
+            helpers::MODE_TASK,
+            "TaskRequest",
+            &helpers::new_message_id(),
+            &args.session_id,
+            &self.agent_id,
+            payload,
         );
         let mut client = self.client.lock().await;
         let ack = helpers::send_as(&mut client, &self.agent_id, env)
-            .await.map_err(|e| MacpToolError(e.to_string()))?;
-        Ok(ToolResult { ok: ack.ok, session_state: ack.session_state })
+            .await
+            .map_err(|e| MacpToolError(e.to_string()))?;
+        Ok(ToolResult {
+            ok: ack.ok,
+            session_state: ack.session_state,
+        })
     }
 }
 
@@ -98,19 +112,28 @@ impl Tool for TaskAcceptTool {
                 },
                 "required": ["session_id", "task_id"]
             }
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let payload = helpers::task_accept_payload(&args.task_id, &self.agent_id);
         let env = helpers::envelope(
-            helpers::MODE_TASK, "TaskAccept",
-            &helpers::new_message_id(), &args.session_id, &self.agent_id, payload,
+            helpers::MODE_TASK,
+            "TaskAccept",
+            &helpers::new_message_id(),
+            &args.session_id,
+            &self.agent_id,
+            payload,
         );
         let mut client = self.client.lock().await;
         let ack = helpers::send_as(&mut client, &self.agent_id, env)
-            .await.map_err(|e| MacpToolError(e.to_string()))?;
-        Ok(ToolResult { ok: ack.ok, session_state: ack.session_state })
+            .await
+            .map_err(|e| MacpToolError(e.to_string()))?;
+        Ok(ToolResult {
+            ok: ack.ok,
+            session_state: ack.session_state,
+        })
     }
 }
 
@@ -148,18 +171,27 @@ impl Tool for TaskCompleteTool {
                 },
                 "required": ["session_id", "task_id", "summary"]
             }
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let payload = helpers::task_complete_payload(&args.task_id, &self.agent_id, &args.summary);
         let env = helpers::envelope(
-            helpers::MODE_TASK, "TaskComplete",
-            &helpers::new_message_id(), &args.session_id, &self.agent_id, payload,
+            helpers::MODE_TASK,
+            "TaskComplete",
+            &helpers::new_message_id(),
+            &args.session_id,
+            &self.agent_id,
+            payload,
         );
         let mut client = self.client.lock().await;
         let ack = helpers::send_as(&mut client, &self.agent_id, env)
-            .await.map_err(|e| MacpToolError(e.to_string()))?;
-        Ok(ToolResult { ok: ack.ok, session_state: ack.session_state })
+            .await
+            .map_err(|e| MacpToolError(e.to_string()))?;
+        Ok(ToolResult {
+            ok: ack.ok,
+            session_state: ack.session_state,
+        })
     }
 }

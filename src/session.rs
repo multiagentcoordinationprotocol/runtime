@@ -1,6 +1,7 @@
 use crate::error::MacpError;
 use crate::mode::ModeResponse;
 use crate::pb::SessionStartPayload;
+use crate::policy::PolicyDefinition;
 use prost::Message;
 use std::collections::{HashMap, HashSet};
 
@@ -34,6 +35,7 @@ pub struct Session {
     pub initiator_sender: String,
     pub participant_message_counts: HashMap<String, u32>,
     pub participant_last_seen: HashMap<String, i64>,
+    pub policy_definition: Option<PolicyDefinition>,
 }
 
 impl Session {
@@ -102,6 +104,12 @@ pub fn validate_canonical_session_start_payload(
     }
 
     if payload.participants.is_empty() {
+        return Err(MacpError::InvalidPayload);
+    }
+
+    // Safety limit: prevent resource exhaustion from excessively large participant lists.
+    const MAX_PARTICIPANTS: usize = 1000;
+    if payload.participants.len() > MAX_PARTICIPANTS {
         return Err(MacpError::InvalidPayload);
     }
 
@@ -363,5 +371,26 @@ mod tests {
                 .to_string(),
             "InvalidSessionId"
         );
+    }
+
+    #[test]
+    fn too_many_participants_rejected() {
+        let participants: Vec<String> = (0..1001).map(|i| format!("agent://p{i}")).collect();
+        let bytes = encode_payload(5000, participants);
+        let payload = parse_session_start_payload(&bytes).unwrap();
+        assert_eq!(
+            validate_canonical_session_start_payload(&payload)
+                .unwrap_err()
+                .to_string(),
+            "InvalidPayload"
+        );
+    }
+
+    #[test]
+    fn max_participants_accepted() {
+        let participants: Vec<String> = (0..1000).map(|i| format!("agent://p{i}")).collect();
+        let bytes = encode_payload(5000, participants);
+        let payload = parse_session_start_payload(&bytes).unwrap();
+        validate_canonical_session_start_payload(&payload).unwrap();
     }
 }
