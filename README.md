@@ -233,7 +233,6 @@ See `docs/architecture.md` for detailed layer descriptions.
 
 ```text
 runtime/
-├── proto/                  # protobuf schemas copied from the RFC/spec repository
 ├── src/
 │   ├── main.rs             # server startup, TLS, persistence, auth wiring
 │   ├── server.rs           # gRPC adapter and request authentication
@@ -277,7 +276,7 @@ Check that the sender identity matches the session's participant list. For `Comm
 The runtime requires write access to `MACP_DATA_DIR`. Check directory permissions. Log append failures are fatal — the runtime will not acknowledge a message without a durable record.
 
 **Proto version mismatch**
-Update the `macp-proto` dependency version in `Cargo.toml` and run `cargo build`.
+Update the `macp-proto` version in `Cargo.toml` (published on crates.io) and run `cargo build`.
 
 ## Testing
 

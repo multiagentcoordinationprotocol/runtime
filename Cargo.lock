@@ -1038,7 +1038,8 @@ dependencies = [
 [[package]]
 name = "macp-proto"
 version = "0.1.0"
-source = "git+https://github.com/multiagentcoordinationprotocol/multiagentcoordinationprotocol.git#07d80fc1052cc1c96eaf069a799889c1d204dc95"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9f86838342731bb2edf1377543c4528f52e8bcbe13682aaaa00e1ca886b84a0"
 
 [[package]]
 name = "macp-runtime"
