@@ -34,10 +34,10 @@ opentelemetry-otlp = { version = "0.15", features = ["tonic"], optional = true }
 tracing-opentelemetry = { version = "0.23", optional = true }
 rocksdb = { version = "0.22", optional = true }
 redis = { version = "0.27", features = ["tokio-comp", "aio"], optional = true }
-# Proto definitions from the spec repo (exposes DEP_MACP_PROTO_PROTO_DIR to build.rs via links metadata).
+# Proto definitions from crates.io (exposes DEP_MACP_PROTO_PROTO_DIR to build.rs via links metadata).
 # For local proto development, temporarily switch to a path dependency:
 #   macp-proto = { path = "../multiagentcoordinationprotocol/packages/proto-rust" }
-macp-proto = { git = "https://github.com/multiagentcoordinationprotocol/multiagentcoordinationprotocol.git" }
+macp-proto = "0.1.0"
 
 [dev-dependencies]
 tempfile = "3"
