@@ -35,4 +35,6 @@ pub mod session;
 pub mod storage;
 pub mod stream_bus;
 
+pub mod auth;
+pub mod extensions;
 pub mod security;

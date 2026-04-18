@@ -291,12 +291,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             builder
         }
-        _ => {
-            return Err(
-                "TLS is required unless MACP_ALLOW_INSECURE=1 and MACP_ALLOW_DEV_SENDER_HEADER=1"
-                    .into(),
-            )
-        }
+        _ => return Err("TLS is required unless MACP_ALLOW_INSECURE=1 is set".into()),
     };
 
     // Set up gRPC health check service

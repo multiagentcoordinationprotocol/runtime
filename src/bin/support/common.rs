@@ -28,8 +28,10 @@ pub async fn connect_client(
 fn with_sender<T>(sender: &str, inner: T) -> Request<T> {
     let mut request = Request::new(inner);
     request.metadata_mut().insert(
-        "x-macp-agent-id",
-        sender.parse().expect("valid sender header"),
+        "authorization",
+        format!("Bearer {sender}")
+            .parse()
+            .expect("valid auth header"),
     );
     request
 }
@@ -42,8 +44,9 @@ pub fn canonical_start_payload(intent: &str, participants: &[&str], ttl_ms: i64)
         configuration_version: CONFIG_VERSION.into(),
         policy_version: POLICY_VERSION.into(),
         ttl_ms,
-        context: vec![],
         roots: vec![],
+        context_id: String::new(),
+        extensions: std::collections::HashMap::new(),
     }
     .encode_to_vec()
 }

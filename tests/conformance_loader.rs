@@ -355,7 +355,8 @@ async fn run_conformance_fixture(path: &Path) {
         configuration_version: fixture.configuration_version.clone(),
         policy_version: fixture.policy_version.clone(),
         ttl_ms: fixture.ttl_ms,
-        context: vec![],
+        context_id: String::new(),
+        extensions: std::collections::HashMap::new(),
         roots: vec![],
     }
     .encode_to_vec();

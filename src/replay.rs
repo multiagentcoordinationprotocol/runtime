@@ -222,7 +222,8 @@ fn replay_from_start(
         mode_version: start_payload.mode_version.clone(),
         configuration_version: start_payload.configuration_version.clone(),
         policy_version: start_payload.policy_version.clone(),
-        context: start_payload.context.clone(),
+        context_id: start_payload.context_id.clone(),
+        extensions: start_payload.extensions.clone(),
         roots: start_payload.roots.clone(),
         initiator_sender: start_entry.sender.clone(),
         participant_message_counts: std::collections::HashMap::new(),
@@ -268,7 +269,8 @@ mod tests {
             configuration_version: "cfg-1".into(),
             policy_version: "policy-1".into(),
             ttl_ms: 60_000,
-            context: vec![],
+            context_id: String::new(),
+            extensions: std::collections::HashMap::new(),
             roots: vec![],
         }
         .encode_to_vec()

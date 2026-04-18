@@ -2,6 +2,7 @@ use chrono::Utc;
 use std::sync::Arc;
 
 use crate::error::MacpError;
+use crate::extensions::ExtensionProviderRegistry;
 use crate::log_store::{EntryKind, LogEntry, LogStore};
 use crate::metrics::RuntimeMetrics;
 use crate::mode_registry::ModeRegistry;
@@ -22,14 +23,24 @@ pub struct ProcessResult {
     pub duplicate: bool,
 }
 
+#[derive(Clone, Debug)]
+pub enum SessionLifecycleEvent {
+    Created { session_id: String },
+    Resolved { session_id: String },
+    Expired { session_id: String },
+}
+
 pub struct Runtime {
     pub storage: Arc<dyn StorageBackend>,
     pub registry: Arc<SessionRegistry>,
     pub log_store: Arc<LogStore>,
     stream_bus: Arc<SessionStreamBus>,
     signal_bus: tokio::sync::broadcast::Sender<Envelope>,
+    session_lifecycle_bus: tokio::sync::broadcast::Sender<SessionLifecycleEvent>,
     mode_registry: Arc<ModeRegistry>,
     policy_registry: Arc<PolicyRegistry>,
+    #[allow(dead_code)] // plumbed for future session-extension providers; register API TBD
+    extensions: Arc<ExtensionProviderRegistry>,
     metrics: Arc<RuntimeMetrics>,
     checkpoint_interval: usize,
 }
@@ -75,14 +86,17 @@ impl Runtime {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0); // 0 = disabled by default
         let (signal_tx, _) = tokio::sync::broadcast::channel(256);
+        let (session_lifecycle_tx, _) = tokio::sync::broadcast::channel(64);
         Self {
             storage,
             registry,
             log_store,
             stream_bus: Arc::new(SessionStreamBus::default()),
             signal_bus: signal_tx,
+            session_lifecycle_bus: session_lifecycle_tx,
             mode_registry,
             policy_registry,
+            extensions: Arc::new(ExtensionProviderRegistry::new()),
             metrics: Arc::new(RuntimeMetrics::new()),
             checkpoint_interval,
         }
@@ -165,6 +179,12 @@ impl Runtime {
         self.signal_bus.subscribe()
     }
 
+    pub fn subscribe_session_lifecycle(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<SessionLifecycleEvent> {
+        self.session_lifecycle_bus.subscribe()
+    }
+
     fn publish_accepted_envelope(&self, env: &Envelope) {
         if !env.session_id.is_empty() {
             self.stream_bus.publish(&env.session_id, env.clone());
@@ -233,6 +253,11 @@ impl Runtime {
             session.state = SessionState::Expired;
             self.metrics.record_session_expired(&session.mode);
             tracing::info!(session_id, "session expired via TTL");
+            let _ = self
+                .session_lifecycle_bus
+                .send(SessionLifecycleEvent::Expired {
+                    session_id: session_id.to_string(),
+                });
             return Ok(true);
         }
         Ok(false)
@@ -364,7 +389,8 @@ impl Runtime {
             mode_version: start_payload.mode_version.clone(),
             configuration_version: start_payload.configuration_version.clone(),
             policy_version: effective_policy_version,
-            context: start_payload.context.clone(),
+            context_id: start_payload.context_id.clone(),
+            extensions: start_payload.extensions.clone(),
             roots: start_payload.roots.clone(),
             initiator_sender: env.sender.clone(),
             participant_message_counts: std::collections::HashMap::new(),
@@ -414,6 +440,11 @@ impl Runtime {
         );
         guard.insert(env.session_id.clone(), session);
         self.publish_accepted_envelope(env);
+        let _ = self
+            .session_lifecycle_bus
+            .send(SessionLifecycleEvent::Created {
+                session_id: env.session_id.clone(),
+            });
 
         Ok(ProcessResult {
             session_state: result_state,
@@ -494,6 +525,11 @@ impl Runtime {
         if result_state == SessionState::Resolved {
             self.metrics.record_session_resolved(&session.mode);
             tracing::info!(session_id = %env.session_id, mode = %session.mode, "session resolved");
+            let _ = self
+                .session_lifecycle_bus
+                .send(SessionLifecycleEvent::Resolved {
+                    session_id: env.session_id.clone(),
+                });
         }
 
         // 3. Best-effort session save + checkpoint
@@ -608,6 +644,11 @@ impl Runtime {
         }
         self.metrics.record_session_cancelled(&session.mode);
         tracing::info!(session_id, reason, "session cancelled");
+        let _ = self
+            .session_lifecycle_bus
+            .send(SessionLifecycleEvent::Expired {
+                session_id: session_id.to_string(),
+            });
 
         Ok(ProcessResult {
             session_state: SessionState::Expired,
@@ -721,6 +762,11 @@ impl Runtime {
                     self.force_insert_checkpoint(session_id, session).await;
                 }
                 tracing::info!(session_id, "session expired via background cleanup");
+                let _ = self
+                    .session_lifecycle_bus
+                    .send(SessionLifecycleEvent::Expired {
+                        session_id: session_id.clone(),
+                    });
             }
         }
 
@@ -786,7 +832,8 @@ mod tests {
             configuration_version: "cfg-1".into(),
             policy_version: String::new(),
             ttl_ms: 1_000,
-            context: vec![],
+            context_id: String::new(),
+            extensions: std::collections::HashMap::new(),
             roots: vec![],
         }
         .encode_to_vec()
@@ -931,7 +978,8 @@ mod tests {
             configuration_version: "cfg-1".into(),
             policy_version: String::new(),
             ttl_ms: 1,
-            context: vec![],
+            context_id: String::new(),
+            extensions: std::collections::HashMap::new(),
             roots: vec![],
         }
         .encode_to_vec();
@@ -1095,7 +1143,8 @@ mod tests {
             configuration_version: "cfg-1".into(),
             policy_version: String::new(),
             ttl_ms: 1,
-            context: vec![],
+            context_id: String::new(),
+            extensions: std::collections::HashMap::new(),
             roots: vec![],
         }
         .encode_to_vec();
@@ -1558,7 +1607,8 @@ mod tests {
             configuration_version: "cfg-1".into(),
             policy_version: String::new(),
             ttl_ms: 1,
-            context: vec![],
+            context_id: String::new(),
+            extensions: std::collections::HashMap::new(),
             roots: vec![],
         }
         .encode_to_vec();
@@ -1611,7 +1661,8 @@ mod tests {
             configuration_version: "cfg-1".into(),
             policy_version: String::new(),
             ttl_ms: 1,
-            context: vec![],
+            context_id: String::new(),
+            extensions: std::collections::HashMap::new(),
             roots: vec![],
         }
         .encode_to_vec();
@@ -1719,7 +1770,8 @@ mod tests {
             configuration_version: "cfg-1".into(),
             policy_version: String::new(),
             ttl_ms: 60_000,
-            context: vec![],
+            context_id: String::new(),
+            extensions: std::collections::HashMap::new(),
             roots: vec![],
         }
         .encode_to_vec();

@@ -1,20 +1,22 @@
 use macp_runtime::error::MacpError;
 use macp_runtime::pb::macp_runtime_service_server::MacpRuntimeService;
 use macp_runtime::pb::{
-    Ack, CancelSessionRequest, CancelSessionResponse, CancellationCapability, Capabilities,
-    Envelope, GetManifestRequest, GetManifestResponse, GetPolicyRequest, GetPolicyResponse,
-    GetSessionRequest, GetSessionResponse, InitializeRequest, InitializeResponse,
-    ListExtModesRequest, ListExtModesResponse, ListModesRequest, ListModesResponse,
-    ListPoliciesRequest, ListPoliciesResponse, ListRootsRequest, ListRootsResponse,
-    MacpError as PbMacpError, ManifestCapability, ModeRegistryCapability, ParticipantActivity,
-    PolicyDescriptor, PolicyRegistryCapability, ProgressCapability, PromoteModeRequest,
-    PromoteModeResponse, RegisterExtModeRequest, RegisterExtModeResponse, RegisterPolicyRequest,
-    RegisterPolicyResponse, RootsCapability, RuntimeInfo, SendRequest, SendResponse,
+    session_lifecycle_event, Ack, CancelSessionRequest, CancelSessionResponse,
+    CancellationCapability, Capabilities, Envelope, GetManifestRequest, GetManifestResponse,
+    GetPolicyRequest, GetPolicyResponse, GetSessionRequest, GetSessionResponse, InitializeRequest,
+    InitializeResponse, ListExtModesRequest, ListExtModesResponse, ListModesRequest,
+    ListModesResponse, ListPoliciesRequest, ListPoliciesResponse, ListRootsRequest,
+    ListRootsResponse, ListSessionsRequest, ListSessionsResponse, MacpError as PbMacpError,
+    ManifestCapability, ModeRegistryCapability, ParticipantActivity, PolicyDescriptor,
+    PolicyRegistryCapability, ProgressCapability, PromoteModeRequest, PromoteModeResponse,
+    RegisterExtModeRequest, RegisterExtModeResponse, RegisterPolicyRequest, RegisterPolicyResponse,
+    RootsCapability, RuntimeInfo, SendRequest, SendResponse, SessionLifecycleEvent,
     SessionMetadata, SessionState as PbSessionState, SessionsCapability, StreamSessionRequest,
     StreamSessionResponse, UnregisterExtModeRequest, UnregisterExtModeResponse,
     UnregisterPolicyRequest, UnregisterPolicyResponse, WatchModeRegistryRequest,
     WatchModeRegistryResponse, WatchPoliciesRequest, WatchPoliciesResponse, WatchRootsRequest,
-    WatchRootsResponse, WatchSignalsRequest, WatchSignalsResponse,
+    WatchRootsResponse, WatchSessionsRequest, WatchSessionsResponse, WatchSignalsRequest,
+    WatchSignalsResponse,
 };
 use macp_runtime::runtime::Runtime;
 use macp_runtime::security::{AuthIdentity, SecurityLayer};
@@ -81,6 +83,37 @@ impl MacpServer {
             SessionState::Open => PbSessionState::Open.into(),
             SessionState::Resolved => PbSessionState::Resolved.into(),
             SessionState::Expired => PbSessionState::Expired.into(),
+        }
+    }
+
+    fn session_to_metadata(session: &macp_runtime::session::Session) -> SessionMetadata {
+        let participant_activity = session
+            .participant_message_counts
+            .iter()
+            .map(|(pid, count)| ParticipantActivity {
+                participant_id: pid.clone(),
+                last_message_at_unix_ms: session
+                    .participant_last_seen
+                    .get(pid)
+                    .copied()
+                    .unwrap_or(0),
+                message_count: *count,
+            })
+            .collect();
+        SessionMetadata {
+            session_id: session.session_id.clone(),
+            mode: session.mode.clone(),
+            state: Self::session_state_to_pb(&session.state),
+            started_at_unix_ms: session.started_at_unix_ms,
+            expires_at_unix_ms: session.ttl_expiry,
+            mode_version: session.mode_version.clone(),
+            configuration_version: session.configuration_version.clone(),
+            policy_version: session.policy_version.clone(),
+            participants: session.participants.clone(),
+            participant_activity,
+            initiator: session.initiator_sender.clone(),
+            context_id: session.context_id.clone(),
+            extension_keys: session.extensions.keys().cloned().collect(),
         }
     }
 
@@ -160,7 +193,8 @@ impl MacpServer {
             .get_session_checked(session_id)
             .await
             .ok_or_else(|| Status::not_found(format!("Session '{}' not found", session_id)))?;
-        let allowed = session.initiator_sender == identity.sender
+        let allowed = identity.is_observer
+            || session.initiator_sender == identity.sender
             || session.participants.iter().any(|p| p == &identity.sender);
         if !allowed {
             return Err(Status::permission_denied(
@@ -525,7 +559,7 @@ impl MacpRuntimeService for MacpServer {
                 website_url: String::new(),
             }),
             capabilities: Some(Capabilities {
-                sessions: Some(SessionsCapability { stream: true }),
+                sessions: Some(SessionsCapability { stream: true, list_sessions: true, watch_sessions: true }),
                 cancellation: Some(CancellationCapability {
                     cancel_session: true,
                 }),
@@ -605,34 +639,8 @@ impl MacpRuntimeService for MacpServer {
             .await
             .ok_or_else(|| Status::not_found(format!("Session '{}' not found", session_id)))?;
 
-        let participant_activity = session
-            .participant_message_counts
-            .iter()
-            .map(|(pid, count)| ParticipantActivity {
-                participant_id: pid.clone(),
-                last_message_at_unix_ms: session
-                    .participant_last_seen
-                    .get(pid)
-                    .copied()
-                    .unwrap_or(0),
-                message_count: *count,
-            })
-            .collect();
-
         Ok(Response::new(GetSessionResponse {
-            metadata: Some(SessionMetadata {
-                session_id: session.session_id.clone(),
-                mode: session.mode.clone(),
-                state: Self::session_state_to_pb(&session.state),
-                started_at_unix_ms: session.started_at_unix_ms,
-                expires_at_unix_ms: session.ttl_expiry,
-                mode_version: session.mode_version.clone(),
-                configuration_version: session.configuration_version.clone(),
-                policy_version: session.policy_version.clone(),
-                participants: session.participants.clone(),
-                participant_activity,
-                initiator: session.initiator_sender.clone(),
-            }),
+            metadata: Some(Self::session_to_metadata(&session)),
         }))
     }
 
@@ -812,6 +820,10 @@ impl MacpRuntimeService for MacpServer {
         Box<dyn futures_core::Stream<Item = Result<WatchSignalsResponse, Status>> + Send>,
     >;
 
+    type WatchSessionsStream = std::pin::Pin<
+        Box<dyn futures_core::Stream<Item = Result<WatchSessionsResponse, Status>> + Send>,
+    >;
+
     async fn watch_signals(
         &self,
         _request: Request<WatchSignalsRequest>,
@@ -821,6 +833,68 @@ impl MacpRuntimeService for MacpServer {
             while let Ok(envelope) = rx.recv().await {
                 yield WatchSignalsResponse {
                     envelope: Some(envelope),
+                };
+            }
+        };
+        Ok(Response::new(Box::pin(stream)))
+    }
+
+    // Session lifecycle observation RPCs
+
+    async fn list_sessions(
+        &self,
+        request: Request<ListSessionsRequest>,
+    ) -> Result<Response<ListSessionsResponse>, Status> {
+        let _identity = self
+            .security
+            .authenticate_metadata(request.metadata())
+            .map_err(Self::status_from_error)?;
+        let sessions = self.runtime.registry.get_all_sessions().await;
+        let metadata: Vec<SessionMetadata> =
+            sessions.iter().map(Self::session_to_metadata).collect();
+        Ok(Response::new(ListSessionsResponse { sessions: metadata }))
+    }
+
+    async fn watch_sessions(
+        &self,
+        request: Request<WatchSessionsRequest>,
+    ) -> Result<Response<Self::WatchSessionsStream>, Status> {
+        let _identity = self
+            .security
+            .authenticate_metadata(request.metadata())
+            .map_err(Self::status_from_error)?;
+        let mut rx = self.runtime.subscribe_session_lifecycle();
+        let runtime = Arc::clone(&self.runtime);
+        let stream = async_stream::try_stream! {
+            // Initial sync: emit all current sessions as CREATED events
+            let sessions = runtime.registry.get_all_sessions().await;
+            for session in &sessions {
+                yield WatchSessionsResponse {
+                    event: Some(SessionLifecycleEvent {
+                        event_type: session_lifecycle_event::EventType::Created.into(),
+                        session: Some(Self::session_to_metadata(session)),
+                        observed_at_unix_ms: session.started_at_unix_ms,
+                    }),
+                };
+            }
+            // Stream lifecycle transitions
+            while let Ok(event) = rx.recv().await {
+                let (event_type, sid) = match &event {
+                    macp_runtime::runtime::SessionLifecycleEvent::Created { session_id } =>
+                        (session_lifecycle_event::EventType::Created, session_id.clone()),
+                    macp_runtime::runtime::SessionLifecycleEvent::Resolved { session_id } =>
+                        (session_lifecycle_event::EventType::Resolved, session_id.clone()),
+                    macp_runtime::runtime::SessionLifecycleEvent::Expired { session_id } =>
+                        (session_lifecycle_event::EventType::Expired, session_id.clone()),
+                };
+                let session_meta = runtime.registry.get_session(&sid).await
+                    .map(|s| Self::session_to_metadata(&s));
+                yield WatchSessionsResponse {
+                    event: Some(SessionLifecycleEvent {
+                        event_type: event_type.into(),
+                        session: session_meta,
+                        observed_at_unix_ms: chrono::Utc::now().timestamp_millis(),
+                    }),
                 };
             }
         };
@@ -1061,7 +1135,7 @@ impl MacpServer {
         let rules: serde_json::Value = if descriptor.rules.is_empty() {
             serde_json::json!({})
         } else {
-            serde_json::from_slice(&descriptor.rules).unwrap_or_else(|_| serde_json::json!({}))
+            serde_json::from_str(&descriptor.rules).unwrap_or_else(|_| serde_json::json!({}))
         };
         macp_runtime::policy::PolicyDefinition {
             policy_id: descriptor.policy_id.clone(),
@@ -1079,7 +1153,7 @@ impl MacpServer {
             policy_id: definition.policy_id.clone(),
             mode: definition.mode.clone(),
             description: definition.description.clone(),
-            rules: serde_json::to_vec(&definition.rules).unwrap_or_default(),
+            rules: serde_json::to_string(&definition.rules).unwrap_or_default(),
             schema_version: definition.schema_version,
             registered_at_unix_ms: 0,
         }
@@ -1114,7 +1188,7 @@ mod tests {
             envelope: Some(env),
         });
         req.metadata_mut()
-            .insert("x-macp-agent-id", sender.parse().unwrap());
+            .insert("authorization", format!("Bearer {sender}").parse().unwrap());
         req
     }
 
@@ -1131,7 +1205,8 @@ mod tests {
             configuration_version: "cfg-1".into(),
             policy_version: String::new(),
             ttl_ms: 1000,
-            context: vec![],
+            context_id: String::new(),
+            extensions: std::collections::HashMap::new(),
             roots: vec![],
         }
         .encode_to_vec()
@@ -1206,8 +1281,10 @@ mod tests {
         assert!(ack.ok);
 
         let mut req = Request::new(GetSessionRequest { session_id: sid });
-        req.metadata_mut()
-            .insert("x-macp-agent-id", "agent://outsider".parse().unwrap());
+        req.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", "agent://outsider").parse().unwrap(),
+        );
         let err = server.get_session(req).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
@@ -1241,6 +1318,7 @@ mod tests {
             can_start_sessions: true,
             max_open_sessions: None,
             can_manage_mode_registry: false,
+            is_observer: false,
         }
     }
 
@@ -1403,8 +1481,12 @@ mod tests {
         let mut req = Request::new(GetSessionRequest {
             session_id: sid.clone(),
         });
-        req.metadata_mut()
-            .insert("x-macp-agent-id", "agent://orchestrator".parse().unwrap());
+        req.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", "agent://orchestrator")
+                .parse()
+                .unwrap(),
+        );
         let resp = server.get_session(req).await.unwrap();
         let meta = resp.into_inner().metadata.unwrap();
         assert_eq!(meta.session_id, sid);
@@ -1438,8 +1520,12 @@ mod tests {
             session_id: sid,
             reason: "no longer needed".into(),
         });
-        req.metadata_mut()
-            .insert("x-macp-agent-id", "agent://orchestrator".parse().unwrap());
+        req.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", "agent://orchestrator")
+                .parse()
+                .unwrap(),
+        );
         let resp = server.cancel_session(req).await.unwrap();
         let ack = resp.into_inner().ack.unwrap();
         assert!(ack.ok);
@@ -1471,8 +1557,10 @@ mod tests {
             session_id: sid,
             reason: "I want to cancel".into(),
         });
-        req.metadata_mut()
-            .insert("x-macp-agent-id", "agent://fraud".parse().unwrap());
+        req.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", "agent://fraud").parse().unwrap(),
+        );
         let err = server.cancel_session(req).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
@@ -1484,8 +1572,12 @@ mod tests {
             session_id: "nonexistent".into(),
             reason: "test".into(),
         });
-        req.metadata_mut()
-            .insert("x-macp-agent-id", "agent://orchestrator".parse().unwrap());
+        req.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", "agent://orchestrator")
+                .parse()
+                .unwrap(),
+        );
         let err = server.cancel_session(req).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::NotFound);
     }
