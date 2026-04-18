@@ -8,8 +8,10 @@ use tonic::Request;
 fn with_sender<T>(sender: &str, inner: T) -> Request<T> {
     let mut request = Request::new(inner);
     request.metadata_mut().insert(
-        "x-macp-agent-id",
-        sender.parse().expect("valid sender header"),
+        "authorization",
+        format!("Bearer {sender}")
+            .parse()
+            .expect("valid auth header"),
     );
     request
 }

@@ -227,11 +227,12 @@ rpc WatchPolicies(WatchPoliciesRequest) returns (stream WatchPoliciesResponse)
 
 ## Authentication
 
-The runtime checks credentials in this order:
+The runtime applies a resolver chain in this order:
 
-1. **Bearer token**: `Authorization: Bearer <token>` or `x-macp-token: <token>` header. The token is mapped to an `AuthIdentity` via the configured token file.
-2. **Dev mode**: `x-macp-agent-id: <sender>` header, only when `MACP_ALLOW_DEV_SENDER_HEADER=1`. Grants all capabilities.
-3. **Reject**: Returns `UNAUTHENTICATED`.
+1. **JWT bearer** (when `MACP_AUTH_ISSUER` is set): `Authorization: Bearer <jwt>`. The JWT's `sub` claim becomes the sender; `macp_scopes` carries capability flags (`allowed_modes`, `can_start_sessions`, `max_open_sessions`, `can_manage_mode_registry`, `is_observer`).
+2. **Static bearer** (when `MACP_AUTH_TOKENS_*` is set): `Authorization: Bearer <token>` or `x-macp-token: <token>` header. The opaque token is mapped to an `AuthIdentity` via the configured token file.
+3. **Dev-mode fallback** (when neither JWT nor static bearer is configured): any `Authorization: Bearer <value>` header authenticates the caller as sender `<value>` with all capabilities. Intended only for local development.
+4. **Reject**: Returns `UNAUTHENTICATED`.
 
 See the [Getting Started guide](getting-started.md) for token configuration examples.
 

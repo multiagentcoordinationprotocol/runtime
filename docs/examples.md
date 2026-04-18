@@ -8,11 +8,10 @@ All examples target `macp-runtime v0.4.0` and use the development security short
 
 ```bash
 export MACP_ALLOW_INSECURE=1
-export MACP_ALLOW_DEV_SENDER_HEADER=1
 cargo run
 ```
 
-The example binaries attach `x-macp-agent-id` metadata so the runtime can derive the authenticated sender. Every example creates a session with the required fields: `participants`, `mode_version` (`"1.0.0"`), `configuration_version` (`"config.default"`), and a positive `ttl_ms`.
+The example binaries attach `Authorization: Bearer <sender>` metadata so the runtime derives the authenticated sender from the bearer token. Every example creates a session with the required fields: `participants`, `mode_version` (`"1.0.0"`), `configuration_version` (`"config.default"`), and a positive `ttl_ms`.
 
 ## Decision Mode
 
@@ -96,7 +95,7 @@ This client deliberately exercises failure paths: invalid protocol versions, emp
 
 ## Troubleshooting
 
-**`UNAUTHENTICATED`**: Start the runtime with `MACP_ALLOW_DEV_SENDER_HEADER=1` and ensure the client sets the `x-macp-agent-id` header.
+**`UNAUTHENTICATED`**: Start the runtime without `MACP_AUTH_*` configured (so dev-mode auth is active) and ensure the client sets `Authorization: Bearer <sender>`. With auth resolvers configured, send a matching static bearer or JWT instead.
 
 **`INVALID_ENVELOPE` on SessionStart**: Verify that the mode name is canonical, the payload is not empty, and all four required fields (`mode_version`, `configuration_version`, `ttl_ms > 0`, `participants`) are present.
 

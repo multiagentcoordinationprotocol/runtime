@@ -23,7 +23,6 @@ impl ServerManager {
 
         let child = Command::new(binary_path)
             .env("MACP_ALLOW_INSECURE", "1")
-            .env("MACP_ALLOW_DEV_SENDER_HEADER", "1")
             .env("MACP_MEMORY_ONLY", "1")
             .env("MACP_BIND_ADDR", &bind_addr)
             .env("RUST_LOG", "warn")

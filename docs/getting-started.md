@@ -32,15 +32,14 @@ cargo build
 
 ### Starting a development server
 
-For local development, two environment variables disable TLS and enable a header-based identity shortcut. This lets you send requests without configuring tokens or certificates:
+For local development, disable TLS and skip configuring tokens. With no auth resolvers configured, the runtime falls back to dev-mode auth:
 
 ```bash
 export MACP_ALLOW_INSECURE=1
-export MACP_ALLOW_DEV_SENDER_HEADER=1
 cargo run
 ```
 
-The server listens on `127.0.0.1:50051` and trusts the `x-macp-agent-id` gRPC metadata header as the authenticated sender identity.
+The server listens on `127.0.0.1:50051` and treats any `Authorization: Bearer <value>` header as authenticating the caller with sender identity `<value>`.
 
 ### Starting a production server
 
@@ -157,13 +156,13 @@ The session is now terminal. Any subsequent messages targeting it are rejected w
 
 ### Development mode
 
-In development mode, clients set the `x-macp-agent-id` gRPC metadata header to declare their identity:
+In development mode (no auth resolvers configured), clients send their sender identity as a bearer token:
 
 ```
-metadata: { "x-macp-agent-id": "agent://my-agent" }
+metadata: { "authorization": "Bearer agent://my-agent" }
 ```
 
-The runtime trusts this header directly. This is only available when `MACP_ALLOW_DEV_SENDER_HEADER=1` is set.
+The runtime accepts any bearer value as the sender identity. This fallback is only active while neither `MACP_AUTH_TOKENS_*` nor `MACP_AUTH_ISSUER` is set.
 
 ### Production mode
 
@@ -191,13 +190,17 @@ Create a `tokens.json` file that maps bearer tokens to agent identities and capa
 
 Setting `allowed_modes` to an empty array grants access to all modes. The runtime derives the sender identity from the token, so agents cannot spoof their identity. Clients authenticate by sending `Authorization: Bearer <token>` in the gRPC metadata.
 
+### JWT mode
+
+The runtime also accepts JWT bearer tokens when `MACP_AUTH_ISSUER` is set. Configure a JWKS source (`MACP_AUTH_JWKS_JSON` inline, or `MACP_AUTH_JWKS_URL` fetched + cached) and optionally `MACP_AUTH_AUDIENCE` (default `macp-runtime`) and `MACP_AUTH_JWKS_TTL_SECS` (default 300). The JWT's `sub` claim becomes the sender; an optional `macp_scopes` claim carries the same capability fields as the static token config (`allowed_modes`, `can_start_sessions`, `max_open_sessions`, `can_manage_mode_registry`, `is_observer`).
+
 ## Running the example clients
 
 The repository includes example clients in `src/bin` that demonstrate each mode. Start the development server in one terminal, then run any example in another:
 
 ```bash
 # Terminal 1: start the server
-export MACP_ALLOW_INSECURE=1 && export MACP_ALLOW_DEV_SENDER_HEADER=1 && cargo run
+export MACP_ALLOW_INSECURE=1 && cargo run
 
 # Terminal 2: run examples
 cargo run --bin client              # Decision mode
@@ -213,7 +216,7 @@ cargo run --bin fuzz_client         # Error path testing
 
 | Error | Cause | Fix |
 |-------|-------|-----|
-| `UNAUTHENTICATED` | No valid credential provided | Set `MACP_ALLOW_DEV_SENDER_HEADER=1` and send the `x-macp-agent-id` header |
+| `UNAUTHENTICATED` | No valid credential provided | In dev mode send `Authorization: Bearer <sender>`; in prod send a configured static bearer or a valid JWT |
 | `INVALID_ENVELOPE` | Missing required SessionStart fields | Ensure `participants`, `mode_version`, `configuration_version`, and `ttl_ms > 0` are all present |
 | `SESSION_NOT_OPEN` | Session already resolved or expired | Use `GetSession` to check state; start a new session |
 | `INVALID_SESSION_ID` | Session ID format not accepted | Use UUID v4/v7 or base64url (22+ characters) |
