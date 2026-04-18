@@ -1,5 +1,5 @@
 use crate::auth::resolver::{AuthError, AuthResolver, ResolvedIdentity};
-use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -197,10 +197,23 @@ impl AuthResolver for JwtBearerResolver {
 
         let keys = self.get_keys().await?;
 
-        let mut validation = Validation::new(Algorithm::RS256);
+        // Inspect the token header to pick a single algorithm to validate against.
+        // jsonwebtoken 9 requires every algorithm in validation.algorithms to match
+        // the DecodingKey's family, so a mixed list (RS256 + HS256) with one key
+        // would always fail with InvalidAlgorithm. We still gate on the configured
+        // allowlist — if the token's alg isn't configured, we reject it.
+        let header = decode_header(&token)
+            .map_err(|e| AuthError::InvalidCredential(format!("malformed JWT header: {e}")))?;
+        if !self.config.algorithms.contains(&header.alg) {
+            return Err(AuthError::InvalidCredential(format!(
+                "JWT algorithm {:?} is not in the configured allowlist",
+                header.alg
+            )));
+        }
+        let mut validation = Validation::new(header.alg);
         validation.set_issuer(&[&self.config.issuer]);
         validation.set_audience(&[&self.config.audience]);
-        validation.algorithms = self.config.algorithms.clone();
+        validation.algorithms = vec![header.alg];
 
         let mut last_err = None;
         for key in &keys {
@@ -246,5 +259,221 @@ impl AuthResolver for JwtBearerResolver {
                 "no keys available to validate JWT".to_string(),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine;
+    use jsonwebtoken::{encode, EncodingKey, Header};
+    use serde::Serialize;
+
+    const ISSUER: &str = "https://issuer.test";
+    const AUDIENCE: &str = "macp-runtime";
+    const SECRET: &[u8] = b"super-secret-symmetric-key-32-by";
+
+    #[derive(Serialize)]
+    struct TestClaims<'a> {
+        sub: &'a str,
+        iss: &'a str,
+        aud: &'a str,
+        exp: i64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        macp_scopes: Option<serde_json::Value>,
+    }
+
+    fn jwks_inline() -> String {
+        let k = base64::engine::general_purpose::STANDARD.encode(SECRET);
+        serde_json::json!({
+            "keys": [
+                { "kty": "oct", "alg": "HS256", "k": k }
+            ]
+        })
+        .to_string()
+    }
+
+    fn config() -> JwtConfig {
+        JwtConfig {
+            issuer: ISSUER.to_string(),
+            audience: AUDIENCE.to_string(),
+            algorithms: vec![Algorithm::HS256],
+        }
+    }
+
+    fn sign(claims: &TestClaims) -> String {
+        let mut header = Header::new(Algorithm::HS256);
+        header.kid = Some("test-key".into());
+        encode(&header, claims, &EncodingKey::from_secret(SECRET)).unwrap()
+    }
+
+    fn bearer(token: &str) -> MetadataMap {
+        let mut m = MetadataMap::new();
+        m.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        m
+    }
+
+    #[tokio::test]
+    async fn valid_jwt_resolves_to_identity_with_scopes() {
+        let resolver = JwtBearerResolver::from_inline_json(config(), &jwks_inline()).unwrap();
+        let token = sign(&TestClaims {
+            sub: "agent://alice",
+            iss: ISSUER,
+            aud: AUDIENCE,
+            exp: (chrono::Utc::now().timestamp() + 300),
+            macp_scopes: Some(serde_json::json!({
+                "allowed_modes": ["macp.mode.decision.v1"],
+                "can_start_sessions": true,
+                "max_open_sessions": 5,
+                "can_manage_mode_registry": false,
+                "is_observer": false,
+            })),
+        });
+
+        let id = resolver
+            .resolve(&bearer(&token))
+            .await
+            .expect("ok")
+            .expect("some");
+        assert_eq!(id.sender, "agent://alice");
+        assert_eq!(id.resolver, "jwt_bearer");
+        assert!(id.can_start_sessions);
+        assert_eq!(id.max_open_sessions, Some(5));
+        assert!(!id.can_manage_mode_registry);
+        assert!(!id.is_observer);
+        let modes = id.allowed_modes.unwrap();
+        assert!(modes.contains("macp.mode.decision.v1"));
+    }
+
+    #[tokio::test]
+    async fn jwt_without_scopes_defaults_to_permissive_sender() {
+        let resolver = JwtBearerResolver::from_inline_json(config(), &jwks_inline()).unwrap();
+        let token = sign(&TestClaims {
+            sub: "agent://bob",
+            iss: ISSUER,
+            aud: AUDIENCE,
+            exp: (chrono::Utc::now().timestamp() + 300),
+            macp_scopes: None,
+        });
+        let id = resolver.resolve(&bearer(&token)).await.unwrap().unwrap();
+        assert_eq!(id.sender, "agent://bob");
+        assert!(id.can_start_sessions); // default when unspecified
+        assert!(id.allowed_modes.is_none());
+        assert!(!id.is_observer);
+    }
+
+    #[tokio::test]
+    async fn expired_jwt_returns_expired_error() {
+        let resolver = JwtBearerResolver::from_inline_json(config(), &jwks_inline()).unwrap();
+        // Exceed the default 60s leeway applied by jsonwebtoken's Validation.
+        let token = sign(&TestClaims {
+            sub: "agent://alice",
+            iss: ISSUER,
+            aud: AUDIENCE,
+            exp: (chrono::Utc::now().timestamp() - 600),
+            macp_scopes: None,
+        });
+        let err = resolver.resolve(&bearer(&token)).await.unwrap_err();
+        assert!(matches!(err, AuthError::Expired), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn wrong_issuer_rejected() {
+        let resolver = JwtBearerResolver::from_inline_json(config(), &jwks_inline()).unwrap();
+        let token = sign(&TestClaims {
+            sub: "agent://alice",
+            iss: "https://other.example",
+            aud: AUDIENCE,
+            exp: (chrono::Utc::now().timestamp() + 300),
+            macp_scopes: None,
+        });
+        let err = resolver.resolve(&bearer(&token)).await.unwrap_err();
+        assert!(
+            matches!(err, AuthError::InvalidCredential(ref m) if m.contains("issuer")),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_audience_rejected() {
+        let resolver = JwtBearerResolver::from_inline_json(config(), &jwks_inline()).unwrap();
+        let token = sign(&TestClaims {
+            sub: "agent://alice",
+            iss: ISSUER,
+            aud: "other-audience",
+            exp: (chrono::Utc::now().timestamp() + 300),
+            macp_scopes: None,
+        });
+        let err = resolver.resolve(&bearer(&token)).await.unwrap_err();
+        assert!(
+            matches!(err, AuthError::InvalidCredential(ref m) if m.contains("audience")),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bad_signature_rejected() {
+        let resolver = JwtBearerResolver::from_inline_json(config(), &jwks_inline()).unwrap();
+        // Sign with a different key — signature won't verify.
+        let claims = TestClaims {
+            sub: "agent://alice",
+            iss: ISSUER,
+            aud: AUDIENCE,
+            exp: (chrono::Utc::now().timestamp() + 300),
+            macp_scopes: None,
+        };
+        let bad_token = encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(b"different-key-bytes-0123456789!!"),
+        )
+        .unwrap();
+        let err = resolver.resolve(&bearer(&bad_token)).await.unwrap_err();
+        assert!(
+            matches!(err, AuthError::InvalidCredential(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn opaque_bearer_token_is_not_claimed() {
+        let resolver = JwtBearerResolver::from_inline_json(config(), &jwks_inline()).unwrap();
+        // No dots → not JWT-shaped → defer to next resolver.
+        let outcome = resolver
+            .resolve(&bearer("static-opaque-token"))
+            .await
+            .unwrap();
+        assert!(outcome.is_none());
+    }
+
+    #[tokio::test]
+    async fn missing_authorization_header_is_not_claimed() {
+        let resolver = JwtBearerResolver::from_inline_json(config(), &jwks_inline()).unwrap();
+        let outcome = resolver.resolve(&MetadataMap::new()).await.unwrap();
+        assert!(outcome.is_none());
+    }
+
+    #[tokio::test]
+    async fn server_env_algorithms_accept_hs256_tokens() {
+        // Reproduce the server's SecurityLayer::from_env() config: algorithms = RS256/ES256/HS256.
+        let cfg = JwtConfig {
+            issuer: ISSUER.to_string(),
+            audience: AUDIENCE.to_string(),
+            algorithms: vec![Algorithm::RS256, Algorithm::ES256, Algorithm::HS256],
+        };
+        let resolver = JwtBearerResolver::from_inline_json(cfg, &jwks_inline()).unwrap();
+        let token = sign(&TestClaims {
+            sub: "agent://alice",
+            iss: ISSUER,
+            aud: AUDIENCE,
+            exp: (chrono::Utc::now().timestamp() + 300),
+            macp_scopes: None,
+        });
+        let id = resolver
+            .resolve(&bearer(&token))
+            .await
+            .expect("ok")
+            .expect("some");
+        assert_eq!(id.sender, "agent://alice");
     }
 }

@@ -36,12 +36,11 @@ opentelemetry-otlp = { version = "0.15", features = ["tonic"], optional = true }
 tracing-opentelemetry = { version = "0.23", optional = true }
 rocksdb = { version = "0.22", optional = true }
 redis = { version = "0.27", features = ["tokio-comp", "aio"], optional = true }
-# Proto definitions — local path for WatchSessions development.
-# Switch back to crates.io after publishing: macp-proto = "0.2.0"
-macp-proto = { path = "../multiagentcoordinationprotocol/packages/proto-rust" }
+macp-proto = "0.1.1"
 
 [dev-dependencies]
 tempfile = "3"
+base64 = "0.22"
 
 [build-dependencies]
 tonic-prost-build = "0.14"
