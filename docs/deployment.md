@@ -29,7 +29,11 @@ Before exposing the runtime to production traffic, ensure these four items are c
 | `MACP_REDIS_URL` | `redis://127.0.0.1:6379` | Redis connection URL |
 | `MACP_MEMORY_ONLY` | off | Set to `1` to disable persistence entirely |
 | `MACP_ALLOW_INSECURE` | off | Allow plaintext connections (development only) |
-| `MACP_ALLOW_DEV_SENDER_HEADER` | off | Trust `x-macp-agent-id` header (development only) |
+| `MACP_AUTH_ISSUER` | -- | JWT resolver expected `iss` claim (enables JWT auth) |
+| `MACP_AUTH_AUDIENCE` | `macp-runtime` | JWT resolver expected `aud` claim |
+| `MACP_AUTH_JWKS_JSON` | -- | Inline JWKS document (JSON) for JWT validation |
+| `MACP_AUTH_JWKS_URL` | -- | JWKS endpoint URL (fetched + cached) |
+| `MACP_AUTH_JWKS_TTL_SECS` | `300` | JWKS cache TTL when fetched from URL |
 | `MACP_MAX_PAYLOAD_BYTES` | `1048576` | Maximum envelope payload size in bytes |
 | `MACP_SESSION_START_LIMIT_PER_MINUTE` | `60` | Per-sender session creation rate limit |
 | `MACP_MESSAGE_LIMIT_PER_MINUTE` | `600` | Per-sender message rate limit |

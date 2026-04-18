@@ -14,6 +14,7 @@ pub struct AuthIdentity {
     pub can_start_sessions: bool,
     pub max_open_sessions: Option<usize>,
     pub can_manage_mode_registry: bool,
+    pub is_observer: bool,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -27,6 +28,8 @@ struct RawIdentity {
     max_open_sessions: Option<usize>,
     #[serde(default)]
     can_manage_mode_registry: bool,
+    #[serde(default)]
+    is_observer: bool,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -56,18 +59,21 @@ struct RateBucket {
 pub struct SecurityLayer {
     identities: Arc<HashMap<String, AuthIdentity>>,
     rate_bucket: Arc<RateBucket>,
-    allow_dev_sender_header: bool,
+    auth_chain: Option<Arc<crate::auth::AuthResolverChain>>,
     pub max_payload_bytes: usize,
     session_start_rate: RateLimitConfig,
     message_rate: RateLimitConfig,
 }
 
 impl SecurityLayer {
+    /// Creates a test-friendly SecurityLayer that maps any bearer token
+    /// `"tok-<sender>"` to an identity with `sender = <token-value>`.
+    /// For tests, use `Authorization: Bearer agent://name` to authenticate as `agent://name`.
     pub fn dev_mode() -> Self {
         Self {
             identities: Arc::new(HashMap::new()),
             rate_bucket: Arc::new(RateBucket::default()),
-            allow_dev_sender_header: true,
+            auth_chain: None,
             max_payload_bytes: 1_048_576,
             session_start_rate: RateLimitConfig {
                 limit: usize::MAX,
@@ -78,6 +84,22 @@ impl SecurityLayer {
                 window: Duration::from_secs(60),
             },
         }
+    }
+
+    /// Dev-mode authenticate: accepts any bearer token as the sender identity.
+    /// This is used ONLY in tests (dev_mode), not in production (from_env).
+    fn dev_authenticate(&self, metadata: &MetadataMap) -> Result<AuthIdentity, MacpError> {
+        if let Some(token) = Self::bearer_token(metadata) {
+            return Ok(AuthIdentity {
+                sender: token,
+                allowed_modes: None,
+                can_start_sessions: true,
+                max_open_sessions: None,
+                can_manage_mode_registry: true,
+                is_observer: false,
+            });
+        }
+        Err(MacpError::Unauthenticated)
     }
 
     pub fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
@@ -101,11 +123,6 @@ impl SecurityLayer {
             window: Duration::from_secs(60),
         };
 
-        let allow_dev_sender_header = std::env::var("MACP_ALLOW_DEV_SENDER_HEADER")
-            .ok()
-            .as_deref()
-            == Some("1");
-
         let raw = if let Ok(json) = std::env::var("MACP_AUTH_TOKENS_JSON") {
             Some(json)
         } else if let Ok(path) = std::env::var("MACP_AUTH_TOKENS_FILE") {
@@ -115,14 +132,66 @@ impl SecurityLayer {
         };
 
         let identities = raw
-            .map(|json| Self::parse_identities(&json))
+            .as_ref()
+            .map(|json| Self::parse_identities(json))
             .transpose()?
             .unwrap_or_default();
+
+        // Build auth resolver chain
+        let mut resolvers: Vec<Box<dyn crate::auth::AuthResolver>> = Vec::new();
+
+        // JWT resolver (if configured)
+        if let Ok(issuer) = std::env::var("MACP_AUTH_ISSUER") {
+            let audience =
+                std::env::var("MACP_AUTH_AUDIENCE").unwrap_or_else(|_| "macp-runtime".into());
+            let cache_ttl = std::env::var("MACP_AUTH_JWKS_TTL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(300u64);
+            let config = crate::auth::resolvers::jwt_bearer::JwtConfig {
+                issuer,
+                audience,
+                algorithms: vec![
+                    jsonwebtoken::Algorithm::RS256,
+                    jsonwebtoken::Algorithm::ES256,
+                    jsonwebtoken::Algorithm::HS256,
+                ],
+            };
+            if let Ok(jwks_json) = std::env::var("MACP_AUTH_JWKS_JSON") {
+                match crate::auth::resolvers::JwtBearerResolver::from_inline_json(
+                    config, &jwks_json,
+                ) {
+                    Ok(resolver) => resolvers.push(Box::new(resolver)),
+                    Err(e) => {
+                        tracing::error!("failed to create JWT resolver from inline JWKS: {e}")
+                    }
+                }
+            } else if let Ok(jwks_url) = std::env::var("MACP_AUTH_JWKS_URL") {
+                resolvers.push(Box::new(
+                    crate::auth::resolvers::JwtBearerResolver::from_url(
+                        config, jwks_url, cache_ttl,
+                    ),
+                ));
+            }
+        }
+
+        // Static bearer resolver (always present if tokens are configured)
+        if !identities.is_empty() {
+            resolvers.push(Box::new(crate::auth::resolvers::StaticBearerResolver::new(
+                identities.clone(),
+            )));
+        }
+
+        let auth_chain = if resolvers.is_empty() {
+            None
+        } else {
+            Some(Arc::new(crate::auth::AuthResolverChain::new(resolvers)))
+        };
 
         Ok(Self {
             identities: Arc::new(identities),
             rate_bucket: Arc::new(RateBucket::default()),
-            allow_dev_sender_header,
+            auth_chain,
             max_payload_bytes,
             session_start_rate,
             message_rate,
@@ -151,6 +220,7 @@ impl SecurityLayer {
                     can_start_sessions: item.can_start_sessions,
                     max_open_sessions: item.max_open_sessions,
                     can_manage_mode_registry: item.can_manage_mode_registry,
+                    is_observer: item.is_observer,
                 },
             );
         }
@@ -172,30 +242,29 @@ impl SecurityLayer {
     }
 
     pub fn authenticate_metadata(&self, metadata: &MetadataMap) -> Result<AuthIdentity, MacpError> {
-        if let Some(token) = Self::bearer_token(metadata) {
-            return self
-                .identities
-                .get(&token)
-                .cloned()
-                .ok_or(MacpError::Unauthenticated);
+        // Production path: use the auth resolver chain.
+        if let Some(chain) = &self.auth_chain {
+            let chain = Arc::clone(chain);
+            let metadata_clone = metadata.clone();
+            return tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(chain.authenticate(&metadata_clone))
+            });
         }
 
-        if self.allow_dev_sender_header {
-            if let Some(sender) = metadata
-                .get("x-macp-agent-id")
-                .and_then(|value| value.to_str().ok())
-            {
-                return Ok(AuthIdentity {
-                    sender: sender.to_string(),
-                    allowed_modes: None,
-                    can_start_sessions: true,
-                    max_open_sessions: None,
-                    can_manage_mode_registry: true,
-                });
+        // Explicit identity map (layer_with_tokens in tests)
+        if !self.identities.is_empty() {
+            if let Some(token) = Self::bearer_token(metadata) {
+                return self
+                    .identities
+                    .get(&token)
+                    .cloned()
+                    .ok_or(MacpError::Unauthenticated);
             }
+            return Err(MacpError::Unauthenticated);
         }
 
-        Err(MacpError::Unauthenticated)
+        // Dev-mode: any bearer token → identity (for tests only)
+        self.dev_authenticate(metadata)
     }
 
     pub fn authorize_mode(
@@ -294,7 +363,7 @@ mod tests {
         SecurityLayer {
             identities: Arc::new(identities),
             rate_bucket: Arc::new(RateBucket::default()),
-            allow_dev_sender_header: false,
+            auth_chain: None,
             max_payload_bytes: 1_048_576,
             session_start_rate: RateLimitConfig {
                 limit: usize::MAX,
@@ -312,7 +381,7 @@ mod tests {
         SecurityLayer {
             identities: Arc::new(HashMap::new()),
             rate_bucket: Arc::new(RateBucket::default()),
-            allow_dev_sender_header: false,
+            auth_chain: None,
             max_payload_bytes: 1_048_576,
             session_start_rate: RateLimitConfig {
                 limit: usize::MAX,
@@ -338,12 +407,12 @@ mod tests {
     }
 
     #[test]
-    fn dev_mode_allows_dev_sender_header() {
+    fn dev_mode_rejects_dev_sender_header() {
         let layer = SecurityLayer::dev_mode();
         let mut meta = MetadataMap::new();
         meta.insert("x-macp-agent-id", "agent://dev-bot".parse().unwrap());
-        let id = layer.authenticate_metadata(&meta).expect("should succeed");
-        assert_eq!(id.sender, "agent://dev-bot");
+        let err = layer.authenticate_metadata(&meta).unwrap_err();
+        assert!(matches!(err, MacpError::Unauthenticated));
     }
 
     #[test]
@@ -480,11 +549,11 @@ mod tests {
     // ---------------------------------------------------------------
 
     #[test]
-    fn dev_sender_header_extracted_when_allowed() {
+    fn dev_sender_header_rejected_without_chain() {
         let layer = SecurityLayer {
             identities: Arc::new(HashMap::new()),
             rate_bucket: Arc::new(RateBucket::default()),
-            allow_dev_sender_header: true,
+            auth_chain: None,
             max_payload_bytes: 1_048_576,
             session_start_rate: RateLimitConfig {
                 limit: usize::MAX,
@@ -499,11 +568,8 @@ mod tests {
         let mut meta = MetadataMap::new();
         meta.insert("x-macp-agent-id", "agent://dev-agent".parse().unwrap());
 
-        let id = layer.authenticate_metadata(&meta).expect("should succeed");
-        assert_eq!(id.sender, "agent://dev-agent");
-        assert!(id.allowed_modes.is_none());
-        assert!(id.can_start_sessions);
-        assert!(id.max_open_sessions.is_none());
+        let err = layer.authenticate_metadata(&meta).unwrap_err();
+        assert!(matches!(err, MacpError::Unauthenticated));
     }
 
     #[test]
@@ -512,7 +578,7 @@ mod tests {
         let layer = SecurityLayer {
             identities: Arc::new(HashMap::new()),
             rate_bucket: Arc::new(RateBucket::default()),
-            allow_dev_sender_header: false,
+            auth_chain: None,
             max_payload_bytes: 1_048_576,
             session_start_rate: RateLimitConfig {
                 limit: usize::MAX,
@@ -539,7 +605,7 @@ mod tests {
         let layer = SecurityLayer {
             identities: Arc::new(identities),
             rate_bucket: Arc::new(RateBucket::default()),
-            allow_dev_sender_header: true,
+            auth_chain: None,
             max_payload_bytes: 1_048_576,
             session_start_rate: RateLimitConfig {
                 limit: usize::MAX,
@@ -574,6 +640,7 @@ mod tests {
             can_start_sessions: true,
             max_open_sessions: None,
             can_manage_mode_registry: false,
+            is_observer: false,
         };
         assert!(layer
             .authorize_mode(&id, "macp.mode.decision.v1", false)
@@ -594,6 +661,7 @@ mod tests {
             can_start_sessions: true,
             max_open_sessions: None,
             can_manage_mode_registry: false,
+            is_observer: false,
         };
         assert!(layer
             .authorize_mode(&id, "macp.mode.decision.v1", false)
@@ -613,6 +681,7 @@ mod tests {
             can_start_sessions: false,
             max_open_sessions: None,
             can_manage_mode_registry: false,
+            is_observer: false,
         };
         let err = layer
             .authorize_mode(&id, "macp.mode.decision.v1", true)
@@ -629,6 +698,7 @@ mod tests {
             can_start_sessions: false,
             max_open_sessions: None,
             can_manage_mode_registry: false,
+            is_observer: false,
         };
         // Regular messages (not session start) should succeed
         assert!(layer
@@ -648,6 +718,7 @@ mod tests {
             can_start_sessions: false,
             max_open_sessions: None,
             can_manage_mode_registry: false,
+            is_observer: false,
         };
 
         // Cannot start sessions (checked first)
@@ -676,6 +747,7 @@ mod tests {
             allowed_modes: None,
             can_start_sessions: true,
             max_open_sessions: None,
+            is_observer: false,
             can_manage_mode_registry: false,
         };
         let err = layer.authorize_mode_registry(&id).unwrap_err();
@@ -683,10 +755,12 @@ mod tests {
     }
 
     #[test]
-    fn dev_sender_header_can_manage_mode_registry() {
-        let layer = SecurityLayer::dev_mode();
+    fn bearer_token_can_manage_mode_registry() {
+        let json =
+            r#"[{"token":"admin-tok","sender":"agent://admin","can_manage_mode_registry":true}]"#;
+        let layer = layer_with_tokens(json);
         let mut meta = MetadataMap::new();
-        meta.insert("x-macp-agent-id", "agent://dev-admin".parse().unwrap());
+        meta.insert("authorization", "Bearer admin-tok".parse().unwrap());
         let id = layer.authenticate_metadata(&meta).unwrap();
         assert!(layer.authorize_mode_registry(&id).is_ok());
     }
@@ -700,7 +774,7 @@ mod tests {
         let layer = SecurityLayer {
             identities: Arc::new(HashMap::new()),
             rate_bucket: Arc::new(RateBucket::default()),
-            allow_dev_sender_header: false,
+            auth_chain: None,
             max_payload_bytes: 1_048_576,
             session_start_rate: RateLimitConfig {
                 limit: 3,
@@ -730,7 +804,7 @@ mod tests {
         let layer = SecurityLayer {
             identities: Arc::new(HashMap::new()),
             rate_bucket: Arc::new(RateBucket::default()),
-            allow_dev_sender_header: false,
+            auth_chain: None,
             max_payload_bytes: 1_048_576,
             session_start_rate: RateLimitConfig {
                 limit: usize::MAX,
@@ -757,7 +831,7 @@ mod tests {
         let layer = SecurityLayer {
             identities: Arc::new(HashMap::new()),
             rate_bucket: Arc::new(RateBucket::default()),
-            allow_dev_sender_header: false,
+            auth_chain: None,
             max_payload_bytes: 1_048_576,
             session_start_rate: RateLimitConfig {
                 limit: 1,
@@ -782,7 +856,7 @@ mod tests {
         let layer = SecurityLayer {
             identities: Arc::new(HashMap::new()),
             rate_bucket: Arc::new(RateBucket::default()),
-            allow_dev_sender_header: false,
+            auth_chain: None,
             max_payload_bytes: 1_048_576,
             session_start_rate: RateLimitConfig {
                 limit: 1,

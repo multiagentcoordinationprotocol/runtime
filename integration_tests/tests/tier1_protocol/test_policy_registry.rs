@@ -10,8 +10,10 @@ use tonic::Request;
 fn with_sender<T>(sender: &str, inner: T) -> Request<T> {
     let mut request = Request::new(inner);
     request.metadata_mut().insert(
-        "x-macp-agent-id",
-        sender.parse().expect("valid sender header"),
+        "authorization",
+        format!("Bearer {sender}")
+            .parse()
+            .expect("valid auth header"),
     );
     request
 }
@@ -21,7 +23,7 @@ fn test_descriptor(policy_id: &str, mode: &str, rules_json: serde_json::Value) -
         policy_id: policy_id.into(),
         mode: mode.into(),
         description: format!("test policy {}", policy_id),
-        rules: serde_json::to_vec(&rules_json).unwrap(),
+        rules: serde_json::to_string(&rules_json).unwrap(),
         schema_version: 1,
         registered_at_unix_ms: 0,
     }
@@ -282,7 +284,8 @@ async fn unknown_policy_version_rejects_session_start() {
         configuration_version: CONFIG_VERSION.into(),
         policy_version: "policy.nonexistent.v999".into(),
         ttl_ms: 60_000,
-        context: vec![],
+        context_id: String::new(),
+        extensions: std::collections::HashMap::new(),
         roots: vec![],
     }
     .encode_to_vec();
@@ -345,7 +348,8 @@ async fn policy_enforcement_blocks_commitment_in_decision_mode() {
         configuration_version: CONFIG_VERSION.into(),
         policy_version: policy_id.clone(),
         ttl_ms: 60_000,
-        context: vec![],
+        context_id: String::new(),
+        extensions: std::collections::HashMap::new(),
         roots: vec![],
     }
     .encode_to_vec();

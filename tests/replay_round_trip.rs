@@ -17,7 +17,8 @@ fn start_payload(participants: Vec<&str>) -> Vec<u8> {
         configuration_version: "cfg-1".into(),
         policy_version: "policy-1".into(),
         ttl_ms: 60_000,
-        context: vec![],
+        context_id: String::new(),
+        extensions: std::collections::HashMap::new(),
         roots: vec![],
     }
     .encode_to_vec()

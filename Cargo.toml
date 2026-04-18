@@ -25,6 +25,8 @@ tokio-stream = "0.1"
 futures-core = "0.3"
 async-stream = "0.3"
 async-trait = "0.1"
+jsonwebtoken = "9"
+reqwest = { version = "0.12", features = ["json"], default-features = false }
 uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -34,13 +36,11 @@ opentelemetry-otlp = { version = "0.15", features = ["tonic"], optional = true }
 tracing-opentelemetry = { version = "0.23", optional = true }
 rocksdb = { version = "0.22", optional = true }
 redis = { version = "0.27", features = ["tokio-comp", "aio"], optional = true }
-# Proto definitions from crates.io (exposes DEP_MACP_PROTO_PROTO_DIR to build.rs via links metadata).
-# For local proto development, temporarily switch to a path dependency:
-#   macp-proto = { path = "../multiagentcoordinationprotocol/packages/proto-rust" }
-macp-proto = "0.1.0"
+macp-proto = "0.1.1"
 
 [dev-dependencies]
 tempfile = "3"
+base64 = "0.22"
 
 [build-dependencies]
 tonic-prost-build = "0.14"

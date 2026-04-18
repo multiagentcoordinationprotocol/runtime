@@ -15,18 +15,30 @@ pub struct ServerManager {
 impl ServerManager {
     /// Start a runtime server on a free port. Returns once the server is accepting connections.
     pub async fn start(binary_path: &str) -> Result<Self> {
+        Self::start_with_env(binary_path, &[]).await
+    }
+
+    /// Start with additional process env vars (e.g. to enable JWT auth).
+    pub async fn start_with_env(binary_path: &str, extra_env: &[(&str, &str)]) -> Result<Self> {
         let port = find_free_port()?;
         let bind_addr = format!("127.0.0.1:{port}");
         let endpoint = format!("http://{bind_addr}");
 
         tracing::info!("Starting MACP runtime: {binary_path} on {bind_addr}");
 
-        let child = Command::new(binary_path)
-            .env("MACP_ALLOW_INSECURE", "1")
-            .env("MACP_ALLOW_DEV_SENDER_HEADER", "1")
+        let mut cmd = Command::new(binary_path);
+        cmd.env("MACP_ALLOW_INSECURE", "1")
             .env("MACP_MEMORY_ONLY", "1")
-            .env("MACP_BIND_ADDR", &bind_addr)
-            .env("RUST_LOG", "warn")
+            .env("MACP_BIND_ADDR", &bind_addr);
+        // Allow callers to override RUST_LOG via extra_env; default to warn.
+        let has_rust_log = extra_env.iter().any(|(k, _)| *k == "RUST_LOG");
+        if !has_rust_log {
+            cmd.env("RUST_LOG", "warn");
+        }
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        let child = cmd
             .spawn()
             .with_context(|| format!("failed to start runtime binary: {binary_path}"))?;
 

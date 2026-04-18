@@ -32,7 +32,7 @@ impl TestConfig {
         self.endpoint.is_none()
     }
 
-    /// Whether to use dev-mode headers (x-macp-agent-id) instead of bearer tokens.
+    /// Whether to use dev-mode auth (Authorization: Bearer <sender>) instead of configured bearer tokens.
     pub fn use_dev_headers(&self) -> bool {
         self.auth_token.is_none()
     }

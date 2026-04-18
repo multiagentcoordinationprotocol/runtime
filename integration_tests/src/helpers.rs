@@ -30,8 +30,10 @@ pub fn new_message_id() -> String {
 fn with_sender<T>(sender: &str, inner: T) -> Request<T> {
     let mut request = Request::new(inner);
     request.metadata_mut().insert(
-        "x-macp-agent-id",
-        sender.parse().expect("valid sender header"),
+        "authorization",
+        format!("Bearer {sender}")
+            .parse()
+            .expect("valid auth header"),
     );
     request
 }
@@ -64,7 +66,8 @@ pub fn session_start_payload(intent: &str, participants: &[&str], ttl_ms: i64) -
         configuration_version: CONFIG_VERSION.into(),
         policy_version: POLICY_VERSION.into(),
         ttl_ms,
-        context: vec![],
+        context_id: String::new(),
+        extensions: std::collections::HashMap::new(),
         roots: vec![],
     }
     .encode_to_vec()

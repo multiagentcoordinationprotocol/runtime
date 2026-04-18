@@ -84,14 +84,16 @@ For all standards-track modes and built-in extensions, `SessionStartPayload` mus
 
 In production, requests should be authenticated with a bearer token. The runtime derives `Envelope.sender` from the authenticated identity and rejects spoofed sender values.
 
-For local development, you may opt into insecure/dev mode with:
+For local development, opt into insecure transport with:
 
 ```bash
 MACP_ALLOW_INSECURE=1
-MACP_ALLOW_DEV_SENDER_HEADER=1
 ```
 
-When dev header mode is enabled, clients can set `x-macp-agent-id` metadata instead of bearer tokens.
+When no auth resolvers are configured (no `MACP_AUTH_TOKENS_*` and no
+`MACP_AUTH_ISSUER`), the runtime falls back to dev-mode auth: any
+`Authorization: Bearer <value>` header authenticates the caller as
+sender `<value>`. Use only for local development.
 
 ### Persistence
 
@@ -115,9 +117,18 @@ Unless `MACP_MEMORY_ONLY=1` is set, the runtime persists session and log snapsho
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `MACP_AUTH_TOKENS_JSON` | inline auth config JSON | unset |
-| `MACP_AUTH_TOKENS_FILE` | path to auth config JSON | unset |
-| `MACP_ALLOW_DEV_SENDER_HEADER` | allow `x-macp-agent-id` for local dev | unset |
+| `MACP_AUTH_TOKENS_JSON` | inline static bearer token config JSON | unset |
+| `MACP_AUTH_TOKENS_FILE` | path to static bearer token config JSON | unset |
+| `MACP_AUTH_ISSUER` | JWT resolver expected `iss` claim (enables JWT auth) | unset |
+| `MACP_AUTH_AUDIENCE` | JWT resolver expected `aud` claim | `macp-runtime` |
+| `MACP_AUTH_JWKS_JSON` | inline JWKS document used to validate JWTs | unset |
+| `MACP_AUTH_JWKS_URL` | JWKS endpoint URL (fetched + cached) | unset |
+| `MACP_AUTH_JWKS_TTL_SECS` | JWKS cache TTL when fetched from URL | `300` |
+
+Auth is layered as a resolver chain: configured JWT first, then static
+bearer, with a dev-mode fallback only when both are absent. JWT tokens
+supply MACP scopes via a `macp_scopes` claim matching the static token
+schema.
 
 Token JSON may be either a raw list or an object with a `tokens` array. Example:
 
@@ -170,9 +181,11 @@ cargo run
 
 ```bash
 export MACP_ALLOW_INSECURE=1
-export MACP_ALLOW_DEV_SENDER_HEADER=1
 cargo run
 ```
+
+With no auth tokens configured, clients authenticate by sending their
+sender identity as a bearer token (e.g. `Authorization: Bearer agent://alice`).
 
 ### Running the example clients
 

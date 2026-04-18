@@ -137,8 +137,8 @@ Unknown fields in protobuf messages are silently ignored, so SDKs built for prot
 ### Against a local runtime
 
 ```bash
-MACP_ALLOW_INSECURE=1 MACP_ALLOW_DEV_SENDER_HEADER=1 cargo run
-# SDK connects to localhost:50051 using x-macp-agent-id header
+MACP_ALLOW_INSECURE=1 cargo run
+# SDK connects to localhost:50051 sending Authorization: Bearer <sender-id>
 ```
 
 ### Test checklist

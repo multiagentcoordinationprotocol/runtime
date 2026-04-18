@@ -30,7 +30,8 @@ pub struct Session {
     pub mode_version: String,
     pub configuration_version: String,
     pub policy_version: String,
-    pub context: Vec<u8>,
+    pub context_id: String,
+    pub extensions: HashMap<String, Vec<u8>>,
     pub roots: Vec<crate::pb::Root>,
     pub initiator_sender: String,
     pub participant_message_counts: HashMap<String, u32>,
@@ -189,7 +190,8 @@ mod tests {
             configuration_version: "cfg-1".into(),
             policy_version: String::new(),
             ttl_ms,
-            context: vec![],
+            context_id: String::new(),
+            extensions: std::collections::HashMap::new(),
             roots: vec![],
         };
         payload.encode_to_vec()

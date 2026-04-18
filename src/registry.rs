@@ -29,7 +29,10 @@ pub(crate) struct PersistedSession {
     pub mode_version: String,
     pub configuration_version: String,
     pub policy_version: String,
-    pub context: Vec<u8>,
+    #[serde(default)]
+    pub context_id: String,
+    #[serde(default)]
+    pub extensions: HashMap<String, Vec<u8>>,
     pub roots: Vec<PersistedRoot>,
     pub initiator_sender: String,
     #[serde(default)]
@@ -58,7 +61,8 @@ impl From<&Session> for PersistedSession {
             mode_version: session.mode_version.clone(),
             configuration_version: session.configuration_version.clone(),
             policy_version: session.policy_version.clone(),
-            context: session.context.clone(),
+            context_id: session.context_id.clone(),
+            extensions: session.extensions.clone(),
             roots: session
                 .roots
                 .iter()
@@ -98,7 +102,8 @@ impl From<PersistedSession> for Session {
             mode_version: session.mode_version,
             configuration_version: session.configuration_version,
             policy_version: session.policy_version,
-            context: session.context,
+            context_id: session.context_id,
+            extensions: session.extensions,
             roots: session
                 .roots
                 .into_iter()
@@ -242,7 +247,8 @@ mod tests {
             mode_version: "1.0.0".into(),
             configuration_version: "cfg".into(),
             policy_version: "pol".into(),
-            context: vec![9],
+            context_id: "test-ctx".to_string(),
+            extensions: std::collections::HashMap::new(),
             roots: vec![crate::pb::Root {
                 uri: "root://1".into(),
                 name: "r1".into(),
