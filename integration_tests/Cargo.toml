@@ -11,6 +11,7 @@ tonic = { version = "0.14", features = ["transport"] }
 prost = "0.14"
 
 tokio = { version = "1", features = ["full", "process"] }
+tokio-stream = "0.1"
 
 rig-core = "0.34"
 

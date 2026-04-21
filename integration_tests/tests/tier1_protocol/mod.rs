@@ -6,6 +6,7 @@ mod test_handoff_mode;
 mod test_initialize;
 mod test_mode_registry;
 mod test_multi_round_mode;
+mod test_passive_subscribe;
 mod test_policy_registry;
 mod test_proposal_mode;
 mod test_quorum_mode;

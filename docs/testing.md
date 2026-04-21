@@ -37,7 +37,7 @@ integration_tests/
 
 ### Three tiers
 
-**Tier 1: Protocol tests** (47 tests) exercise every mode through scripted gRPC calls. These tests cover the full protocol surface: `Initialize` negotiation, happy-path flows for all five standard modes plus multi-round, signals, deduplication, version binding, cancellation authorization, session lifecycle, mode registry operations, and discovery RPCs. They run in under a second with no external dependencies.
+**Tier 1: Protocol tests** exercise every mode through scripted gRPC calls. These tests cover the full protocol surface: `Initialize` negotiation, happy-path flows for all five standard modes plus multi-round, signals, deduplication, version binding, cancellation authorization, session lifecycle, `StreamSession` including RFC-MACP-0006-A1 passive subscribe (`test_passive_subscribe.rs` -- history replay with `after_sequence` offsets, unknown-session and non-participant rejection, late-joiner replay-then-live delivery), mode registry operations, JWT bearer auth, and discovery RPCs. They run in under a second with no external dependencies.
 
 **Tier 2: Rig agent tools** (5 tests) validate the MACP operations implemented as Rig `Tool` trait objects. These are called through `ToolSet::call()`, the same interface an LLM agent would use. They cover all five standard modes and verify that the tool abstraction correctly maps to gRPC operations.
 

@@ -1058,6 +1058,7 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tracing",
  "tracing-subscriber",
@@ -1066,9 +1067,9 @@ dependencies = [
 
 [[package]]
 name = "macp-proto"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ca7b5c6a2f0de7adb7c6159b00b11f8385eb216b0e68c74f2ef7a95fbd980ea"
+checksum = "0b75392118927e66872d554e8ee365af4f054470bfe39f24cbf3070d59dd7d5e"
 
 [[package]]
 name = "macp-runtime"

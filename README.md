@@ -40,6 +40,7 @@ This runtime implements the current MACP core/service surface, five standards-tr
 - **StreamSession enabled**
   - `Initialize` advertises `stream: true`
   - `StreamSession` provides per-session bidirectional streaming of accepted envelopes
+  - Passive subscribe (RFC-MACP-0006-A1): a `subscribe_session_id` + `after_sequence` frame replays accepted history and then delivers live envelopes; allowed for declared participants, the initiator, or observer identities
   - `WatchModeRegistry` fires live `RegistryChanged` events on mode register/unregister/promote
   - `WatchRoots` implemented (basic: send initial state, hold stream open)
 - **Extension mode lifecycle**
