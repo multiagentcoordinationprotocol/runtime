@@ -14,9 +14,7 @@ use base64::Engine;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use macp_integration_tests::server_manager::ServerManager;
 use macp_runtime::pb::macp_runtime_service_client::MacpRuntimeServiceClient;
-use macp_runtime::pb::{
-    Envelope, GetSessionRequest, SendRequest, SessionStartPayload,
-};
+use macp_runtime::pb::{Envelope, GetSessionRequest, SendRequest, SessionStartPayload};
 use prost::Message;
 use serde::Serialize;
 use std::sync::OnceLock;
@@ -37,8 +35,7 @@ static JWT_ENDPOINT: OnceLock<String> = OnceLock::new();
 
 fn jwks_json() -> String {
     let k = base64::engine::general_purpose::STANDARD.encode(SECRET);
-    serde_json::json!({ "keys": [ { "kty": "oct", "alg": "HS256", "k": k } ] })
-        .to_string()
+    serde_json::json!({ "keys": [ { "kty": "oct", "alg": "HS256", "k": k } ] }).to_string()
 }
 
 async fn endpoint() -> &'static str {
@@ -98,10 +95,8 @@ fn sign(claims: &Claims) -> String {
 
 fn with_bearer<T>(token: &str, inner: T) -> Request<T> {
     let mut req = Request::new(inner);
-    req.metadata_mut().insert(
-        "authorization",
-        format!("Bearer {token}").parse().unwrap(),
-    );
+    req.metadata_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
     req
 }
 

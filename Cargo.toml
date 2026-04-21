@@ -36,7 +36,7 @@ opentelemetry-otlp = { version = "0.15", features = ["tonic"], optional = true }
 tracing-opentelemetry = { version = "0.23", optional = true }
 rocksdb = { version = "0.22", optional = true }
 redis = { version = "0.27", features = ["tokio-comp", "aio"], optional = true }
-macp-proto = "0.1.1"
+macp-proto = "0.1.2"
 
 [dev-dependencies]
 tempfile = "3"

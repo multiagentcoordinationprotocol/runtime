@@ -147,10 +147,7 @@ async fn objection_invalid_severity_rejected() {
     )
     .await
     .unwrap();
-    assert!(
-        !ack.ok,
-        "Objection with invalid severity must be rejected"
-    );
+    assert!(!ack.ok, "Objection with invalid severity must be rejected");
 }
 
 // ── Signal Payload Validation (RFC-MACP-0001 §4) ──────────────────────
@@ -191,10 +188,7 @@ async fn signal_empty_signal_type_rejected() {
         .into_inner()
         .ack
         .unwrap();
-    assert!(
-        !ack.ok,
-        "Signal with empty signal_type must be rejected"
-    );
+    assert!(!ack.ok, "Signal with empty signal_type must be rejected");
 }
 
 // ── Max Participants (Safety Limit) ───────────────────────────────────

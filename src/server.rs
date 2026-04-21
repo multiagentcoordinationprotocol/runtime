@@ -235,15 +235,41 @@ impl MacpServer {
         }
     }
 
+    /// Process a single StreamSessionRequest frame.
+    ///
+    /// Returns `Ok(replay_envelopes)` — empty for normal sends, non-empty when
+    /// a subscribe frame triggers history replay (RFC-MACP-0006-A1).
     async fn process_stream_request(
         &self,
         identity: &AuthIdentity,
         req: StreamSessionRequest,
         bound_session_id: &mut Option<String>,
         session_events: &mut Option<tokio::sync::broadcast::Receiver<Envelope>>,
-    ) -> Result<(), Status> {
+    ) -> Result<Vec<Envelope>, Status> {
+        // RFC-MACP-0006-A1: Handle subscribe-only frame.
+        // When subscribe_session_id is set and envelope is absent, subscribe to
+        // the session's broadcast channel and replay accepted history.
+        if !req.subscribe_session_id.is_empty() {
+            if req.envelope.is_some() {
+                return Err(Status::invalid_argument(
+                    "StreamSessionRequest must not contain both envelope and subscribe_session_id",
+                ));
+            }
+            return self
+                .process_subscribe_frame(
+                    identity,
+                    &req.subscribe_session_id,
+                    req.after_sequence,
+                    bound_session_id,
+                    session_events,
+                )
+                .await;
+        }
+
         let envelope = req.envelope.ok_or_else(|| {
-            Status::invalid_argument("StreamSessionRequest must contain an envelope")
+            Status::invalid_argument(
+                "StreamSessionRequest must contain an envelope or subscribe_session_id",
+            )
         })?;
 
         self.validate_envelope_shape(&envelope)
@@ -310,7 +336,66 @@ impl MacpServer {
             .process(&envelope, max_open)
             .await
             .map_err(Self::status_from_error)?;
-        Ok(())
+        Ok(vec![])
+    }
+
+    /// RFC-MACP-0006-A1: Process a subscribe-only frame.
+    /// Subscribes the stream to the session's broadcast channel and replays
+    /// accepted envelope history from `after_sequence` onwards.
+    async fn process_subscribe_frame(
+        &self,
+        identity: &AuthIdentity,
+        session_id: &str,
+        after_sequence: u64,
+        bound_session_id: &mut Option<String>,
+        session_events: &mut Option<tokio::sync::broadcast::Receiver<Envelope>>,
+    ) -> Result<Vec<Envelope>, Status> {
+        // Validate: only one session per stream
+        if let Some(bound) = bound_session_id.as_ref() {
+            if bound != session_id {
+                return Err(Status::invalid_argument(
+                    "StreamSession may only carry envelopes for one session_id",
+                ));
+            }
+        }
+
+        // Validate session exists
+        let session = self
+            .runtime
+            .get_session_checked(session_id)
+            .await
+            .ok_or_else(|| Status::not_found(format!("Session '{}' not found", session_id)))?;
+
+        // Authorize: caller must be a declared participant, initiator, or observer
+        let allowed = identity.is_observer
+            || session.initiator_sender == identity.sender
+            || session.participants.iter().any(|p| p == &identity.sender);
+        if !allowed {
+            return Err(Status::permission_denied(
+                "FORBIDDEN: caller is not a declared participant or observer for this session",
+            ));
+        }
+
+        // Subscribe to live broadcast (if not already subscribed)
+        if session_events.is_none() {
+            *bound_session_id = Some(session_id.to_string());
+            *session_events = Some(self.runtime.subscribe_session_stream(session_id));
+        }
+
+        tracing::info!(
+            session_id = %session_id,
+            sender = %identity.sender,
+            after_sequence = after_sequence,
+            "passive subscribe: replaying session history"
+        );
+
+        // Replay accepted envelopes from LogStore
+        let replay = self
+            .runtime
+            .get_session_envelopes_after(session_id, after_sequence)
+            .await;
+
+        Ok(replay)
     }
 
     fn build_stream_session_stream<S>(
@@ -375,7 +460,16 @@ impl MacpServer {
                                 )
                                 .await
                             {
-                                Ok(()) => {}
+                                Ok(replay) => {
+                                    // RFC-MACP-0006-A1: yield replayed envelopes from subscribe
+                                    for env in replay {
+                                        yield StreamSessionResponse {
+                                            response: Some(
+                                                macp_runtime::pb::stream_session_response::Response::Envelope(env),
+                                            ),
+                                        };
+                                    }
+                                }
                                 Err(status) if Self::is_stream_terminal_error(&status) => {
                                     Err(status)?;
                                 }
@@ -446,7 +540,16 @@ impl MacpServer {
                                 )
                                 .await
                             {
-                                Ok(()) => {}
+                                Ok(replay) => {
+                                    // RFC-MACP-0006-A1: yield replayed envelopes from subscribe
+                                    for env in replay {
+                                        yield StreamSessionResponse {
+                                            response: Some(
+                                                macp_runtime::pb::stream_session_response::Response::Envelope(env),
+                                            ),
+                                        };
+                                    }
+                                }
                                 Err(status) if Self::is_stream_terminal_error(&status) => {
                                     Err(status)?;
                                 }
@@ -1329,6 +1432,8 @@ mod tests {
         let (server, _) = make_server();
         let sid = new_sid();
         let requests = iter(vec![Ok(StreamSessionRequest {
+            subscribe_session_id: String::new(),
+            after_sequence: 0,
             envelope: Some(Envelope {
                 macp_version: "1.0".into(),
                 mode: "macp.mode.decision.v1".into(),
@@ -1363,6 +1468,8 @@ mod tests {
         let sid2 = new_sid();
         let requests = iter(vec![
             Ok(StreamSessionRequest {
+                subscribe_session_id: String::new(),
+                after_sequence: 0,
                 envelope: Some(Envelope {
                     macp_version: "1.0".into(),
                     mode: "macp.mode.decision.v1".into(),
@@ -1375,6 +1482,8 @@ mod tests {
                 }),
             }),
             Ok(StreamSessionRequest {
+                subscribe_session_id: String::new(),
+                after_sequence: 0,
                 envelope: Some(Envelope {
                     macp_version: "1.0".into(),
                     mode: "macp.mode.decision.v1".into(),
@@ -1731,5 +1840,346 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    }
+
+    // ── RFC-MACP-0006-A1: passive subscribe tests ──────────────────────
+
+    fn observer_identity(sender: &str) -> AuthIdentity {
+        AuthIdentity {
+            sender: sender.into(),
+            allowed_modes: None,
+            can_start_sessions: false,
+            max_open_sessions: None,
+            can_manage_mode_registry: false,
+            is_observer: true,
+        }
+    }
+
+    fn subscribe_frame(session_id: &str, after: u64) -> StreamSessionRequest {
+        StreamSessionRequest {
+            subscribe_session_id: session_id.into(),
+            after_sequence: after,
+            envelope: None,
+        }
+    }
+
+    fn start_multi_participant(participants: Vec<String>) -> Vec<u8> {
+        SessionStartPayload {
+            intent: "intent".into(),
+            participants,
+            mode_version: "1.0.0".into(),
+            configuration_version: "cfg-1".into(),
+            policy_version: String::new(),
+            ttl_ms: 60_000,
+            context_id: String::new(),
+            extensions: std::collections::HashMap::new(),
+            roots: vec![],
+        }
+        .encode_to_vec()
+    }
+
+    async fn start_session(
+        server: &MacpServer,
+        initiator: &str,
+        sid: &str,
+        participants: Vec<String>,
+    ) {
+        let ack = do_send(
+            server,
+            initiator,
+            Envelope {
+                macp_version: "1.0".into(),
+                mode: "macp.mode.decision.v1".into(),
+                message_type: "SessionStart".into(),
+                message_id: "start".into(),
+                session_id: sid.into(),
+                sender: String::new(),
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                payload: start_multi_participant(participants),
+            },
+        )
+        .await;
+        assert!(ack.ok, "SessionStart failed: {:?}", ack.error);
+    }
+
+    async fn send_proposal(
+        server: &MacpServer,
+        sender: &str,
+        sid: &str,
+        message_id: &str,
+        proposal_id: &str,
+    ) {
+        let payload = macp_runtime::decision_pb::ProposalPayload {
+            proposal_id: proposal_id.into(),
+            option: "opt".into(),
+            rationale: "r".into(),
+            supporting_data: vec![],
+        }
+        .encode_to_vec();
+        let ack = do_send(
+            server,
+            sender,
+            Envelope {
+                macp_version: "1.0".into(),
+                mode: "macp.mode.decision.v1".into(),
+                message_type: "Proposal".into(),
+                message_id: message_id.into(),
+                session_id: sid.into(),
+                sender: String::new(),
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                payload,
+            },
+        )
+        .await;
+        assert!(ack.ok, "Proposal failed: {:?}", ack.error);
+    }
+
+    #[tokio::test]
+    async fn subscribe_replays_session_history_from_zero() {
+        let (server, _) = make_server();
+        let sid = new_sid();
+        let initiator = "agent://orchestrator";
+        let peer = "agent://fraud";
+        start_session(
+            &server,
+            initiator,
+            &sid,
+            vec![initiator.into(), peer.into()],
+        )
+        .await;
+        send_proposal(&server, peer, &sid, "m2", "p1").await;
+
+        let mut bound = None;
+        let mut events = None;
+        let replay = server
+            .process_stream_request(
+                &stream_identity(peer),
+                subscribe_frame(&sid, 0),
+                &mut bound,
+                &mut events,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(replay.len(), 2);
+        assert_eq!(replay[0].message_type, "SessionStart");
+        assert_eq!(replay[0].message_id, "start");
+        assert_eq!(replay[1].message_type, "Proposal");
+        assert_eq!(replay[1].message_id, "m2");
+        assert_eq!(bound.as_deref(), Some(sid.as_str()));
+        assert!(events.is_some());
+    }
+
+    #[tokio::test]
+    async fn subscribe_after_sequence_filters_history() {
+        let (server, _) = make_server();
+        let sid = new_sid();
+        let initiator = "agent://orchestrator";
+        let peer = "agent://fraud";
+        start_session(
+            &server,
+            initiator,
+            &sid,
+            vec![initiator.into(), peer.into()],
+        )
+        .await;
+        send_proposal(&server, peer, &sid, "m2", "p1").await;
+        send_proposal(&server, peer, &sid, "m3", "p2").await;
+
+        let mut bound = None;
+        let mut events = None;
+        let replay = server
+            .process_stream_request(
+                &stream_identity(peer),
+                subscribe_frame(&sid, 2),
+                &mut bound,
+                &mut events,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].message_id, "m3");
+    }
+
+    #[tokio::test]
+    async fn subscribe_unknown_session_returns_not_found() {
+        let (server, _) = make_server();
+        let mut bound = None;
+        let mut events = None;
+        let status = server
+            .process_stream_request(
+                &stream_identity("agent://orchestrator"),
+                subscribe_frame("missing-session", 0),
+                &mut bound,
+                &mut events,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::NotFound);
+        assert!(bound.is_none());
+        assert!(events.is_none());
+    }
+
+    #[tokio::test]
+    async fn subscribe_non_participant_is_forbidden() {
+        let (server, _) = make_server();
+        let sid = new_sid();
+        start_session(
+            &server,
+            "agent://orchestrator",
+            &sid,
+            vec!["agent://orchestrator".into(), "agent://fraud".into()],
+        )
+        .await;
+
+        let mut bound = None;
+        let mut events = None;
+        let status = server
+            .process_stream_request(
+                &stream_identity("agent://outsider"),
+                subscribe_frame(&sid, 0),
+                &mut bound,
+                &mut events,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn subscribe_observer_identity_allowed() {
+        let (server, _) = make_server();
+        let sid = new_sid();
+        start_session(
+            &server,
+            "agent://orchestrator",
+            &sid,
+            vec!["agent://orchestrator".into(), "agent://fraud".into()],
+        )
+        .await;
+
+        let mut bound = None;
+        let mut events = None;
+        let replay = server
+            .process_stream_request(
+                &observer_identity("agent://auditor"),
+                subscribe_frame(&sid, 0),
+                &mut bound,
+                &mut events,
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].message_type, "SessionStart");
+    }
+
+    #[tokio::test]
+    async fn subscribe_initiator_allowed_even_when_not_listed() {
+        // Per RFC-MACP-0007, the initiator is always authorized for session
+        // access, even if not present in the participants list.
+        let (server, _) = make_server();
+        let sid = new_sid();
+        start_session(
+            &server,
+            "agent://orchestrator",
+            &sid,
+            vec!["agent://fraud".into()],
+        )
+        .await;
+
+        let mut bound = None;
+        let mut events = None;
+        let replay = server
+            .process_stream_request(
+                &stream_identity("agent://orchestrator"),
+                subscribe_frame(&sid, 0),
+                &mut bound,
+                &mut events,
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_request_with_envelope_and_subscribe_is_rejected() {
+        let (server, _) = make_server();
+        let sid = new_sid();
+        let req = StreamSessionRequest {
+            subscribe_session_id: sid.clone(),
+            after_sequence: 0,
+            envelope: Some(Envelope {
+                macp_version: "1.0".into(),
+                mode: "macp.mode.decision.v1".into(),
+                message_type: "SessionStart".into(),
+                message_id: "m1".into(),
+                session_id: sid,
+                sender: String::new(),
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                payload: start_payload(),
+            }),
+        };
+
+        let mut bound = None;
+        let mut events = None;
+        let status = server
+            .process_stream_request(
+                &stream_identity("agent://orchestrator"),
+                req,
+                &mut bound,
+                &mut events,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn subscribe_to_different_session_on_bound_stream_is_rejected() {
+        let (server, _) = make_server();
+        let sid1 = new_sid();
+        let sid2 = new_sid();
+        start_session(
+            &server,
+            "agent://orchestrator",
+            &sid1,
+            vec!["agent://orchestrator".into(), "agent://fraud".into()],
+        )
+        .await;
+        start_session(
+            &server,
+            "agent://orchestrator",
+            &sid2,
+            vec!["agent://orchestrator".into(), "agent://fraud".into()],
+        )
+        .await;
+
+        // First subscribe binds the stream to sid1
+        let identity = stream_identity("agent://fraud");
+        let mut bound = None;
+        let mut events = None;
+        server
+            .process_stream_request(
+                &identity,
+                subscribe_frame(&sid1, 0),
+                &mut bound,
+                &mut events,
+            )
+            .await
+            .unwrap();
+        assert_eq!(bound.as_deref(), Some(sid1.as_str()));
+
+        // Second subscribe to sid2 on the same stream must be rejected
+        let status = server
+            .process_stream_request(
+                &identity,
+                subscribe_frame(&sid2, 0),
+                &mut bound,
+                &mut events,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
     }
 }

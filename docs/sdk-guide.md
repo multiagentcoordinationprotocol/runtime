@@ -96,14 +96,14 @@ Use `Send` when you need an explicit acknowledgement per message, or for fire-an
 A `StreamSession` connection follows this pattern:
 
 1. Open a bidirectional stream.
-2. Send the first envelope, which binds the stream to that `session_id`.
+2. Send the first envelope, which binds the stream to that `session_id`. Alternatively, send a **passive subscribe** frame (RFC-MACP-0006-A1) where `envelope` is absent and `subscribe_session_id` is set -- the runtime replays accepted history from log index `after_sequence` and then delivers live envelopes on the same stream. Set `after_sequence = 0` to replay from session start; use a higher value to resume after a known checkpoint.
 3. Receive accepted envelopes from all participants in the session.
-4. Send additional envelopes as needed.
+4. Send additional envelopes as needed (not required for passive observers).
 5. The stream closes on client disconnect, lag overflow, auth failure, or server shutdown.
 
-All envelopes on a stream must target the same session. The stream only delivers envelopes accepted after the bind point -- there is no backfill of earlier history.
+All envelopes on a stream must target the same session. A single frame must not set both `envelope` and `subscribe_session_id` -- the stream terminates with `InvalidArgument` if both are set. Passive subscribe is authorized for the session initiator, declared participants, and observer identities; non-participants receive an inline `FORBIDDEN` error frame without closing the stream.
 
-Application-level errors (validation failures, authorization denials) are delivered as inline `MACPError` messages and the stream stays open. Transport-level errors (unauthenticated, internal) close the stream.
+Application-level errors (validation failures, authorization denials) are delivered as inline `MACPError` messages and the stream stays open. Transport-level errors (unauthenticated, internal, unknown session on subscribe) close the stream.
 
 ### Handling stream lag
 

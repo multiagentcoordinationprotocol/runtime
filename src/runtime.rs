@@ -185,6 +185,39 @@ impl Runtime {
         self.session_lifecycle_bus.subscribe()
     }
 
+    /// RFC-MACP-0006-A1: Replay accepted envelopes from the session log for
+    /// passive subscribe. Returns `Incoming` log entries as reconstructed
+    /// `Envelope` values, starting from `after_sequence` (0-based log index).
+    pub async fn get_session_envelopes_after(
+        &self,
+        session_id: &str,
+        after_sequence: u64,
+    ) -> Vec<Envelope> {
+        self.log_store
+            .get_incoming_after(session_id, after_sequence)
+            .await
+            .into_iter()
+            .map(|(_idx, entry)| Envelope {
+                macp_version: if entry.macp_version.is_empty() {
+                    "1.0".into()
+                } else {
+                    entry.macp_version
+                },
+                mode: entry.mode,
+                message_type: entry.message_type,
+                message_id: entry.message_id,
+                session_id: entry.session_id,
+                sender: entry.sender,
+                timestamp_unix_ms: if entry.timestamp_unix_ms != 0 {
+                    entry.timestamp_unix_ms
+                } else {
+                    entry.received_at_ms
+                },
+                payload: entry.raw_payload,
+            })
+            .collect()
+    }
+
     fn publish_accepted_envelope(&self, env: &Envelope) {
         if !env.session_id.is_empty() {
             self.stream_bus.publish(&env.session_id, env.clone());
