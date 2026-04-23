@@ -49,6 +49,23 @@ This runtime implements the current MACP core/service surface, five standards-tr
   - `RegisterExtMode` dynamically registers new extension modes with a passthrough handler
   - `UnregisterExtMode` removes dynamically registered extensions (built-in modes protected)
   - `PromoteMode` promotes extensions to standards-track with optional identifier rename
+- **Pluggable authentication chain**
+  - JWT bearer resolver validates signature, issuer, audience, and expiration against a JWKS (inline JSON or URL-fetched with TTL cache); `RS256`, `ES256`, and `HS256` supported
+  - Static bearer resolver maps opaque tokens to identities via `MACP_AUTH_TOKENS_FILE`/`MACP_AUTH_TOKENS_JSON`
+  - Resolvers run in chain order (JWT → static); dev-mode fallback only when both are absent
+  - Identities carry capability flags: `allowed_modes`, `can_start_sessions`, `max_open_sessions`, `can_manage_mode_registry`, `is_observer`
+- **Governance policy framework (RFC-MACP-0012)**
+  - `RegisterPolicy`, `UnregisterPolicy`, `GetPolicy`, `ListPolicies`, `WatchPolicies` RPCs
+  - Per-mode rule schemas (voting, objection handling, quorum thresholds, acceptance, assignment, handoff acceptance)
+  - Policies evaluated at commitment time; version binding enforced at SessionStart
+- **Session lifecycle observability**
+  - `ListSessions` enumerates current session metadata
+  - `WatchSessions` streams `Created`/`Resolved`/`Expired` events with a `Created` initial-sync on connect
+- **Session extension plumbing**
+  - `SessionExtensionProvider` trait and `ExtensionProviderRegistry` let hosts hook lifecycle callbacks for custom session-level extensions carried in the `extensions` map; provider errors are non-fatal
+- **Pluggable storage backends**
+  - File (default), in-memory, RocksDB (`rocksdb-backend` feature), Redis (`redis-backend` feature)
+  - Checkpoint-based replay and terminal-session log compaction
 - **Structured logging via `tracing`**
   - use `RUST_LOG` env var to control log level (e.g. `RUST_LOG=info`)
 - **Per-mode metrics**
@@ -208,25 +225,35 @@ cargo run --bin fuzz_client
 |---|---|
 | `Initialize` | implemented |
 | `Send` | implemented |
+| `StreamSession` | implemented (active + passive subscribe) |
 | `GetSession` | implemented |
+| `ListSessions` | implemented |
+| `WatchSessions` | implemented |
 | `CancelSession` | implemented |
 | `GetManifest` | implemented |
 | `ListModes` | implemented |
-| `ListRoots` | implemented |
-| `StreamSession` | implemented |
-| `WatchModeRegistry` | implemented |
-| `WatchRoots` | implemented |
 | `ListExtModes` | implemented |
 | `RegisterExtMode` | implemented |
 | `UnregisterExtMode` | implemented |
 | `PromoteMode` | implemented |
+| `WatchModeRegistry` | implemented |
+| `ListRoots` | implemented |
+| `WatchRoots` | implemented |
+| `WatchSignals` | implemented |
+| `RegisterPolicy` | implemented |
+| `UnregisterPolicy` | implemented |
+| `GetPolicy` | implemented |
+| `ListPolicies` | implemented |
+| `WatchPolicies` | implemented |
 
 ## Architecture
 
 ```
 Client Request
        |
-  [Transport/gRPC] -- server.rs, security.rs
+  [Transport/gRPC] -- server.rs
+       |
+  [Auth Chain]    -- security.rs, auth/*.rs  (JWT → static → dev fallback)
        |
   [Coordination Kernel] -- runtime.rs
        |
@@ -236,7 +263,9 @@ Client Request
    mode/*.rs       ListModes, ListExtModes, GetManifest,
                    RegisterExtMode, UnregisterExtMode, PromoteMode
        |
-  [Storage Layer] -- storage.rs, log_store.rs
+  [Policy Engine] -- policy/*.rs  (commitment-time evaluation)
+       |
+  [Storage Layer] -- storage/*.rs, log_store.rs
        |
   [Replay] -- replay.rs
 ```
@@ -249,25 +278,45 @@ See `docs/architecture.md` for detailed layer descriptions.
 runtime/
 ├── src/
 │   ├── main.rs             # server startup, TLS, persistence, auth wiring
-│   ├── server.rs           # gRPC adapter and request authentication
-│   ├── runtime.rs          # coordination kernel and mode dispatch
+│   ├── server.rs           # gRPC adapter (22 RPCs) and envelope validation
+│   ├── runtime.rs          # coordination kernel, mode dispatch, lifecycle bus
 │   ├── mode_registry.rs    # single source of truth for mode registration
-│   ├── security.rs         # auth config, sender derivation, rate limiting
+│   ├── security.rs         # auth config loader, sender derivation, rate limiting
 │   ├── session.rs          # canonical SessionStart validation and session model
 │   ├── registry.rs         # session store with optional persistence
-│   ├── log_store.rs        # in-memory accepted-history log cache
-│   ├── storage.rs          # storage backend trait, FileBackend, crash recovery
+│   ├── log_store.rs        # in-memory accepted-history log cache + replay helpers
 │   ├── replay.rs           # session rebuild from append-only log
+│   ├── stream_bus.rs       # per-session broadcast channels
 │   ├── metrics.rs          # per-mode metrics counters
+│   ├── auth/               # pluggable auth resolver chain
+│   │   ├── chain.rs        # resolver chain driver
+│   │   ├── resolver.rs     # AuthResolver trait, ResolvedIdentity
+│   │   └── resolvers/
+│   │       ├── jwt_bearer.rs    # JWT validation with JWKS (inline or URL cache)
+│   │       └── static_bearer.rs # opaque bearer token → identity map
+│   ├── extensions/         # session-extension provider plumbing
+│   │   ├── provider.rs     # SessionExtensionProvider trait
+│   │   └── registry.rs     # ExtensionProviderRegistry
 │   ├── mode/               # mode implementations (standards-track + extensions)
 │   │   ├── passthrough.rs  # generic handler for dynamically registered extensions
 │   │   └── ...
+│   ├── policy/             # governance policy framework (RFC-MACP-0012)
+│   │   ├── registry.rs     # policy CRUD + broadcast
+│   │   ├── evaluator.rs    # per-mode commitment evaluation
+│   │   └── rules.rs        # mode-specific rule schemas
+│   ├── storage/            # pluggable storage backends
+│   │   ├── file.rs         # per-session append-only log + snapshots
+│   │   ├── memory.rs       # in-memory backend
+│   │   ├── rocksdb.rs      # RocksDB backend (feature-gated)
+│   │   ├── redis_backend.rs # Redis backend (feature-gated)
+│   │   └── recovery.rs     # crash recovery (.tmp cleanup)
 │   └── bin/                # local development example clients
 ├── tests/
 │   ├── integration_mode_lifecycle.rs  # full-stack integration tests
 │   ├── replay_round_trip.rs           # replay tests for all modes
 │   ├── conformance_loader.rs          # JSON fixture runner
 │   └── conformance/                   # per-mode conformance fixtures
+├── integration_tests/                 # gRPC boundary tests (Tier 1/2/3)
 ├── docs/
 └── build.rs
 ```
@@ -309,7 +358,7 @@ MACP_TEST_BINARY=../target/debug/macp-runtime cargo test -- --test-threads=1
 
 The integration suite has three tiers:
 
-- **Tier 1 (Protocol)** — 47 scripted gRPC tests covering all modes, error paths, signals, version binding, dedup, and RFC cross-cutting features
+- **Tier 1 (Protocol)** — 74 scripted gRPC tests (including JWT bearer auth, passive subscribe, and policy registry coverage) across all modes, error paths, signals, version binding, dedup, and RFC cross-cutting features
 - **Tier 2 (Rig Tools)** — 5 tests using [Rig](https://rig.rs) agent framework `Tool` implementations for all MACP operations
 - **Tier 3 (E2E)** — 3 tests with real OpenAI GPT-4o-mini agents coordinating through the runtime (requires `OPENAI_API_KEY`)
 
