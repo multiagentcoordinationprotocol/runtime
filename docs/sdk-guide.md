@@ -9,12 +9,14 @@ For protocol-level SDK conformance requirements, see the [protocol SDK parity do
 A well-built MACP SDK takes care of seven concerns so that application code can focus on coordination logic:
 
 1. **gRPC transport** -- Connection management, TLS configuration, and metadata injection.
-2. **Authentication** -- Storing tokens and attaching them to every request.
+2. **Authentication** -- Storing the caller's bearer credential (opaque static token or JWT) and attaching it to every request as `Authorization: Bearer <token>`.
 3. **Envelope construction** -- Building protobuf-encoded envelopes with correct version and mode fields.
 4. **Message ID generation** -- Producing unique IDs for deduplication.
 5. **Session ID generation** -- Creating IDs in an accepted format (UUID v4/v7 or base64url).
 6. **Error handling** -- Distinguishing transient from permanent failures and applying appropriate retry logic.
-7. **Streaming** -- Managing `StreamSession` connections, handling inline errors, and recovering from lag.
+7. **Streaming** -- Managing `StreamSession` connections (including passive subscribe), handling inline errors, and recovering from lag.
+
+The runtime treats JWT and opaque static tokens interchangeably at the wire level: both travel in `Authorization: Bearer`. A JWT is detected by the presence of dots in the token; otherwise it is treated as opaque. SDKs do not need to know which resolver the server is running.
 
 ## Starting a connection
 
@@ -107,7 +109,11 @@ Application-level errors (validation failures, authorization denials) are delive
 
 ### Handling stream lag
 
-The runtime's broadcast buffer holds 256 envelopes per session. If a client falls behind, the stream terminates with `ResourceExhausted`. Your SDK should detect this, call `GetSession` to learn the current session state, reconnect with a new stream, and resume processing.
+The runtime's broadcast buffer holds 256 envelopes per session. If a client falls behind, the stream terminates with `ResourceExhausted`. Your SDK should detect this, reconnect with a new stream, and use a passive-subscribe frame with `after_sequence` set to the log index of the last envelope it saw -- the runtime will replay missed history and then resume live delivery on the same stream.
+
+### Observer identities
+
+Non-participant agents (audit agents, dashboards, read-only observers) should be provisioned with an identity that carries `is_observer: true`. Observers can open passive-subscribe streams for any session and consume its accepted history and live envelopes without being listed in the session's `participants`. Attempting to `Send` into a session as an observer still requires normal participation rules, so passive observation does not bypass mode authority.
 
 ## Capability negotiation
 

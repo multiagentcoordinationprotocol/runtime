@@ -176,7 +176,8 @@ Create a `tokens.json` file that maps bearer tokens to agent identities and capa
     "allowed_modes": ["macp.mode.decision.v1", "macp.mode.task.v1"],
     "can_start_sessions": true,
     "max_open_sessions": 10,
-    "can_manage_mode_registry": false
+    "can_manage_mode_registry": false,
+    "is_observer": false
   },
   {
     "token": "secret-token-for-reviewer",
@@ -184,15 +185,52 @@ Create a `tokens.json` file that maps bearer tokens to agent identities and capa
     "allowed_modes": [],
     "can_start_sessions": true,
     "can_manage_mode_registry": false
+  },
+  {
+    "token": "secret-token-for-auditor",
+    "sender": "agent://auditor",
+    "can_start_sessions": false,
+    "is_observer": true
   }
 ]
 ```
 
-Setting `allowed_modes` to an empty array grants access to all modes. The runtime derives the sender identity from the token, so agents cannot spoof their identity. Clients authenticate by sending `Authorization: Bearer <token>` in the gRPC metadata.
+Setting `allowed_modes` to an empty array (or omitting it) grants access to all modes. The runtime derives the sender identity from the token, so agents cannot spoof their identity. `is_observer` allows passive-subscribe access to any session, even when the identity is not a declared participant -- useful for monitoring and audit agents. Clients authenticate by sending `Authorization: Bearer <token>` (or the alternate `x-macp-token: <token>` header) in the gRPC metadata.
 
 ### JWT mode
 
-The runtime also accepts JWT bearer tokens when `MACP_AUTH_ISSUER` is set. Configure a JWKS source (`MACP_AUTH_JWKS_JSON` inline, or `MACP_AUTH_JWKS_URL` fetched + cached) and optionally `MACP_AUTH_AUDIENCE` (default `macp-runtime`) and `MACP_AUTH_JWKS_TTL_SECS` (default 300). The JWT's `sub` claim becomes the sender; an optional `macp_scopes` claim carries the same capability fields as the static token config (`allowed_modes`, `can_start_sessions`, `max_open_sessions`, `can_manage_mode_registry`, `is_observer`).
+The runtime accepts JWT bearer tokens when `MACP_AUTH_ISSUER` is set. Configure a JWKS source (`MACP_AUTH_JWKS_JSON` inline, or `MACP_AUTH_JWKS_URL` fetched + cached) and optionally override `MACP_AUTH_AUDIENCE` (default `macp-runtime`) and `MACP_AUTH_JWKS_TTL_SECS` (default 300). Supported signature algorithms are `RS256`, `ES256`, and `HS256`.
+
+```bash
+export MACP_AUTH_ISSUER=https://issuer.example.com
+export MACP_AUTH_AUDIENCE=macp-runtime
+export MACP_AUTH_JWKS_URL=https://issuer.example.com/.well-known/jwks.json
+cargo run
+```
+
+The JWT's `sub` claim becomes the `sender`. An optional `macp_scopes` claim carries capability fields that mirror the static token config:
+
+```json
+{
+  "sub": "agent://analyst",
+  "iss": "https://issuer.example.com",
+  "aud": "macp-runtime",
+  "exp": 1767225600,
+  "macp_scopes": {
+    "allowed_modes": ["macp.mode.decision.v1", "macp.mode.task.v1"],
+    "can_start_sessions": true,
+    "max_open_sessions": 10,
+    "can_manage_mode_registry": false,
+    "is_observer": false
+  }
+}
+```
+
+When `macp_scopes` is omitted, the identity defaults to permissive: any mode allowed, sessions can be started, and admin/observer flags off. The `is_observer` capability is required for passive-subscribe access to sessions where the caller is neither the initiator nor a declared participant.
+
+### Resolver order
+
+If both JWT and static bearer tokens are configured, the runtime runs the JWT resolver first and then the static resolver. JWT-shaped tokens (containing dots) are only considered by the JWT resolver; opaque tokens are only considered by the static resolver. Dev-mode fallback activates only when **neither** `MACP_AUTH_ISSUER` nor `MACP_AUTH_TOKENS_*` is configured.
 
 ## Running the example clients
 

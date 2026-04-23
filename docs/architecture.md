@@ -6,7 +6,7 @@ This page describes the runtime's internal design: its layer structure, how requ
 
 ## Layers
 
-The runtime is organized into six layers, each with a clear responsibility boundary:
+The runtime is organized into seven layers, each with a clear responsibility boundary:
 
 ```
 Agents (external)
@@ -14,15 +14,24 @@ Agents (external)
   v  gRPC (tonic)
 +-----------------------------------------------------------+
 |  Transport Layer (src/server.rs)                          |
-|    18 RPC handlers, authentication, envelope validation,  |
-|    sender derivation, rate limiting                        |
+|    22 RPC handlers, envelope validation, sender            |
+|    derivation, rate limiting                               |
++-----------------------------------------------------------+
+  |
+  v
++-----------------------------------------------------------+
+|  Auth Layer (src/security.rs, src/auth/*.rs)              |
+|    Resolver chain: JWT bearer → static bearer → dev-mode   |
+|    fallback; capability flags (allowed_modes,              |
+|    max_open_sessions, is_observer, …)                      |
 +-----------------------------------------------------------+
   |
   v
 +-----------------------------------------------------------+
 |  Coordination Kernel (src/runtime.rs)                     |
 |    Session lifecycle, deduplication, TTL enforcement,      |
-|    mode dispatch, signal broadcast                         |
+|    mode dispatch, signal broadcast, session lifecycle      |
+|    observability (WatchSessions)                           |
 +-----------------------------------------------------------+
   |
   v
@@ -53,7 +62,9 @@ Agents (external)
 +-----------------------------------------------------------+
 ```
 
-The **transport layer** terminates gRPC connections, authenticates requests using bearer tokens or development headers, validates envelope structure, overrides the sender field with the authenticated identity, and enforces per-sender rate limits. It never touches session state directly.
+The **transport layer** terminates gRPC connections, delegates authentication to the auth layer, validates envelope structure, overrides the sender field with the authenticated identity, and enforces per-sender rate limits. It never touches session state directly.
+
+The **auth layer** implements a pluggable resolver chain. Each resolver inspects the request metadata and returns either a verified identity, a pass (the credential isn't ours, try the next resolver), or a hard reject (the credential is ours but invalid). The built-in resolvers are `jwt_bearer` (validates signature, issuer, audience, and expiration via a JWKS) and `static_bearer` (looks up opaque tokens in a preloaded map). When neither is configured, the layer falls back to dev-mode auth where any bearer value becomes the sender -- strictly for local development. Every resolved identity carries capability flags (`allowed_modes`, `can_start_sessions`, `max_open_sessions`, `can_manage_mode_registry`, `is_observer`) that later authorization checks consult.
 
 The **coordination kernel** is the heart of the runtime. It manages session creation, deduplication, lazy TTL expiration, and dispatches messages to the appropriate mode handler. It also broadcasts signals on the ambient plane and publishes accepted envelopes to streaming subscribers.
 
@@ -115,9 +126,9 @@ The critical property is the **commit point**: the log entry is persisted to dur
 
 Bidirectional streaming works similarly but binds the stream to a single session:
 
-The first envelope on the stream establishes the session binding. All subsequent envelopes must target the same session. The client receives all accepted envelopes for that session (from any participant), delivered through a per-session broadcast channel.
+The first frame on the stream establishes the session binding. It can be either (a) an envelope -- the stream then behaves as an active participant, or (b) a passive-subscribe frame (`subscribe_session_id` + `after_sequence`) -- the runtime replays accepted envelopes from log index `after_sequence` and then delivers live envelopes on the same stream. All subsequent envelope frames must target the same session. Passive subscribe is authorized for session initiators, declared participants, and identities carrying the `is_observer` capability; non-participants receive an inline `FORBIDDEN` error and the stream stays open. A frame that sets both `envelope` and `subscribe_session_id` is rejected with `InvalidArgument`.
 
-Application-level errors like validation failures or authorization denials are sent as inline error messages on the stream without closing it. Transport-level errors like authentication failure terminate the stream. If the client falls behind the broadcast buffer (capacity: 256 envelopes), the stream is terminated with `ResourceExhausted` and the client must reconnect.
+Application-level errors like validation failures or authorization denials are sent as inline error messages on the stream without closing it. Transport-level errors like authentication failure terminate the stream. If the client falls behind the broadcast buffer (capacity: 256 envelopes), the stream is terminated with `ResourceExhausted` and the client must reconnect -- optionally resuming via passive subscribe with an `after_sequence` derived from the last envelope it saw.
 
 ## Key types
 
@@ -189,7 +200,7 @@ The runtime processes different sessions in parallel but serializes access withi
 
 - **Cross-session parallelism**: Messages targeting different sessions are processed concurrently with no coordination between them.
 
-- **Stream bus**: Each session has a `tokio::sync::broadcast` channel (capacity 256) for delivering accepted envelopes to `StreamSession` subscribers. A separate global broadcast channel handles ambient signals via `WatchSignals`.
+- **Stream bus**: Each session has a `tokio::sync::broadcast` channel (capacity 256) for delivering accepted envelopes to `StreamSession` subscribers. A separate global broadcast channel handles ambient signals via `WatchSignals`, and a third broadcast channel (capacity 64) carries session lifecycle events (`Created`, `Resolved`, `Expired`) for `WatchSessions` subscribers.
 
 - **Background tasks**: A periodic cleanup task runs every 60 seconds (configurable via `MACP_CLEANUP_INTERVAL_SECS`) to expire sessions that have exceeded their TTL and evict terminal sessions from memory after a retention period.
 
@@ -204,17 +215,30 @@ At runtime, the registry supports dynamic extension management: `RegisterExtMode
 ```
 src/
   main.rs              -- Startup, TLS config, persistence wiring, background tasks
-  server.rs            -- gRPC adapter (18 RPCs), auth, validation, streaming
-  runtime.rs           -- Coordination kernel, session lifecycle, mode dispatch
+  server.rs            -- gRPC adapter (22 RPCs), envelope validation, streaming
+  runtime.rs           -- Coordination kernel, session lifecycle, mode dispatch,
+                          session lifecycle broadcast
   session.rs           -- Session model, SessionStart validation, ID rules
-  security.rs          -- Auth config, sender derivation, rate limiting
+  security.rs          -- Auth config loader, sender derivation, rate limiting
   error.rs             -- Error types and RFC error code mapping
   registry.rs          -- In-memory session registry
-  log_store.rs         -- In-memory log cache
+  log_store.rs         -- In-memory log cache; passive-subscribe replay helpers
   stream_bus.rs        -- Per-session broadcast channels for StreamSession
   metrics.rs           -- Atomic per-mode counters
   mode_registry.rs     -- Mode lookup, extension lifecycle
   replay.rs            -- Session rebuild from logs, checkpoint fast path
+  auth/
+    mod.rs             -- Public exports for chain, resolver, resolvers
+    chain.rs           -- AuthResolverChain: walks resolvers in order
+    resolver.rs        -- AuthResolver trait, ResolvedIdentity, AuthError
+    resolvers/
+      mod.rs           -- Built-in resolver exports
+      jwt_bearer.rs    -- JWT bearer resolver (inline JWKS or URL, with cache)
+      static_bearer.rs -- Opaque bearer token → identity map resolver
+  extensions/
+    mod.rs             -- Public exports for extension plumbing
+    provider.rs        -- SessionExtensionProvider trait, SessionOutcome
+    registry.rs        -- ExtensionProviderRegistry lifecycle fan-out
   mode/
     mod.rs             -- Mode trait and standard descriptors
     decision.rs        -- Decision mode state machine

@@ -1,6 +1,6 @@
 # API Reference
 
-This is the reference for all 18 gRPC RPCs exposed by the MACP Runtime on `macp.v1.MACPRuntimeService`. The default endpoint is `127.0.0.1:50051`, configurable via `MACP_BIND_ADDR`.
+This is the reference for all 22 gRPC RPCs exposed by the MACP Runtime on `macp.v1.MACPRuntimeService`. The default endpoint is `127.0.0.1:50051`, configurable via `MACP_BIND_ADDR`.
 
 For protocol-level transport semantics, see the [protocol transports documentation](https://www.multiagentcoordinationprotocol.io/docs/transports).
 
@@ -34,7 +34,7 @@ The client sends its supported protocol versions in descending preference order.
 
 Returns `UNSUPPORTED_PROTOCOL_VERSION` if no mutual version exists.
 
-**Capabilities advertised**: `sessions.stream`, `cancellation.cancel_session`, `progress.progress`, `manifest.get_manifest`, `mode_registry.list_modes`, `mode_registry.list_changed`, `roots.list_roots`, `roots.list_changed`, `policy_registry.register_policy`, `policy_registry.list_policies`, `policy_registry.list_changed`.
+**Capabilities advertised**: `sessions.stream`, `sessions.list_sessions`, `sessions.watch_sessions`, `cancellation.cancel_session`, `progress.progress`, `manifest.get_manifest`, `mode_registry.list_modes`, `mode_registry.list_changed`, `roots.list_roots`, `roots.list_changed`, `policy_registry.register_policy`, `policy_registry.list_policies`, `policy_registry.list_changed`.
 
 ## Message Transport
 
@@ -94,6 +94,26 @@ rpc GetSession(GetSessionRequest) returns (GetSessionResponse)
 ```
 
 Returns `SessionMetadata` with the session's mode, state, TTL deadline, bound versions, participants, per-participant activity summaries, and initiator identity. Only the session initiator and declared participants can query a session.
+
+### ListSessions
+
+Enumerates metadata for every session currently held in the registry (including terminal sessions still within the retention window).
+
+```protobuf
+rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse)
+```
+
+Returns a `sessions` array of `SessionMetadata` entries. Authentication is required; the RPC is not filtered by caller identity, so callers should apply their own participation or tenancy checks before exposing results to end users.
+
+### WatchSessions
+
+Server-streaming RPC for observing session lifecycle transitions across the runtime.
+
+```protobuf
+rpc WatchSessions(WatchSessionsRequest) returns (stream WatchSessionsResponse)
+```
+
+On connect, the runtime emits one `Created` event per session currently in the registry (initial sync), then streams live `SessionLifecycleEvent` entries as sessions are `Created`, `Resolved`, or `Expired`. Each event carries `event_type`, the current `SessionMetadata` snapshot, and `observed_at_unix_ms`. The underlying broadcast channel has a bounded capacity -- slow subscribers that fall behind will miss events, so consumers should reconcile with `ListSessions` on reconnect.
 
 ### CancelSession
 

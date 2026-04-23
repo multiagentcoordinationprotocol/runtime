@@ -69,9 +69,10 @@ A coordinator starts a session using `ext.multi_round.v1`, participants exchange
 
 Key behaviors to note:
 
-- The stream starts observing from the bind point -- there is no replay of earlier history.
 - Use `SessionStart` to create a new session over the stream, or send a session-scoped message to attach to an existing one.
+- For observers and late joiners, send a passive-subscribe frame (`subscribe_session_id` + `after_sequence`) as the first frame -- the runtime replays accepted history starting at `after_sequence` and then delivers live envelopes on the same stream. Use `after_sequence = 0` to replay from session start.
 - Mixed-session streams (envelopes targeting different sessions) are rejected.
+- A single frame must not carry both `envelope` and `subscribe_session_id` -- the stream terminates with `InvalidArgument`.
 - Application errors are delivered inline without closing the stream.
 
 ## Extension Mode Lifecycle
