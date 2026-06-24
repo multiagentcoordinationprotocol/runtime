@@ -16,10 +16,13 @@ env:
   CARGO_TERM_COLOR: always
   # Workspace publishing (`cargo publish --workspace`) resolves internal path
   # deps locally, so a dry-run validates the whole graph before anything is on
-  # the index. Pin an explicit toolchain that has the flag stabilized rather
-  # than the `stable` label, which can resolve to a cargo too old for it. The
-  # rest of CI pins the MSRV (1.89.0); only this job needs the newer toolchain.
+  # the index. It needs a toolchain new enough to have the flag stabilized.
   RUST_TOOLCHAIN: "1.95.0"
+  # The repo pins the MSRV via rust-toolchain.toml (channel = "1.89.0"), and
+  # that file wins over the installed default for plain `cargo`. RUSTUP_TOOLCHAIN
+  # has higher precedence than the file, so it forces this job's cargo to the
+  # newer toolchain installed above without touching the repo-wide MSRV pin.
+  RUSTUP_TOOLCHAIN: "1.95.0"
 
 jobs:
   publish:
