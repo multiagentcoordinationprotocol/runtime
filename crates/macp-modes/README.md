@@ -14,7 +14,7 @@ concrete policy engine. Pair it with
 [`macp-policy`](https://crates.io/crates/macp-policy) for the default behavior,
 or supply your own evaluator.
 
-This crate is part of the [`macp-runtime`](https://github.com/multiagentcoordinationprotocol/runtime)
+This crate is part of the [`macp-runtime`](https://github.com/multiagentcoordinationprotocol/macp-runtime)
 workspace and depends on [`macp-core`](https://crates.io/crates/macp-core).
 
 ## License

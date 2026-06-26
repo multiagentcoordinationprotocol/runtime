@@ -12,7 +12,7 @@ vocabulary and drive the modes in
 `PolicyEvaluator` implementation, without taking on transport, persistence, or
 auth.
 
-This crate is part of the [`macp-runtime`](https://github.com/multiagentcoordinationprotocol/runtime)
+This crate is part of the [`macp-runtime`](https://github.com/multiagentcoordinationprotocol/macp-runtime)
 workspace.
 
 ## License

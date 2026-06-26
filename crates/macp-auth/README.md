@@ -15,7 +15,7 @@ Provides:
 
 This crate confines `jsonwebtoken` and `reqwest` so the rest of the workspace
 stays free of them. It is part of the
-[`macp-runtime`](https://github.com/multiagentcoordinationprotocol/runtime)
+[`macp-runtime`](https://github.com/multiagentcoordinationprotocol/macp-runtime)
 workspace and depends on [`macp-core`](https://crates.io/crates/macp-core).
 
 ## License

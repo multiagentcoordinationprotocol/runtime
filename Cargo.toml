@@ -25,7 +25,7 @@ version = "0.4.0"
 edition = "2021"
 rust-version = "1.89.0"
 license = "Apache-2.0"
-repository = "https://github.com/multiagentcoordinationprotocol/runtime"
+repository = "https://github.com/multiagentcoordinationprotocol/macp-runtime"
 authors = ["Ajit Koti <ajitkoti@zer07labs.com>"]
 
 # Shared dependency versions for every crate in the workspace. Member crates

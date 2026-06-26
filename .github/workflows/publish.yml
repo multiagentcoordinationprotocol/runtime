@@ -75,7 +75,7 @@ jobs:
           is_published() {
             local name="$1" ver="$2" code
             code=$(curl -s -o /dev/null -w '%{http_code}' \
-              -A "macp-runtime-release (https://github.com/multiagentcoordinationprotocol/runtime)" \
+              -A "macp-runtime-release (https://github.com/multiagentcoordinationprotocol/macp-runtime)" \
               "https://crates.io/api/v1/crates/$name/$ver")
             [ "$code" = "200" ]
           }
