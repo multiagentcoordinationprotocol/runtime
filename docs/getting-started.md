@@ -25,8 +25,8 @@ rustc --version
 Clone the repository and build:
 
 ```bash
-git clone https://github.com/multiagentcoordinationprotocol/runtime.git
-cd runtime
+git clone https://github.com/multiagentcoordinationprotocol/macp-runtime.git
+cd macp-runtime
 cargo build
 ```
 

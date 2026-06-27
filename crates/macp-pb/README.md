@@ -9,7 +9,7 @@ The `macp.v1` gRPC **service** stubs are generated separately in the
 [`macp-runtime`](https://crates.io/crates/macp-runtime) crate, which references
 these message types via `.extern_path` so they are defined exactly once.
 
-This crate is part of the [`macp-runtime`](https://github.com/multiagentcoordinationprotocol/runtime)
+This crate is part of the [`macp-runtime`](https://github.com/multiagentcoordinationprotocol/macp-runtime)
 workspace and sits at the base of its one-way dependency graph.
 
 ## License

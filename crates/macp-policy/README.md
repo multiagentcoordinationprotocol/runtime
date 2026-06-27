@@ -11,7 +11,7 @@ Modes never depend on this crate directly; they evaluate governance through the
 The runtime injects `DefaultPolicyEvaluator` at mode construction, and a
 consumer may substitute their own evaluator instead.
 
-This crate is part of the [`macp-runtime`](https://github.com/multiagentcoordinationprotocol/runtime)
+This crate is part of the [`macp-runtime`](https://github.com/multiagentcoordinationprotocol/macp-runtime)
 workspace.
 
 ## License

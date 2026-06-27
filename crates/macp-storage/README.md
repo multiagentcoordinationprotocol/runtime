@@ -12,7 +12,7 @@ Backends:
 - **rocksdb** — enable the `rocksdb-backend` feature
 - **redis** — enable the `redis-backend` feature
 
-This crate is part of the [`macp-runtime`](https://github.com/multiagentcoordinationprotocol/runtime)
+This crate is part of the [`macp-runtime`](https://github.com/multiagentcoordinationprotocol/macp-runtime)
 workspace and depends on [`macp-core`](https://crates.io/crates/macp-core).
 
 ## License

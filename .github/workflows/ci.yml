@@ -189,7 +189,10 @@ jobs:
         run: |
           deps=$(cargo tree -p macp-core --edges normal)
           echo "$deps"
-          if echo "$deps" | grep -qiE "tonic|tokio|rocksdb|redis|reqwest|macp-storage|macp-auth|macp-modes|macp-runtime"; then
+          # Strip the parenthesized manifest path before grepping so the check
+          # matches crate names only — the checkout directory itself is named
+          # "macp-runtime" and would otherwise trip the forbidden pattern.
+          if echo "$deps" | sed 's/ ([^)]*)//' | grep -qiE "tonic|tokio|rocksdb|redis|reqwest|macp-storage|macp-auth|macp-modes|macp-runtime"; then
             echo "::error::macp-core pulled a forbidden dependency"; exit 1
           fi
 
@@ -197,7 +200,7 @@ jobs:
         run: |
           deps=$(cargo tree -p macp-modes --edges normal)
           echo "$deps"
-          if echo "$deps" | grep -qiE "tonic|macp-policy|macp-storage|macp-auth|macp-runtime|reqwest|rocksdb|redis"; then
+          if echo "$deps" | sed 's/ ([^)]*)//' | grep -qiE "tonic|macp-policy|macp-storage|macp-auth|macp-runtime|reqwest|rocksdb|redis"; then
             echo "::error::macp-modes pulled a forbidden dependency"; exit 1
           fi
 
@@ -205,7 +208,7 @@ jobs:
         run: |
           for crate in macp-core macp-modes macp-policy macp-storage; do
             deps=$(cargo tree -p "$crate" --edges normal)
-            if echo "$deps" | grep -qiE "jsonwebtoken|reqwest"; then
+            if echo "$deps" | sed 's/ ([^)]*)//' | grep -qiE "jsonwebtoken|reqwest"; then
               echo "::error::$crate pulled an auth-only dependency"; exit 1
             fi
           done
